@@ -1,3 +1,4 @@
+import { useTranslation } from '../i18n'
 import { useLayoutEffect, useMemo, useRef } from 'react'
 import { exportDxf, exportStl, exportSvg } from '../solver/export'
 import type { ContourLoop } from '../solver/contour'
@@ -9,11 +10,11 @@ export interface ContourSettings {
   thickness: number
 }
 
-function download(data: BlobPart, extension: string, mime: string) {
+export function download(data: BlobPart, extension: string, mime: string, name = 'topostudio-contour') {
   const url = URL.createObjectURL(new Blob([data], { type: mime }))
   const link = document.createElement('a')
   link.href = url
-  link.download = `topostudio-contour.${extension}`
+  link.download = `${name}.${extension}`
   link.click()
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
@@ -25,6 +26,7 @@ export function ExportDialog({ loops, grid, settings, setSettings, onClose }: {
   setSettings: (settings: ContourSettings) => void
   onClose: () => void
 }) {
+  const { t } = useTranslation()
   const dialog = useRef<HTMLDialogElement>(null)
   useLayoutEffect(() => {
     dialog.current?.showModal()
@@ -42,28 +44,29 @@ export function ExportDialog({ loops, grid, settings, setSettings, onClose }: {
   return (
     <dialog ref={dialog} className="export-dialog panel" onClose={onClose} aria-labelledby="export-title">
       <form method="dialog" className="export-header">
-        <h2 id="export-title">Export CAD geometry</h2>
-        <button className="tool-button" autoFocus>Close</button>
+        <h2 id="export-title">{t('exportTitle')}</h2>
+        <button className="tool-button" autoFocus>{t('close')}</button>
       </form>
-      <label htmlFor="contour-threshold">Density threshold <output>{threshold.toFixed(2)}</output></label>
+      <label htmlFor="contour-threshold">{t('threshold')} <output>{threshold.toFixed(2)}</output></label>
       <input id="contour-threshold" type="range" min="0.01" max="0.99" step="0.01" value={threshold}
         onChange={event => setSettings({ ...settings, threshold: event.target.valueAsNumber })} />
-      <label htmlFor="contour-smoothing">Taubin smoothing passes <output>{smoothing}</output></label>
+      <label htmlFor="contour-smoothing">{t('smoothing')} <output>{smoothing}</output></label>
       <input id="contour-smoothing" type="range" min="0" max="12" step="1" value={smoothing}
         onChange={event => setSettings({ ...settings, smoothing: event.target.valueAsNumber })} />
-      <label htmlFor="stl-thickness">Extrusion thickness (mm)</label>
+      <label htmlFor="stl-thickness">{t('extrusion')}</label>
       <input id="stl-thickness" className="field-input" type="number" min="0.01" step="any"
         value={Number.isNaN(thickness) ? '' : thickness}
         onChange={event => setSettings({ ...settings, thickness: event.target.valueAsNumber })} />
       <p className="contour-summary" aria-live="polite">
-        {loops.length} loops · {holes} holes · {mesh?.triangleCount ?? '—'} STL triangles
+        {t('contourSummary').replace('{loops}', String(loops.length)).replace('{holes}', String(holes))
+          .replace('{triangles}', String(mesh?.triangleCount ?? '—'))}
       </p>
-      {!loops.length && <p className="hint">No material at this threshold. Lower the threshold or run the optimizer.</p>}
-      {error && <p className="error" role="alert">{error}</p>}
+      {!loops.length && <p className="hint">{t('noMaterial')} {t('helpThreshold')}</p>}
+      {error && <p className="error" role="alert" title={error}>{t('exportError')}</p>}
       <div className="action-row export-actions">
-        <button className="tool-button" disabled={!loops.length} onClick={() => download(exportSvg(loops, grid), 'svg', 'image/svg+xml')}>Download SVG</button>
-        <button className="tool-button" disabled={!loops.length} onClick={() => download(exportDxf(loops, grid), 'dxf', 'application/dxf')}>Download DXF</button>
-        <button className="tool-button" disabled={!mesh} onClick={() => mesh && download(mesh.data, 'stl', 'model/stl')}>Download STL</button>
+        <button className="tool-button" disabled={!loops.length} onClick={() => download(exportSvg(loops, grid), 'svg', 'image/svg+xml')}>{t('download').replace('{format}', 'SVG')}</button>
+        <button className="tool-button" disabled={!loops.length} onClick={() => download(exportDxf(loops, grid), 'dxf', 'application/dxf')}>{t('download').replace('{format}', 'DXF')}</button>
+        <button className="tool-button" disabled={!mesh} onClick={() => mesh && download(mesh.data, 'stl', 'model/stl')}>{t('download').replace('{format}', 'STL')}</button>
       </div>
     </dialog>
   )

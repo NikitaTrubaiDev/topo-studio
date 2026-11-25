@@ -1,3 +1,5 @@
+import { useTranslation } from '../i18n'
+
 export interface Sample {
   iteration: number
   compliance: number
@@ -5,6 +7,7 @@ export interface Sample {
 }
 
 export function ConvergenceChart({ samples, target }: { samples: Sample[]; target: number }) {
+  const { t } = useTranslation()
   const width = 700
   const height = 120
   const left = 63
@@ -26,16 +29,16 @@ export function ConvergenceChart({ samples, target }: { samples: Sample[]; targe
   const last = samples.at(-1)
 
   return (
-    <section className="chart panel" aria-label="Convergence history">
+    <section className="chart panel" aria-label={t('convergence')}>
       <div className="chart-heading">
-        <h2>Convergence</h2>
+        <h2>{t('convergence')}</h2>
         <div className="chart-key">
-          <span><i className="key-compliance" />Compliance <small>N·mm</small></span>
-          <span><i className="key-volume" />Volume <small>%</small></span>
+          <span><i className="key-compliance" />{t('compliance')} <small>{t('N')}·{t('mm')}</small></span>
+          <span><i className="key-volume" />{t('volume')} <small>%</small></span>
         </div>
       </div>
       {last ? (
-        <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Compliance and material volume by iteration">
+        <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={t('convergenceDescription')}>
           {[0, 0.5, 1].map(fraction => (
             <g key={fraction}>
               <line x1={left} x2={right} y1={yVolume(fraction)} y2={yVolume(fraction)} className="chart-grid" />
@@ -51,11 +54,11 @@ export function ConvergenceChart({ samples, target }: { samples: Sample[]; targe
           <circle cx={x(samples.length - 1)} cy={yCompliance(last.compliance)} r="3" className="compliance-dot" />
           <circle cx={x(samples.length - 1)} cy={yVolume(last.volFrac)} r="3" className="volume-dot" />
           <text x={left} y={height - 5}>1</text>
-          <text x={width / 2} y={height - 5} textAnchor="middle">Iteration</text>
+          <text x={width / 2} y={height - 5} textAnchor="middle">{t('iteration')}</text>
           {last.iteration > 1 && <text x={right} y={height - 5} textAnchor="end">{last.iteration}</text>}
         </svg>
       ) : (
-        <div className="chart-empty">Start or step to record convergence.</div>
+        <div className="chart-empty">{t('chartEmpty')}</div>
       )}
     </section>
   )

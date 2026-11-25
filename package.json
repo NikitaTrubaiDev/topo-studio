@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "test": "vitest run",
+    "bench:solver": "vitest bench --run --reporter=verbose",
     "build": "tsc --noEmit && vite build"
   },
   "dependencies": {

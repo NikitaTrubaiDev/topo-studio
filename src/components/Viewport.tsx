@@ -1,8 +1,10 @@
 import { useLayoutEffect, useMemo, useRef, useState, type PointerEvent } from 'react'
 import type { ContourLoop } from '../solver/contour'
-import { initialPhysicalDensity } from '../solver/density'
-import { editSupport, isValidForce, loadCaseIndex, MAX_NODAL_FORCE, paintMask, setForce, supportKind, type MaskTool, type SupportAction } from '../solver/design'
-import { nodeIndex, type Grid, type LoadCase, type SimpProblem } from '../solver/types'
+import { useTranslation } from '../i18n'
+import { buildLabels } from './Controls'
+import { OverhangFilter } from '../solver/overhang'
+import { brushExtent, editSupport, isValidForce, loadCaseIndex, MAX_NODAL_FORCE, paintMask, setForce, supportKind, type MaskTool, type SupportAction } from '../solver/design'
+import { nodeIndex, type Grid, type LoadCase, type PassiveMasks, type SimpProblem } from '../solver/types'
 import { DEFORMED_DENSITY_THRESHOLD, deformedNodes, hitTestDeformedMesh, quadNodes } from './deformedMesh'
 import { caseColor } from './LoadCases'
 import type { TimedSnapshot } from '../workers/protocol'
@@ -10,8 +12,9 @@ import type { TimedSnapshot } from '../workers/protocol'
 export type ViewMode = 'density' | 'stress' | 'deformed' | 'cad'
 type Overlays = { supports: boolean; forces: boolean; passive: boolean; smooth: boolean }
 type Point = [number, number]
+type Raster = { canvas: HTMLCanvasElement; image?: ImageData }
 
-const modes: Record<ViewMode, string> = { density: 'Density', stress: 'Von Mises', deformed: 'Deformed mesh', cad: 'CAD contour' }
+const modes = ['density', 'stress', 'deformed', 'cad'] as const
 const densityStops = [[20, 32, 41], [32, 95, 104], [131, 233, 219]]
 const stressStops = [[24, 40, 64], [18, 123, 168], [60, 195, 156], [244, 213, 104], [248, 107, 96]]
 
@@ -19,6 +22,23 @@ function colorAt(stops: number[][], value: number) {
   const position = (Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0) * (stops.length - 1)
   const index = Math.min(stops.length - 2, Math.floor(position))
   return stops[index].map((channel, i) => Math.round(channel + (stops[index + 1][i] - channel) * (position - index)))
+}
+
+function makePalette(stops: number[][]) {
+  const rgb = new Uint8ClampedArray(256 * 3)
+  const css = Array.from({ length: 256 }, (_, i) => {
+    const color = colorAt(stops, i / 255)
+    rgb.set(color, 3 * i)
+    return `rgb(${color.join(' ')})`
+  })
+  return { rgb, css }
+}
+
+const densityPalette = makePalette(densityStops)
+const stressPalette = makePalette(stressStops)
+
+function colorIndex(value: number) {
+  return Math.round(255 * Math.max(0, Math.min(1, value)))
 }
 
 function drawSupport(ctx: CanvasRenderingContext2D, point: Point, fixedX: boolean, fixedY: boolean, clamp: boolean) {
@@ -60,7 +80,7 @@ function drawForce(ctx: CanvasRenderingContext2D, point: Point, fx: number, fy: 
 }
 
 function paint(
-  canvas: HTMLCanvasElement, raster: HTMLCanvasElement, problem: SimpProblem, density: Float32Array,
+  canvas: HTMLCanvasElement, raster: Raster, problem: SimpProblem, density: Float32Array,
   mode: ViewMode, overlays: Overlays, positions: Float64Array | undefined, stressLimit: number,
   stress: Float32Array | undefined, loops: ContourLoop[], activeCase: number, resultCase: number,
 ) {
@@ -84,7 +104,7 @@ function paint(
     if (deform && positions) return point(positions[2 * node], positions[2 * node + 1])
     return point(node % (nelx + 1), Math.floor(node / (nelx + 1)))
   }
-  const palette = stress || mode === 'stress' ? stressStops : densityStops
+  const palette = stress || mode === 'stress' ? stressPalette : densityPalette
   const valueAt = (e: number) => {
     if (stress) return Number.isFinite(stress[e]) ? stress[e] / (stressLimit || 1) : 0
     return mode === 'stress' ? 0 : density[e]
@@ -121,7 +141,7 @@ function paint(
         const e = y * nelx + x
         if (density[e] < DEFORMED_DENSITY_THRESHOLD) continue
         const [a, b, c, d] = quadNodes(grid, x, y)
-        ctx.fillStyle = `rgb(${colorAt(palette, valueAt(e)).join(' ')})`
+        ctx.fillStyle = palette.css[colorIndex(valueAt(e))]
         ctx.strokeStyle = '#0e3339'
         ctx.lineWidth = 0.65
         ctx.beginPath()
@@ -135,23 +155,35 @@ function paint(
       }
     }
   } else {
-    if (raster.width !== nelx) raster.width = nelx
-    if (raster.height !== nely) raster.height = nely
-    const rasterCtx = raster.getContext('2d')
+    const { canvas: offscreen } = raster
+    const rasterCtx = offscreen.getContext('2d')
     if (rasterCtx) {
-      const image = rasterCtx.createImageData(nelx, nely)
+      if (offscreen.width !== nelx || offscreen.height !== nely) {
+        offscreen.width = nelx
+        offscreen.height = nely
+        raster.image = undefined
+      }
+      const image = raster.image ??= rasterCtx.createImageData(nelx, nely)
+      const { data } = image
+      const colors = palette.rgb
       for (let y = 0; y < nely; y++) {
         for (let x = 0; x < nelx; x++) {
           const e = y * nelx + x
-          if (passive?.void?.[e]) continue
           const offset = 4 * ((nely - 1 - y) * nelx + x)
-          image.data.set(colorAt(palette, valueAt(e)), offset)
-          image.data[offset + 3] = 255
+          if (passive?.void?.[e]) {
+            data[offset + 3] = 0
+            continue
+          }
+          const color = 3 * colorIndex(valueAt(e))
+          data[offset] = colors[color]
+          data[offset + 1] = colors[color + 1]
+          data[offset + 2] = colors[color + 2]
+          data[offset + 3] = 255
         }
       }
       rasterCtx.putImageData(image, 0, 0)
       ctx.imageSmoothingEnabled = overlays.smooth
-      ctx.drawImage(raster, left, top, nelx * cell, nely * cell)
+      ctx.drawImage(offscreen, left, top, nelx * cell, nely * cell)
     }
   }
 
@@ -252,11 +284,10 @@ function paint(
   ctx.fillText('X', 44, height - 17)
 }
 
-const tools = {
-  inspect: 'Inspect', void: 'Paint void', solid: 'Paint solid', erase: 'Erase mask',
-  bolt: 'Bolt hole / ring', supports: 'Supports', loads: 'Loads',
-}
-type Tool = keyof typeof tools
+const tools = ['inspect', 'void', 'solid', 'erase', 'bolt', 'supports', 'loads'] as const
+type Tool = typeof tools[number]
+const overlaysList = ['supports', 'forces', 'passive', 'smooth'] as const
+const arrows = { '+Y': '↑', '-Y': '↓', '+X': '→', '-X': '←' }
 
 function canvasLayout(width: number, height: number, { nelx, nely }: Grid) {
   const cell = Math.min(Math.max(10, width - 72) / nelx, Math.max(10, height - 82) / nely)
@@ -272,6 +303,7 @@ function gridPoint(event: PointerEvent<HTMLCanvasElement>, grid: Grid): Point {
 function ForceEditor({ node, problem, activeCase, onChange }: {
   node: number; problem: SimpProblem; activeCase: LoadCase; onChange: (problem: SimpProblem) => void
 }) {
+  const { t, caseName } = useTranslation()
   const [invalid, setInvalid] = useState(false)
   const force = activeCase.forces.find(force => force.node === node)
   const width = problem.grid.nelx + 1
@@ -287,30 +319,33 @@ function ForceEditor({ node, problem, activeCase, onChange }: {
       if (isValidForce(fx, fy)) change({ fx, fy })
       else setInvalid(true)
     }}>
-      <span>Node ({node % width}, {Math.floor(node / width)}) · {activeCase.name}</span>
-      <label>Fx (N) <input type="number" className="field-input" required name="fx" step="any" defaultValue={force?.fx ?? 0} /></label>
-      <label>Fy (N) <input type="number" className="field-input" required name="fy" step="any" defaultValue={force?.fy ?? -100} /></label>
-      <button className="tool-button" type="submit">Apply force</button>
-      <button className="tool-button" type="button" disabled={!force} onClick={() => change(null)}>Remove force</button>
-      {invalid && <span role="alert">Enter a finite force with magnitude at most {MAX_NODAL_FORCE.toExponential()} N.</span>}
+      <span>{t('node')} ({node % width}, {Math.floor(node / width)}) · {caseName(activeCase)}</span>
+      <label>Fx ({t('N')}) <input type="number" className="field-input" required name="fx" step="any" defaultValue={force?.fx ?? 0} /></label>
+      <label>Fy ({t('N')}) <input type="number" className="field-input" required name="fy" step="any" defaultValue={force?.fy ?? -100} /></label>
+      <button className="tool-button" type="submit">{t('applyForce')}</button>
+      <button className="tool-button" type="button" disabled={!force} onClick={() => change(null)}>{t('removeForce')}</button>
+      {invalid && <span role="alert">{t('forceLimit').replace('{limit}', MAX_NODAL_FORCE.toExponential())}</span>}
     </form>
   )
 }
 
 export function Viewport({
-  problem, frame, initialDensity, loops, mode, setMode, activeCase, onChange,
+  problem, frame, initialDensity, loops, threshold, effectivePassive, mode, setMode, activeCase, onChange,
 }: {
   problem: SimpProblem
   frame: TimedSnapshot | undefined
   initialDensity: Float32Array
   loops: ContourLoop[]
+  threshold: number
+  effectivePassive?: PassiveMasks
   mode: ViewMode
   setMode: (mode: ViewMode) => void
   activeCase: LoadCase
   onChange: (problem: SimpProblem) => void
 }) {
+  const { t, caseName } = useTranslation()
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const rasterRef = useRef<HTMLCanvasElement>(null)
+  const rasterRef = useRef<Raster | null>(null)
   const stroke = useRef<{ problem: SimpProblem; original: SimpProblem; last: Point; nodes: Set<number> } | null>(null)
   const [draft, setDraft] = useState<SimpProblem>()
   const [drawingTool, setTool] = useState<Tool>('inspect')
@@ -325,13 +360,24 @@ export function Viewport({
   const [size, setSize] = useState({ width: 0, height: 0 })
   const { grid, params, passive } = problem
   const { nelx, nely } = grid
-  const preview = draft ?? problem
+  const displayed = useMemo(() => ({ ...problem, passive: effectivePassive }), [problem, effectivePassive])
+  const preview = draft ?? displayed
   const previewFrame = draft ? undefined : frame
-  const previewPassive = preview.passive
-  const initialPreview = useMemo(() => previewPassive === passive
-    ? initialDensity : initialPhysicalDensity({ grid, params, passive: previewPassive }),
-  [previewPassive, passive, initialDensity, grid, params])
+  const previewPassive = draft?.passive ?? passive
+  const initialPreview = useMemo(() => {
+    if (previewPassive === passive) return initialDensity
+    const density = initialDensity.slice()
+    for (let e = 0; e < density.length; e++) {
+      if (previewPassive?.void?.[e]) density[e] = 0
+      else if (previewPassive?.solid?.[e]) density[e] = 1
+      else if (passive?.void?.[e] || passive?.solid?.[e]) density[e] = params.volFrac
+    }
+    return density
+  }, [previewPassive, passive, initialDensity, params.volFrac])
   const previewDensity = previewFrame?.density ?? initialPreview
+  const build = params.overhang
+  const overhang = useMemo(() => build ? new OverhangFilter(grid, build) : undefined, [grid, build])
+  const unsupported = useMemo(() => overhang?.unsupported(previewDensity, threshold) ?? 0, [overhang, previewDensity, threshold])
   const caseIndex = loadCaseIndex(problem.loadCases, resultCaseId)
   const activeCaseIndex = loadCaseIndex(problem.loadCases, activeCase.id)
   const stress = caseIndex < 0 ? previewFrame?.vonMises : previewFrame?.caseVonMises[caseIndex]
@@ -379,7 +425,7 @@ export function Viewport({
 
   useLayoutEffect(() => {
     if (canvasRef.current && size.width && size.height) {
-      rasterRef.current ??= document.createElement('canvas')
+      rasterRef.current ??= { canvas: document.createElement('canvas') }
       paint(canvasRef.current, rasterRef.current, preview, previewDensity, mode, overlays, positions,
         stressLimit, stressMode ? stress : undefined, loops, activeCaseIndex, caseIndex)
     }
@@ -451,63 +497,67 @@ export function Viewport({
   const hoverDensity = inspectIndex === null ? undefined : previewDensity[inspectIndex]
   const hoverStress = inspectIndex === null ? undefined : stress?.[inspectIndex]
   const hoverLayout = canvasLayout(size.width, size.height, grid)
+  const hoverNode = hover && inside(hover, 0.6) && (tool === 'supports' || tool === 'loads') ? nearest(hover) : undefined
   const selectedForce = activeCase.forces.find(force => force.node === selectedNode)
 
   return (
-    <section className="viewport panel" aria-label="Simulation viewport">
+    <section className="viewport panel" aria-label={t('viewport')}>
       <div className="viewport-tools">
-        <div className="segmented" role="group" aria-label="Result view">
-          {Object.entries(modes).map(([id, label]) => (
+        <div className="segmented" role="group" aria-label={t('resultView')}>
+          {modes.map(id => (
             <button key={id} type="button" aria-pressed={mode === id} onClick={() => {
-              setMode(id as ViewMode)
+              setMode(id)
               if (id !== 'density') setTool('inspect')
-            }}>{label}</button>
+            }}>{t(id)}</button>
           ))}
         </div>
-        <div className="overlay-controls" role="group" aria-label="Viewport overlays">
-          {Object.entries({ supports: 'Supports', forces: 'Forces', passive: 'Masks', smooth: 'Interpolate raster' }).map(([key, label]) => (
+        <div className="overlay-controls" role="group" aria-label={t('overlays')}>
+          {overlaysList.map(key => (
             <label key={key}>
-              <input type="checkbox" checked={overlays[key as keyof Overlays]} disabled={key === 'smooth' && (mode === 'deformed' || mode === 'cad')}
-                onChange={() => toggle(key as keyof Overlays)} />{label}
+              <input type="checkbox" checked={overlays[key]} disabled={key === 'smooth' && (mode === 'deformed' || mode === 'cad')}
+                onChange={() => toggle(key)} />{t(key)}
             </label>
           ))}
         </div>
       </div>
       <div className="viewport-tools designer-tools">
-        <div className="segmented" role="group" aria-label="Drawing tools">
-          {Object.entries(tools).map(([id, label]) => (
-            <button key={id} type="button" aria-pressed={tool === id} onClick={() => {
-              setTool(id as Tool)
+        <div className="segmented" role="group" aria-label={t('drawTools')}>
+          {tools.map(id => (
+            <button key={id} type="button" aria-pressed={tool === id} title={t(`${id}Hint`)} onClick={() => {
+              setTool(id)
               if (id !== 'inspect') setMode('density')
-            }}>{label}</button>
+            }}>{t(id)}</button>
           ))}
         </div>
-        {isBrush && <label className="compact-input">Radius
-          <input aria-label="Brush radius" type="range" min="1" max="16" step="0.5" value={radius}
+        {isBrush && <label className="compact-input">{t('brushRadius')}
+          <input aria-label={t('brushRadius')} type="range" min="1" max="16" step="0.5" value={radius}
             onChange={event => setRadius(event.target.valueAsNumber)} />
-          <output>{radius} elem</output>
+          <output>{radius} {t('elementShort')}</output>
         </label>}
-        {tool === 'supports' && <label className="compact-input">Support
+        {tool === 'supports' && <label className="compact-input">{t('support')}
           <select className="field-input" value={supportAction} onChange={event => setSupportAction(event.target.value as SupportAction)}>
-            <option value="cycle">Cycle support</option><option value="fixed">Fixed XY</option><option value="pin">Pin XY</option>
-            <option value="roller-x">Roller-X · fixes Y</option><option value="roller-y">Roller-Y · fixes X</option>
-            <option value="remove">Remove support</option>
+            <option value="cycle">{t('cycle')}</option><option value="fixed">{t('fixed')}</option><option value="pin">{t('pin')}</option>
+            <option value="roller-x">{t('rollerX')}</option><option value="roller-y">{t('rollerY')}</option>
+            <option value="remove">{t('removeSupport')}</option>
           </select>
         </label>}
-        {stressMode && <label className="compact-input">Result case
+        {stressMode && <label className="compact-input">{t('resultCase')}
           <select className="field-input" value={caseIndex < 0 ? '' : resultCaseId} onChange={event => setResultCaseId(event.target.value || undefined)}>
-            <option value="">Combined stress envelope</option>
-            {problem.loadCases.map(load => <option key={load.id} value={load.id}>{load.name}</option>)}
+            <option value="">{t('envelope')}</option>
+            {problem.loadCases.map(load => <option key={load.id} value={load.id}>{caseName(load)}</option>)}
           </select>
         </label>}
-        {tool === 'loads' && selectedNode === undefined && <p className="hint">Select a grid node to edit its force.</p>}
         {tool === 'loads' && selectedNode !== undefined && (
           <ForceEditor key={`${activeCase.id}:${selectedNode}:${selectedForce?.fx}:${selectedForce?.fy}`} node={selectedNode}
             problem={problem} activeCase={activeCase} onChange={onChange} />
         )}
       </div>
+      <p className="context-hint" title={t(`${tool}Hint`)}>{t(`${tool}Hint`)}</p>
       <div className="canvas-field">
-        <canvas ref={canvasRef} aria-label={`${modes[mode]} field, ${nelx} by ${nely} elements`} role="img" data-tool={tool}
+        {build && <div className="build-indicator" data-direction={build} title={t(buildLabels[build])}>
+          <span aria-hidden="true">{arrows[build]}</span> {build} · {t(buildLabels[build])}
+        </div>}
+        <canvas ref={canvasRef} aria-label={`${t(mode)} · ${nelx} ${t('by')} ${nely} ${t('elements')}`} role="img" data-tool={tool}
           onPointerDown={pointerDown} onPointerMove={event => {
             const point = gridPoint(event, grid)
             setHover(point)
@@ -519,10 +569,15 @@ export function Viewport({
             finish(true)
           }}
           onPointerCancel={() => finish(false)} onLostPointerCapture={() => finish(false)} />
-        <div className="field-caption">{nelx} × {nely} ELEMENTS · {Number((nelx * (grid.cellSizeMm ?? 1)).toPrecision(5))} × {Number((nely * (grid.cellSizeMm ?? 1)).toPrecision(5))} mm</div>
-        {isBrush && hover && inside(hover) && <div className="brush-cursor" style={{
-          left: hoverLayout.left + hover[0] * hoverLayout.cell, top: hoverLayout.bottom - hover[1] * hoverLayout.cell,
-          width: radius * hoverLayout.cell * 2, height: radius * hoverLayout.cell * 2,
+        <div className="field-caption">{nelx} × {nely} {t('elements')} · {Number((nelx * (grid.cellSizeMm ?? 1)).toPrecision(5))} × {Number((nely * (grid.cellSizeMm ?? 1)).toPrecision(5))} {t('mm')}</div>
+        {isBrush && hover && inside(hover) && (tool === 'bolt' ? [brushExtent('bolt', radius), radius] : [radius])
+          .map((ring, index) => <div key={index} className={`brush-cursor brush-${tool}`} style={{
+            left: hoverLayout.left + hover[0] * hoverLayout.cell, top: hoverLayout.bottom - hover[1] * hoverLayout.cell,
+            width: ring * hoverLayout.cell * 2, height: ring * hoverLayout.cell * 2,
+          }} />)}
+        {hoverNode !== undefined && <div className="node-cursor node-preview" style={{
+          left: hoverLayout.left + (hoverNode % (nelx + 1)) * hoverLayout.cell,
+          top: hoverLayout.bottom - Math.floor(hoverNode / (nelx + 1)) * hoverLayout.cell,
         }} />}
         {tool === 'loads' && selectedNode !== undefined && <div className="node-cursor" style={{
           left: hoverLayout.left + (selectedNode % (nelx + 1)) * hoverLayout.cell,
@@ -530,25 +585,27 @@ export function Viewport({
           borderColor: caseColor(activeCaseIndex),
         }} />}
         {tool === 'inspect' && hoverDensity !== undefined && (
-          <div className="inspect-readout">ρ {hoverDensity.toFixed(3)} · σ<sub>VM</sub> {hoverStress !== undefined && Number.isFinite(hoverStress) ? `${hoverStress.toPrecision(4)} MPa` : '—'}</div>
+          <div className="inspect-readout">ρ {hoverDensity.toFixed(3)} · σ<sub>VM</sub> {hoverStress !== undefined && Number.isFinite(hoverStress) ? `${hoverStress.toPrecision(4)} ${t('MPa')}` : '—'}</div>
         )}
         {mode === 'deformed' && (
           <div className="magnification">
-            <label htmlFor="deformation-percent">Deformation</label>
+            <label htmlFor="deformation-percent">{t('deformation')}</label>
             <input id="deformation-percent" type="range" min="0" max="200" value={deformationPercent}
-              aria-valuetext={`${deformationPercent}% of automatic scale`} onChange={event => setDeformationPercent(event.target.valueAsNumber)} />
+              aria-valuetext={`${deformationPercent}% ${t('autoScale')}`} onChange={event => setDeformationPercent(event.target.valueAsNumber)} />
             <output>{displacement ? `${Number(magnification.toPrecision(3))}×` : '—'}</output>
-            {caseIndex < 0 && deformation && <span>Shape · {problem.loadCases[deformation.index].name}</span>}
+            {caseIndex < 0 && deformation && <span>{t('shape')} · {caseName(problem.loadCases[deformation.index])}</span>}
           </div>
         )}
-        {mode !== 'cad' && <div className="scale" aria-label={stressMode ? 'Stress color scale in MPa' : 'Density color scale from 0 to 1'}>
-          <span>{stressMode ? 'MPa' : 'Density'}</span>
+        {mode !== 'cad' && <div className="scale" aria-label={stressMode ? t('stressScale') : t('densityScale')}>
+          <span>{stressMode ? t('MPa') : t('density')}</span>
           <div className={`scale-ramp ${stressMode ? 'stress-ramp' : 'density-ramp'}`} />
           <div className="scale-labels"><span>0</span><span>{stressMode ? (frame ? stressLimit.toPrecision(3) : '—') : '1'}</span></div>
-          {stressMode && frame && <div className="scale-peak">Max {maxStress.toPrecision(4)} MPa</div>}
+          {stressMode && frame && <div className="scale-peak">{t('max')} {maxStress.toPrecision(4)} {t('MPa')}</div>}
         </div>}
-        {mode === 'cad' && !loops.length && <div className="inspect-readout">No material at the current threshold.</div>}
+        {mode === 'cad' && !loops.length && <div className="inspect-readout">{t('noMaterial')}</div>}
       </div>
+      {build && unsupported > 0 && (frame || mode === 'cad') &&
+        <p className="am-status">{t('amUnsupported')} · {unsupported}</p>}
     </section>
   )
 }

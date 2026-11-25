@@ -73,3 +73,18 @@ export class DensityFilter {
     return result
   }
 }
+
+/** Tanh projection with eta = 0.5 and its pointwise derivative. Volume is
+ * conserved by solving the OC constraint on the projected field. */
+export function projectHeaviside(
+  input: Float64Array, beta: number, output: Float64Array, slope?: Float64Array,
+) {
+  const edge = Math.tanh(beta / 2)
+  const denominator = 2 * edge
+  for (let e = 0; e < input.length; e++) {
+    const tanh = Math.tanh(beta * (input[e] - 0.5))
+    output[e] = (edge + tanh) / denominator
+    if (slope) slope[e] = beta * (1 - tanh * tanh) / denominator
+  }
+  return output
+}

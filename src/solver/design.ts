@@ -38,12 +38,16 @@ export function editSupport(supports: readonly Support[], node: number, action: 
   return [...supports.filter(item => item.node !== node), { node, kind, fixedX: kind !== 'roller-x', fixedY: kind !== 'roller-y' }]
 }
 
+export function brushExtent(tool: MaskTool, radius: number) {
+  return tool === 'bolt' ? radius + Math.max(1, radius * 0.35) : radius
+}
+
 export function paintMask(
   { nelx, nely }: Grid, passive: PassiveMasks | undefined, tool: MaskTool, x: number, y: number, radius: number,
 ): PassiveMasks | undefined {
   const solid = passive?.solid?.slice() ?? new Uint8Array(nelx * nely)
   const voidMask = passive?.void?.slice() ?? new Uint8Array(nelx * nely)
-  const extent = tool === 'bolt' ? radius + Math.max(1, radius * 0.35) : radius
+  const extent = brushExtent(tool, radius)
   let changed = false
   for (let row = Math.max(0, Math.floor(y - extent)); row < Math.min(nely, Math.ceil(y + extent)); row++) {
     for (let col = Math.max(0, Math.floor(x - extent)); col < Math.min(nelx, Math.ceil(x + extent)); col++) {
@@ -69,9 +73,10 @@ export function setForce(loadCase: LoadCase, node: number, value: Omit<NodalForc
 let nextCaseId = 1
 
 export function addLoadCase(loadCases: readonly LoadCase[]): LoadCase[] {
+  while (loadCases.some(load => load.id === ('case-' + nextCaseId))) nextCaseId++
   let number = loadCases.length + 1
   while (loadCases.some(load => load.name === `Case ${number}`)) number++
-  return [...loadCases, { id: `case-${nextCaseId++}`, name: `Case ${number}`, forces: [] }]
+  return [...loadCases, { id: `case-${nextCaseId++}`, name: `Case ${number}`, generatedNumber: number, forces: [] }]
 }
 
 export function loadCaseIndex(loadCases: readonly LoadCase[], id: string | undefined): number {

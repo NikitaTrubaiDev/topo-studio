@@ -1,10 +1,10 @@
 import { isValidForce, MAX_NODAL_FORCE, supportError } from './design'
-import { filterPhysicalDensity, initializeDensity } from './density'
-import { Stiffness2D } from './stiffness'
+import { densitySum, ManufacturingDensity } from './manufacturing'
+import { Multigrid2D } from './multigrid'
+import { elementDofs, Stiffness2D } from './stiffness'
 import { centerB, elementStiffness, planeStressD } from './elementQ4'
-import type { DensityFilter } from './filter'
 import { pcg, PcgWorkspace } from './pcg'
-import { nodeIndex, type IterationSnapshot, type SimpProblem } from './types'
+import type { IterationSnapshot, SimpProblem } from './types'
 
 function dotElement(matrix: Float64Array, row: number, vector: Float64Array, dofs: Uint32Array, start: number) {
   return matrix[row] * vector[dofs[start]]
@@ -19,7 +19,9 @@ function dotElement(matrix: Float64Array, row: number, vector: Float64Array, dof
 
 export class Simp2D {
   readonly volumeRange: readonly [number, number]
-  private readonly filter: DensityFilter
+  private readonly manufacturing: ManufacturingDensity
+  private readonly multigrid?: Multigrid2D
+  private readonly volumeAtOutput: Float64Array
   private readonly dofs: Uint32Array
   private readonly fixed: Uint8Array
   private readonly forces: Float64Array[]
@@ -42,6 +44,9 @@ export class Simp2D {
   private readonly lower: Float64Array
   private readonly upper: Float64Array
   private readonly trial: Float64Array
+  private beta = 1
+  private betaSince = 0
+  private advanceBeta = false
   private iteration = 0
   private done = false
 
@@ -66,22 +71,12 @@ export class Simp2D {
     }
     const elements = nelx * nely
     const nodes = (nelx + 1) * (nely + 1)
-    this.ke = elementStiffness(1, material.nu)
+    const thickness = grid.thicknessMm ?? 1
+    if (!Number.isFinite(thickness) || thickness <= 0) throw new Error('Part thickness must be finite and positive.')
+    this.ke = elementStiffness(thickness, material.nu)
     // Square element stiffness is invariant to side length. Strain scales as 1 / side length.
     this.stressD = planeStressD(1 / cellSize, material.nu)
-    this.dofs = new Uint32Array(elements * 8)
-    for (let y = 0; y < nely; y++) {
-      for (let x = 0; x < nelx; x++) {
-        const bl = nodeIndex(grid, x, y)
-        const tl = nodeIndex(grid, x, y + 1)
-        const corners = [bl, bl + 1, tl + 1, tl]
-        const offset = 8 * (y * nelx + x)
-        for (let k = 0; k < 4; k++) {
-          this.dofs[offset + 2 * k] = 2 * corners[k]
-          this.dofs[offset + 2 * k + 1] = 2 * corners[k] + 1
-        }
-      }
-    }
+    this.dofs = elementDofs(grid)
     this.fixed = new Uint8Array(nodes * 2)
     const issue = supportError(grid, supports)
     if (issue) throw new Error(issue)
@@ -110,12 +105,16 @@ export class Simp2D {
       return vector
     })
 
-    const { filter, mask, design, volumeGradient, fixedVolume, volumeRange } = initializeDensity(problem)
-    const [min, max] = volumeRange
+    this.density = new Float64Array(elements)
+    this.manufacturing = new ManufacturingDensity(problem)
+    const { mask, design, volumeGradient, fixedVolume, volumeRange } = this.manufacturing.setup
+    const range = this.manufacturing.nonlinear
+      ? this.manufacturing.seed(this.beta, params.volFrac, this.density) : volumeRange
+    const [min, max] = range
     if (params.volFrac < min - 1e-12 || params.volFrac > max + 1e-12) {
       throw new Error('The target volume fraction is infeasible with the passive masks and filter radius.')
     }
-    this.filter = filter
+    this.volumeAtOutput = new Float64Array(elements).fill(1)
     this.mask = mask
     this.design = design
     this.volumeGradient = volumeGradient
@@ -124,6 +123,9 @@ export class Simp2D {
     this.density = new Float64Array(elements)
     this.modulus = new Float64Array(elements)
     this.stiffness = new Stiffness2D(grid, this.fixed, this.dofs)
+    if (params.preconditioner !== 'jacobi' && Math.min(nelx, nely) >= 2 && nodes > 40) {
+      this.multigrid = new Multigrid2D(grid, this.fixed, this.stiffness)
+    }
     this.pcgWorkspace = new PcgWorkspace(this.fixed.length)
     this.displacements = this.forces.map(force => new Float64Array(force.length))
     this.vonMises = new Float32Array(elements)
@@ -137,7 +139,7 @@ export class Simp2D {
   }
 
   private physicalDensity() {
-    return filterPhysicalDensity(this.filter, this.mask, this.design, this.density)
+    return this.manufacturing.apply(this.design, this.density, this.beta)
   }
 
   private analyze(density: Float64Array) {
@@ -146,7 +148,7 @@ export class Simp2D {
     const { dofs, ke, fixed, stressD, modulus, stiffness, physicalGradient, vonMises } = this
     for (let e = 0; e < modulus.length; e++) modulus[e] = Emin + (E0 - Emin) * density[e] ** penal
     stiffness.assemble(modulus, ke)
-    const precondition = stiffness.preparePreconditioner()
+    const precondition = this.multigrid?.prepare()
     const tolerance = density.length >= 4_800 && this.iteration < 20 ? 1e-5 : 1e-6
     physicalGradient.fill(0)
     vonMises.fill(0)
@@ -194,7 +196,8 @@ export class Simp2D {
         maxVonMises = Math.max(maxVonMises, stress)
       }
     }
-    this.filter.transpose(physicalGradient, this.gradient)
+    this.manufacturing.transpose(physicalGradient, this.gradient)
+    this.manufacturing.transpose(this.volumeAtOutput, this.volumeGradient)
     return { compliance, maxVonMises }
   }
 
@@ -204,53 +207,92 @@ export class Simp2D {
     const target = volFrac * design.length
     let maxDrive = 0
     for (let e = 0; e < design.length; e++) {
-      if (volumeGradient[e] === 0) continue
-      drive[e] = -gradient[e] / volumeGradient[e]
+      if (this.mask[e]) continue
+      drive[e] = volumeGradient[e] > 0 ? -gradient[e] / volumeGradient[e] : 0
       maxDrive = Math.max(maxDrive, drive[e])
     }
-    if (maxDrive === 0) return 0
+    if (maxDrive === 0 && !this.manufacturing.nonlinear) return 0
 
     let lo = 0
     let hi = 0
     // Search in the Lagrange multiplier coordinate t = sqrt(maxDrive / lambda).
     // A small positive seed lets a variable at zero regain material if its sensitivity rises.
     for (let e = 0; e < design.length; e++) {
-      if (volumeGradient[e] === 0) continue
+      if (this.mask[e]) continue
       lower[e] = Math.max(0, design[e] - moveLimit)
       upper[e] = Math.min(1, design[e] + moveLimit)
-      drive[e] = Math.max(1e-8, design[e]) * Math.sqrt(Math.max(1e-12, drive[e] / maxDrive))
+      drive[e] = Math.max(1e-8, design[e]) * Math.sqrt(Math.max(1e-12, maxDrive > 0 ? drive[e] / maxDrive : 1))
       hi = Math.max(hi, upper[e] / drive[e])
     }
-    for (let i = 0; i < 90; i++) {
-      const t = (lo + hi) / 2
+    const evaluate = (t: number) => {
       let volume = this.fixedVolume
       for (let e = 0; e < design.length; e++) {
-        if (volumeGradient[e] === 0) continue
-        trial[e] = Math.max(lower[e], Math.min(upper[e], drive[e] * t))
-        volume += volumeGradient[e] * trial[e]
+        if (this.mask[e]) {
+          trial[e] = design[e]
+        } else {
+          trial[e] = Math.max(lower[e], Math.min(upper[e], drive[e] * t))
+          volume += volumeGradient[e] * trial[e]
+        }
       }
-      if (Math.abs(volume - target) <= 1e-9 * design.length) break
+      return this.manufacturing.nonlinear
+        ? densitySum(this.manufacturing.apply(trial, this.density, this.beta, false)) : volume
+    }
+
+    // Bracket close to the active update instead of bisecting from the
+    // largest saturation point, which can be orders of magnitude away.
+    const limit = hi
+    hi = Math.min(1, limit)
+    let volume = evaluate(hi)
+    while (volume < target && hi < limit) {
+      lo = hi
+      hi = Math.min(2 * hi, limit)
+      volume = evaluate(hi)
+    }
+    const tolerance = (this.manufacturing.nonlinear ? 1e-7 : 1e-9) * design.length
+    const bracketed = volume >= target
+    for (let i = 0; bracketed && i < 42 && Math.abs(volume - target) > tolerance; i++) {
+      const t = (lo + hi) / 2
+      volume = evaluate(t)
       if (volume < target) lo = t
       else hi = t
     }
     let change = 0
     for (let e = 0; e < design.length; e++) {
-      if (volumeGradient[e] === 0) continue
+      if (this.mask[e]) continue
       change = Math.max(change, Math.abs(trial[e] - design[e]))
       design[e] = trial[e]
     }
     return change
   }
 
+  private betaFeasible(beta: number) {
+    const { design, trial, density, mask } = this
+    const { moveLimit, volFrac } = this.problem.params
+    for (const sign of [-1, 1]) {
+      for (let e = 0; e < design.length; e++) {
+        trial[e] = mask[e] ? design[e] : Math.max(0, Math.min(1, design[e] + sign * moveLimit))
+      }
+      const bound = densitySum(this.manufacturing.apply(trial, density, beta, false)) / density.length
+      if (sign * (bound - volFrac) < -1e-7) return false
+    }
+    return true
+  }
+
   step(): IterationSnapshot {
     if (this.done) throw new Error('This optimization has already finished.')
     const { params } = this.problem
-    if (this.iteration === 0) this.analyze(this.physicalDensity())
+    const attempted = this.advanceBeta
+    const continued = attempted && this.betaFeasible(2 * this.beta)
+    if (attempted) this.betaSince = this.iteration
+    if (continued) this.beta *= 2
+    if (this.iteration === 0 || continued) this.analyze(this.physicalDensity())
     const change = this.update(this.gradient)
     const physical = this.physicalDensity()
     const analysis = this.analyze(physical)
     this.iteration++
-    this.done = this.iteration >= params.maxIter || change <= params.changeTol
+    this.advanceBeta = !!params.heaviside && this.beta < 16
+      && (this.iteration - this.betaSince >= 20 || (change <= params.changeTol && (!attempted || continued)))
+    this.done = this.iteration >= params.maxIter || (!this.advanceBeta && change <= params.changeTol)
     return {
       iteration: this.iteration,
       density: Float32Array.from(physical),
@@ -258,10 +300,11 @@ export class Simp2D {
       caseVonMises: this.caseVonMises.map(stress => stress.slice()),
       displacements: this.displacements.map(u => u.slice()),
       compliance: analysis.compliance,
-      volFrac: physical.reduce((sum, value) => sum + value, 0) / physical.length,
+      volFrac: densitySum(physical) / physical.length,
       change,
       maxVonMises: analysis.maxVonMises,
       done: this.done,
+      beta: params.heaviside ? this.beta : undefined,
     }
   }
 }

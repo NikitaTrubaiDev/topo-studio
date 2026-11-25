@@ -1,39 +1,62 @@
-import type { Grid } from './types'
+import { nodeIndex, type Grid } from './types'
+
+export function elementDofs(grid: Grid) {
+  const { nelx, nely } = grid
+  const dofs = new Uint32Array(nelx * nely * 8)
+  for (let y = 0; y < nely; y++) {
+    for (let x = 0; x < nelx; x++) {
+      const bl = 2 * nodeIndex(grid, x, y)
+      const tl = 2 * nodeIndex(grid, x, y + 1)
+      const start = 8 * (y * nelx + x)
+      for (let k = 0; k < 4; k++) dofs[start + k] = bl + k
+      dofs[start + 4] = tl + 2
+      dofs[start + 5] = tl + 3
+      dofs[start + 6] = tl
+      dofs[start + 7] = tl + 1
+    }
+  }
+  return dofs
+}
+
+export function createQ4Stencil({ nelx, nely }: Grid) {
+  const width = nelx + 1
+  const size = 2 * width * (nely + 1)
+  const offsets = new Uint32Array(size + 1)
+  const columns = new Uint32Array(4 * (3 * nelx + 1) * (3 * nely + 1))
+  const diagonalSlots = new Uint32Array(size)
+  let slot = 0
+  for (let row = 0; row < size; row++) {
+    offsets[row] = slot
+    const x = (row >> 1) % width, y = Math.floor((row >> 1) / width)
+    for (let ny = Math.max(0, y - 1); ny <= Math.min(nely, y + 1); ny++) {
+      for (let nx = Math.max(0, x - 1); nx <= Math.min(nelx, x + 1); nx++) {
+        const col = 2 * (ny * width + nx)
+        if (x === nx && y === ny) diagonalSlots[row] = slot + (row & 1)
+        columns[slot++] = col
+        columns[slot++] = col + 1
+      }
+    }
+  }
+  offsets[size] = slot
+  return { offsets, columns, diagonalSlots }
+}
 
 /** Cache the Q4 stencil for repeated matrix-vector products within each elasticity solve. */
 export class Stiffness2D {
   readonly diagonal: Float64Array
-  private readonly offsets: Uint32Array
-  private readonly columns: Uint32Array
-  private readonly entries: Float64Array
+  readonly offsets: Uint32Array
+  readonly columns: Uint32Array
+  readonly entries: Float64Array
   private readonly elementSlots: Uint32Array
-  private readonly diagonalSlots: Uint32Array
-  private readonly factor: Float64Array
-  private readonly factorsInverse: Float64Array
+  readonly diagonalSlots: Uint32Array
 
-  constructor({ nelx, nely }: Grid, private readonly fixed: Uint8Array, dofs: Uint32Array) {
-    const width = nelx + 1
-    this.offsets = new Uint32Array(fixed.length + 1)
+  constructor(grid: Grid, private readonly fixed: Uint8Array, dofs: Uint32Array) {
+    const { offsets, columns, diagonalSlots } = createQ4Stencil(grid)
+    this.offsets = offsets
+    this.columns = columns
+    this.diagonalSlots = diagonalSlots
     this.diagonal = new Float64Array(fixed.length)
-    this.diagonalSlots = new Uint32Array(fixed.length)
-    const columns: number[] = []
-    for (let row = 0; row < fixed.length; row++) {
-      const node = row >> 1
-      const x = node % width, y = Math.floor(node / width)
-      this.offsets[row] = columns.length
-      for (let ny = Math.max(0, y - 1); ny <= Math.min(nely, y + 1); ny++) {
-        for (let nx = Math.max(0, x - 1); nx <= Math.min(nelx, x + 1); nx++) {
-          const column = 2 * (ny * width + nx)
-          if (row === column || row === column + 1) this.diagonalSlots[row] = columns.length + (row % 2)
-          columns.push(column, column + 1)
-        }
-      }
-    }
-    this.offsets[fixed.length] = columns.length
-    this.columns = Uint32Array.from(columns)
     this.entries = new Float64Array(columns.length)
-    this.factor = new Float64Array(columns.length)
-    this.factorsInverse = new Float64Array(fixed.length)
     this.elementSlots = new Uint32Array(dofs.length * 8)
     for (let e = 0; e < dofs.length; e += 8) {
       for (let i = 0; i < 8; i++) {
@@ -73,48 +96,6 @@ export class Stiffness2D {
       }
       for (; k < end; k++) sum += entries[k] * input[columns[k]]
       output[row] = sum
-    }
-  }
-
-  /** IC(0) with diagonal shifts for stiff/soft layouts that would cause a nonpositive pivot. */
-  preparePreconditioner() {
-    const { offsets, columns, diagonalSlots, entries, factor, factorsInverse, diagonal } = this
-    for (const shift of [0, 0.01, 0.05, 0.2, 1]) {
-      let row = 0
-      for (; row < diagonal.length; row++) {
-        const start = offsets[row], end = diagonalSlots[row]
-        let pivot = diagonal[row] * (1 + shift)
-        for (let k = start; k < end; k++) {
-          const column = columns[k]
-          let value = entries[k]
-          let a = start, b = offsets[column]
-          const stop = diagonalSlots[column]
-          while (a < k && b < stop) {
-            if (columns[a] < columns[b]) a++
-            else if (columns[b] < columns[a]) b++
-            else value -= factor[a++] * factor[b++]
-          }
-          factor[k] = value * factorsInverse[column]
-          pivot -= factor[k] * factor[k]
-        }
-        if (!(pivot > 1e-8 * diagonal[row])) break
-        factorsInverse[row] = 1 / Math.sqrt(pivot)
-      }
-      if (row === diagonal.length) return this.precondition
-    }
-    return undefined
-  }
-
-  private readonly precondition = (input: Float64Array, output: Float64Array) => {
-    const { offsets, columns, factor, factorsInverse, diagonalSlots } = this
-    for (let row = 0; row < output.length; row++) {
-      let sum = input[row]
-      for (let k = offsets[row]; k < diagonalSlots[row]; k++) sum -= factor[k] * output[columns[k]]
-      output[row] = sum * factorsInverse[row]
-    }
-    for (let row = output.length - 1; row >= 0; row--) {
-      output[row] *= factorsInverse[row]
-      for (let k = offsets[row]; k < diagonalSlots[row]; k++) output[columns[k]] -= factor[k] * output[row]
     }
   }
 }

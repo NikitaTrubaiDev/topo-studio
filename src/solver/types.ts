@@ -1,9 +1,11 @@
-/** Square elements of unit thickness, numbered left to right and bottom to top. */
+/** Square elements, numbered left to right and bottom to top. */
 export interface Grid {
   nelx: number
   nely: number
   /** Side length in mm. Defaults to 1 for element counts without a physical scale. */
   cellSizeMm?: number
+  /** Plane-stress thickness in mm. Defaults to 1 for legacy solver callers. */
+  thicknessMm?: number
 }
 
 /** Elastic moduli and yield stress in MPa. Density is in kg/m³. */
@@ -16,7 +18,18 @@ export interface Material {
   yieldMPa: number
 }
 
+export type Symmetry = 'none' | 'x' | 'y' | 'xy'
+export type BuildDirection = '+Y' | '-Y' | '+X' | '-X'
+
 export interface SimpParams {
+  /** Enable tanh projection with beta continuation and eta = 0.5. */
+  heaviside?: boolean
+  /** Mirror left/right (x), bottom/top (y), or both. */
+  symmetry?: Symmetry
+  /** Build direction for the 45-degree additive manufacturing filter. */
+  overhang?: BuildDirection
+  /** Defaults to multigrid where the grid can be coarsened. */
+  preconditioner?: 'multigrid' | 'jacobi'
   /** SIMP stiffness penalization exponent (at least 1). */
   penal: number
   /** Cone radius in element widths. */
@@ -47,6 +60,9 @@ export interface NodalForce {
 export interface LoadCase {
   id: string
   name: string
+  generatedNumber?: number
+  /** Translation key for the default name of a preset load case. */
+  presetName?: 'caseMbb' | 'caseCantilever' | 'caseBridge' | 'caseBracket' | 'caseBump' | 'caseRebound'
   forces: readonly NodalForce[]
 }
 
@@ -78,6 +94,7 @@ export interface IterationSnapshot {
   volFrac: number
   change: number
   maxVonMises: number
+  beta?: number
   done: boolean
 }
 

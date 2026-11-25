@@ -69,6 +69,7 @@ export function pcg(
     return { u, iterations: 0, relativeResidual: 0, converged: true }
   }
 
+  const target = forceSquared * tolerance ** 2
   let squared = 0
   let preconditioned = 0
   function restartResidual() {
@@ -80,6 +81,7 @@ export function pcg(
       residual[i] = r
       squared += r * r
     }
+    if (squared <= target) return
     if (precondition) precondition(residual, direction)
     for (let i = 0; i < size; i++) {
       direction[i] = fixed[i] ? 0 : precondition ? direction[i] : residual[i] * inverse[i]
@@ -87,7 +89,6 @@ export function pcg(
     }
   }
 
-  const target = forceSquared * tolerance ** 2
   restartResidual()
   let iterations = 0
   while (squared > target && iterations < maxIterations) {

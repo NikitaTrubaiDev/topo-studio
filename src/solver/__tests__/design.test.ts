@@ -1,11 +1,11 @@
 import { expect, it } from 'vitest'
 import { addLoadCase, editSupport, hasFreeLoad, loadCaseIndex, paintMask, setForce, supportError } from '../design'
-import { makePreset, presets, type PresetId } from '../presets'
+import { makePreset } from '../presets'
 import { Simp2D } from '../simp2d'
 import { nodeIndex } from '../types'
 
 for (const nelx of [120, 180]) {
-  for (const preset of Object.keys(presets) as PresetId[]) {
+  for (const preset of ['mbb', 'cantilever', 'bridge', 'bracket'] as const) {
     it(`solves ${preset} at ${nelx} × ${nelx / 3} with the same total load`, () => {
       const grid = { nelx, nely: nelx / 3, cellSizeMm: 120 / nelx }
       const problem = makePreset(preset, grid)
