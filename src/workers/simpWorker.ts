@@ -35,6 +35,7 @@ function iterate() {
     send({ type: 'frame', snapshot }, [
       snapshot.density.buffer,
       snapshot.vonMises.buffer,
+      ...snapshot.caseVonMises.map(stress => stress.buffer),
       ...snapshot.displacements.map(u => u.buffer),
     ])
     if (finished) stop()

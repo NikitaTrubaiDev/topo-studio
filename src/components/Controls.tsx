@@ -1,14 +1,14 @@
+import type { ReactNode } from 'react'
 import { materials, presets, type PresetId } from '../solver/presets'
 import type { Grid, SimpParams } from '../solver/types'
 
 export type MaterialId = keyof typeof materials
 
-export const resolutions: Record<string, Grid> = {
-  '30 × 10': { nelx: 30, nely: 10 },
-  '48 × 16': { nelx: 48, nely: 16 },
-  '72 × 24': { nelx: 72, nely: 24 },
-  '96 × 32': { nelx: 96, nely: 32 },
-}
+export const resolutions: Record<string, Grid> = Object.fromEntries(
+  [30, 48, 60, 72, 96, 120, 150, 180].map(nelx => [`${nelx} × ${nelx / 3}`, {
+    nelx, nely: nelx / 3, cellSizeMm: 120 / nelx,
+  }]),
+)
 
 export interface Settings {
   preset: PresetId
@@ -17,7 +17,9 @@ export interface Settings {
   params: SimpParams
 }
 
-export function Controls({ settings, setSettings }: { settings: Settings; setSettings: (value: Settings) => void }) {
+export function Controls({ settings, setSettings, children }: {
+  settings: Settings; setSettings: (value: Settings) => void; children: ReactNode
+}) {
   const { preset, resolution, material, params } = settings
   const patch = (value: Partial<Settings>) => setSettings({ ...settings, ...value })
   const parameter = (key: keyof SimpParams, value: number) => patch({ params: { ...params, [key]: value } })
@@ -58,6 +60,7 @@ export function Controls({ settings, setSettings }: { settings: Settings; setSet
           <div><dt>Poisson’s ratio</dt><dd>{materials[material].nu.toFixed(2)}</dd></div>
         </dl>
       </section>
+      {children}
     </aside>
   )
 }

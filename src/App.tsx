@@ -1,9 +1,22 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ConvergenceChart, type Sample } from './components/ConvergenceChart'
 import { Controls, resolutions, type Settings } from './components/Controls'
-import { Viewport } from './components/Viewport'
+import { Viewport, type ViewMode } from './components/Viewport'
+import { LoadCases } from './components/LoadCases'
+import { ExportDialog, type ContourSettings } from './components/ExportDialog'
+import { contourField, extractContours } from './solver/contour'
+import { addLoadCase, hasFreeLoad, supportError } from './solver/design'
+import type { SimpProblem } from './solver/types'
 import { defaultParams, makePreset, materials, presets } from './solver/presets'
 import type { TimedSnapshot, WorkerCommand, WorkerEvent } from './workers/protocol'
+
+type Design = Pick<SimpProblem, 'supports' | 'loadCases' | 'passive'>
+interface History {
+  past: Design[]
+  present?: Design
+  future: Design[]
+}
+const initialHistory: History = { past: [], future: [] }
 
 type RunState = 'ready' | 'running' | 'pausing' | 'paused' | 'stepping' | 'complete' | 'error'
 
@@ -28,12 +41,26 @@ export default function App() {
   const [frame, setFrame] = useState<TimedSnapshot>()
   const [samples, setSamples] = useState<Sample[]>([])
   const [error, setError] = useState('')
+  const [history, setHistory] = useState(initialHistory)
+  const [selectedCase, setSelectedCase] = useState(0)
+  const [mode, setMode] = useState<ViewMode>('density')
+  const [exportOpen, setExportOpen] = useState(false)
+  const [contour, setContour] = useState<ContourSettings>({ threshold: 0.5, smoothing: 3, thickness: 10 })
   const workerRef = useRef<Worker | null>(null)
   const paintRequest = useRef<number | undefined>(undefined)
   const queued = useRef<TimedSnapshot | undefined>(undefined)
-  const problem = useMemo(() => makePreset(
+  const presetProblem = useMemo(() => makePreset(
     settings.preset, resolutions[settings.resolution], settings.params, materials[settings.material],
   ), [settings])
+  const design = history.present
+  const problem = useMemo(() => ({ ...presetProblem, ...design }), [presetProblem, design])
+  const activeCase = Math.min(selectedCase, problem.loadCases.length - 1)
+  const constraint = useMemo(() => supportError(problem.grid, problem.supports)
+    ?? (hasFreeLoad(problem) ? undefined : 'Apply a force to at least one unrestrained degree of freedom.'), [problem])
+  const showContours = mode === 'cad' || exportOpen
+  const loops = useMemo(() => showContours
+    ? extractContours(contourField(problem, frame?.density), problem.grid, contour.threshold, contour.smoothing) : [],
+  [showContours, problem, frame, contour.threshold, contour.smoothing])
 
   useEffect(() => () => {
     workerRef.current?.terminate()
@@ -57,10 +84,47 @@ export default function App() {
 
   function changeSettings(value: Settings) {
     reset()
+    if (value.preset !== settings.preset || value.resolution !== settings.resolution) {
+      setHistory(initialHistory)
+      setSelectedCase(0)
+    }
     setSettings(value)
   }
 
+  function edit({ supports, loadCases, passive }: Design) {
+    reset()
+    const { supports: oldSupports, loadCases: oldLoads, passive: oldMasks } = problem
+    setHistory(current => ({
+      past: [...current.past.slice(-79), { supports: oldSupports, loadCases: oldLoads, passive: oldMasks }],
+      present: { supports, loadCases, passive },
+      future: [],
+    }))
+  }
+
+  function undo() {
+    const previous = history.past.at(-1)
+    if (!previous) return
+    reset()
+    setHistory({
+      past: history.past.slice(0, -1),
+      present: previous,
+      future: [history.present ?? presetProblem, ...history.future],
+    })
+  }
+
+  function redo() {
+    const next = history.future[0]
+    if (!next) return
+    reset()
+    setHistory({
+      past: [...history.past, history.present ?? presetProblem],
+      present: next,
+      future: history.future.slice(1),
+    })
+  }
+
   function send(type: 'start' | 'pause' | 'step') {
+    if (type !== 'pause' && constraint) return
     try {
       let worker = workerRef.current
       if (!worker) {
@@ -111,7 +175,7 @@ export default function App() {
     }
   }
 
-  const canRun = runState === 'ready' || runState === 'paused'
+  const canRun = !constraint && (runState === 'ready' || runState === 'paused')
   const metrics = [
     { label: 'Iteration', value: frame?.iteration ?? '—', unit: '' },
     { label: 'Compliance', value: display(frame?.compliance, 4), unit: 'N·mm' },
@@ -136,14 +200,45 @@ export default function App() {
         </div>
       </header>
       <main className="workspace">
-        <Controls settings={settings} setSettings={changeSettings} />
+        <Controls settings={settings} setSettings={changeSettings}>
+          <LoadCases cases={problem.loadCases} active={activeCase} onSelect={setSelectedCase}
+            onAdd={() => {
+              edit({ ...problem, loadCases: addLoadCase(problem.loadCases) })
+              setSelectedCase(problem.loadCases.length)
+            }}
+            onRemove={() => {
+              if (problem.loadCases.length === 1) return
+              edit({ ...problem, loadCases: problem.loadCases.filter((_, i) => i !== activeCase) })
+              setSelectedCase(Math.min(activeCase, problem.loadCases.length - 2))
+            }}
+            onRename={name => edit({
+              ...problem, loadCases: problem.loadCases.map((load, i) => i === activeCase ? { ...load, name } : load),
+            })} />
+        </Controls>
         <div className="results">
           <div className="result-header">
             <h2>{presets[settings.preset].name}</h2>
-            <span className={`status status-${runState}`} role="status"><i />{stateLabels[runState]}</span>
+            <div className="action-row result-actions">
+              <span className={`status status-${runState}`} role="status"><i />{stateLabels[runState]}</span>
+              <button className="tool-button" type="button" disabled={!history.past.length} onClick={undo}>Undo</button>
+              <button className="tool-button" type="button" disabled={!history.future.length} onClick={redo}>Redo</button>
+              <button className="tool-button" type="button" onClick={() => {
+                if (design) edit(presetProblem)
+                else reset()
+                setSelectedCase(0)
+              }}>Reset to preset</button>
+              <button className="tool-button export-trigger" type="button" onClick={() => {
+                setMode('cad')
+                setExportOpen(true)
+              }}>Export</button>
+            </div>
           </div>
           {error && <p role="alert" className="error">{error} Reset to run again.</p>}
-          <Viewport problem={problem} frame={frame} />
+          {constraint && <p className="constraint-warning" role="alert">{constraint}</p>}
+          <Viewport key={`${settings.preset}/${settings.resolution}`} problem={problem} frame={frame} loops={loops}
+            mode={mode} setMode={setMode} activeCase={activeCase} onChange={edit} />
+          {exportOpen && <ExportDialog loops={loops} grid={problem.grid} settings={contour}
+            setSettings={setContour} onClose={() => setExportOpen(false)} />}
           <section className="panel telemetry" aria-label="Iteration telemetry">
             <dl>{metrics.map(({ label, value, unit }) => (
               <div key={label}><dt>{label}</dt><dd>{value}{unit && <span>{unit}</span>}</dd></div>

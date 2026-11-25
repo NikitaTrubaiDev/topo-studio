@@ -1,7 +1,9 @@
-/** Unit square elements (1 mm side, 1 mm thickness), numbered left to right and bottom to top. */
+/** Square elements of unit thickness, numbered left to right and bottom to top. */
 export interface Grid {
   nelx: number
   nely: number
+  /** Side length in mm. Defaults to 1 for element counts without a physical scale. */
+  cellSizeMm?: number
 }
 
 /** Elastic moduli and yield stress in MPa. Density is in kg/m³. */
@@ -32,6 +34,8 @@ export interface Support {
   node: number
   fixedX: boolean
   fixedY: boolean
+  /** Drawing symbol. Pins and clamps both fix the two translational DOFs. */
+  kind?: 'fixed' | 'pin' | 'roller-x' | 'roller-y'
 }
 
 export interface NodalForce {
@@ -64,6 +68,8 @@ export interface IterationSnapshot {
   density: Float32Array
   /** Peak center von Mises stress per element across load cases, in MPa. */
   vonMises: Float32Array
+  /** Center von Mises stress (MPa), one element field per load case. */
+  caseVonMises: Float32Array[]
   /** Interleaved X and Y translations in mm, one vector per load case. */
   displacements: Float64Array[]
   /** Sum of Fᵀu for all load cases, in N·mm. */

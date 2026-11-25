@@ -38,12 +38,18 @@ it('steps once, streams transferable frames, pauses, resumes, and clears queued 
   vi.stubGlobal('self', scope)
   await import('../simpWorker')
   const problem = makePreset('mbb', { nelx: 12, nely: 4 })
+  problem.loadCases = [...problem.loadCases, { name: 'Unloaded', forces: [] }]
   const send = (data: WorkerCommand) => scope.onmessage!({ data })
   const iterations = () => events.flatMap(event => event.type === 'frame' ? [event.snapshot.iteration] : [])
 
   send({ type: 'init', problem })
   send({ type: 'step' })
   expect(iterations()).toEqual([1])
+  const event = events[0]
+  if (event.type !== 'frame') throw new Error('Expected a solver frame.')
+  expect(event.snapshot.caseVonMises).toHaveLength(2)
+  expect(event.snapshot.caseVonMises[0]).toEqual(event.snapshot.vonMises)
+  expect(event.snapshot.caseVonMises[1]).toEqual(new Float32Array(48))
   expect(vi.getTimerCount()).toBe(0)
   send({ type: 'start' })
   vi.advanceTimersToNextTimer()

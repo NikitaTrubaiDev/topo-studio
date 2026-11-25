@@ -1,3 +1,5 @@
+import { supportError } from './design'
+import { Stiffness2D } from './stiffness'
 import { centerB, elementStiffness, planeStressD } from './elementQ4'
 import { DensityFilter } from './filter'
 import { pcg, PcgWorkspace } from './pcg'
@@ -28,10 +30,11 @@ export class Simp2D {
   private readonly design: Float64Array
   private readonly density: Float64Array
   private readonly modulus: Float64Array
-  private readonly diagonal: Float64Array
+  private readonly stiffness: Stiffness2D
   private readonly pcgWorkspace: PcgWorkspace
   private readonly displacements: Float64Array[]
   private readonly vonMises: Float32Array
+  private readonly caseVonMises: Float32Array[]
   private readonly physicalGradient: Float64Array
   private readonly gradient: Float64Array
   private readonly drive: Float64Array
@@ -47,6 +50,8 @@ export class Simp2D {
     if (!Number.isSafeInteger(nelx) || !Number.isSafeInteger(nely) || nelx < 1 || nely < 1) {
       throw new Error('Grid dimensions must be positive integers.')
     }
+    const cellSize = grid.cellSizeMm ?? 1
+    if (!Number.isFinite(cellSize) || cellSize <= 0) throw new Error('Element size must be finite and positive.')
     if (!Number.isFinite(material.E0) || !(material.E0 > material.Emin && material.Emin > 0)
       || !(material.nu > -1 && material.nu < 0.5)) {
       throw new Error('Material requires E0 > Emin > 0 and −1 < ν < 0.5.')
@@ -61,7 +66,8 @@ export class Simp2D {
     const elements = nelx * nely
     const nodes = (nelx + 1) * (nely + 1)
     this.ke = elementStiffness(1, material.nu)
-    this.stressD = planeStressD(1, material.nu)
+    // Square element stiffness is invariant to side length. Strain scales as 1 / side length.
+    this.stressD = planeStressD(1 / cellSize, material.nu)
     this.dofs = new Uint32Array(elements * 8)
     for (let y = 0; y < nely; y++) {
       for (let x = 0; x < nelx; x++) {
@@ -76,23 +82,12 @@ export class Simp2D {
       }
     }
     this.fixed = new Uint8Array(nodes * 2)
-    const supportRows = new Set<number>()
-    const supportColumns = new Set<number>()
+    const issue = supportError(grid, supports)
+    if (issue) throw new Error(issue)
     for (const { node, fixedX, fixedY } of supports) {
-      if (!Number.isInteger(node) || node < 0 || node >= nodes) throw new Error('Support node is outside the grid.')
-      if (fixedX) {
-        this.fixed[2 * node] = 1
-        supportRows.add(Math.floor(node / (nelx + 1)))
-      }
-      if (fixedY) {
-        this.fixed[2 * node + 1] = 1
-        supportColumns.add(node % (nelx + 1))
-      }
-    }
-    if (!supportRows.size || !supportColumns.size || supportRows.size + supportColumns.size < 3) {
-      throw new Error('Supports must restrain both rigid translations and rotation.')
-    }
-    if (!loadCases.length) throw new Error('At least one load case is required.')
+      if (fixedX) this.fixed[2 * node] = 1
+      if (fixedY) this.fixed[2 * node + 1] = 1
+    }    if (!loadCases.length) throw new Error('At least one load case is required.')
     this.forces = loadCases.map(({ forces }) => {
       const vector = new Float64Array(nodes * 2)
       for (const { node, fx, fy } of forces) {
@@ -113,10 +108,11 @@ export class Simp2D {
     this.design = new Float64Array(elements)
     this.density = new Float64Array(elements)
     this.modulus = new Float64Array(elements)
-    this.diagonal = new Float64Array(this.fixed.length)
+    this.stiffness = new Stiffness2D(grid, this.fixed, this.dofs)
     this.pcgWorkspace = new PcgWorkspace(this.fixed.length)
     this.displacements = this.forces.map(force => new Float64Array(force.length))
     this.vonMises = new Float32Array(elements)
+    this.caseVonMises = this.forces.map(() => new Float32Array(elements))
     this.physicalGradient = new Float64Array(elements)
     this.gradient = new Float64Array(elements)
     this.drive = new Float64Array(elements)
@@ -166,41 +162,14 @@ export class Simp2D {
     return density
   }
 
-  private readonly multiply = (input: Float64Array, output: Float64Array) => {
-    const { modulus, dofs, ke } = this
-    output.fill(0)
-    for (let e = 0; e < modulus.length; e++) {
-      const start = 8 * e
-      const scale = modulus[e]
-      const u0 = input[dofs[start]]
-      const u1 = input[dofs[start + 1]]
-      const u2 = input[dofs[start + 2]]
-      const u3 = input[dofs[start + 3]]
-      const u4 = input[dofs[start + 4]]
-      const u5 = input[dofs[start + 5]]
-      const u6 = input[dofs[start + 6]]
-      const u7 = input[dofs[start + 7]]
-      for (let i = 0; i < 8; i++) {
-        const row = 8 * i
-        output[dofs[start + i]] += scale * (
-          ke[row] * u0 + ke[row + 1] * u1 + ke[row + 2] * u2 + ke[row + 3] * u3
-          + ke[row + 4] * u4 + ke[row + 5] * u5 + ke[row + 6] * u6 + ke[row + 7] * u7
-        )
-      }
-    }
-  }
-
   private analyze(density: Float64Array) {
     const { E0, Emin } = this.problem.material
     const { penal } = this.problem.params
-    const { dofs, ke, fixed, stressD, modulus, diagonal, physicalGradient, vonMises } = this
-    diagonal.fill(0)
-    for (let e = 0; e < modulus.length; e++) {
-      const stiffness = Emin + (E0 - Emin) * density[e] ** penal
-      modulus[e] = stiffness
-      const start = 8 * e
-      for (let i = 0; i < 8; i++) diagonal[dofs[start + i]] += stiffness * ke[9 * i]
-    }
+    const { dofs, ke, fixed, stressD, modulus, stiffness, physicalGradient, vonMises } = this
+    for (let e = 0; e < modulus.length; e++) modulus[e] = Emin + (E0 - Emin) * density[e] ** penal
+    stiffness.assemble(modulus, ke)
+    const precondition = stiffness.preparePreconditioner()
+    const tolerance = density.length >= 4_800 && this.iteration < 20 ? 1e-5 : 1e-6
     physicalGradient.fill(0)
     vonMises.fill(0)
     let compliance = 0
@@ -208,7 +177,10 @@ export class Simp2D {
     for (let caseIndex = 0; caseIndex < this.forces.length; caseIndex++) {
       const force = this.forces[caseIndex]
       const u = this.displacements[caseIndex]
-      const result = pcg(this.multiply, diagonal, force, fixed, {
+      const caseStress = this.caseVonMises[caseIndex]
+      const result = pcg(stiffness.multiply, stiffness.diagonal, force, fixed, {
+        precondition,
+        tolerance,
         initial: u,
         output: u,
         workspace: this.pcgWorkspace,
@@ -235,7 +207,8 @@ export class Simp2D {
         const sy = modulus[e] * (stressD[3] * ex + stressD[4] * ey)
         const shear = modulus[e] * stressD[8] * gamma
         const stress = Math.sqrt(sx * sx - sx * sy + sy * sy + 3 * shear * shear)
-        vonMises[e] = Math.max(vonMises[e], stress)
+        caseStress[e] = stress
+        vonMises[e] = Math.max(vonMises[e], caseStress[e])
         maxVonMises = Math.max(maxVonMises, stress)
       }
     }
@@ -300,6 +273,7 @@ export class Simp2D {
       iteration: this.iteration,
       density: Float32Array.from(physical),
       vonMises: this.vonMises.slice(),
+      caseVonMises: this.caseVonMises.map(stress => stress.slice()),
       displacements: this.displacements.map(u => u.slice()),
       compliance: analysis.compliance,
       volFrac: physical.reduce((sum, value) => sum + value, 0) / physical.length,

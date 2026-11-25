@@ -1,4 +1,4 @@
-import { nodeIndex, type Grid, type Material, type NodalForce, type SimpParams, type SimpProblem } from './types'
+import { nodeIndex, type Grid, type Material, type NodalForce, type SimpParams, type SimpProblem, type Support } from './types'
 
 export const materials = {
   steel: { name: 'Steel', E0: 200_000, Emin: 0.2, nu: 0.30, densityKgM3: 7850, yieldMPa: 250 },
@@ -34,14 +34,15 @@ export function makePreset(
   const { nelx, nely } = grid
   const node = (x: number, y: number) => nodeIndex(grid, x, y)
   const force = (x: number, y: number, fy = -100): NodalForce => ({ node: node(x, y), fx: 0, fy })
-  const support = (x: number, y: number, fixedX = true, fixedY = true) => ({ node: node(x, y), fixedX, fixedY })
+  const support = (x: number, y: number, kind: NonNullable<Support['kind']> = 'fixed'): Support =>
+    ({ node: node(x, y), kind, fixedX: kind !== 'roller-x', fixedY: kind !== 'roller-y' })
   const leftEdge = Array.from({ length: nely + 1 }, (_, y) => support(0, y))
   const problem = { grid, params, material }
   switch (id) {
     case 'mbb':
       return {
         ...problem,
-        supports: [...leftEdge.map(s => ({ ...s, fixedY: false })), support(nelx, 0, false)],
+        supports: [...leftEdge.map((_, y) => support(0, y, 'roller-y')), support(nelx, 0, 'roller-x')],
         loadCases: [{ name: 'Top-left load', forces: [force(0, nely)] }],
       }
     case 'cantilever': {
@@ -53,7 +54,7 @@ export function makePreset(
     case 'bridge':
       return {
         ...problem,
-        supports: [support(0, 0), support(nelx, 0, false)],
+        supports: [support(0, 0, 'pin'), support(nelx, 0, 'roller-x')],
         loadCases: [{
           name: 'Deck load',
           forces: Array.from({ length: nelx + 1 }, (_, x) =>
