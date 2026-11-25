@@ -1,6 +1,6 @@
 import { centerB, elementStiffness, planeStressD } from './elementQ4'
 import { DensityFilter } from './filter'
-import { pcg } from './pcg'
+import { pcg, PcgWorkspace } from './pcg'
 import { nodeIndex, type IterationSnapshot, type SimpProblem } from './types'
 
 function dotElement(matrix: Float64Array, row: number, vector: Float64Array, dofs: Uint32Array, start: number) {
@@ -12,14 +12,6 @@ function dotElement(matrix: Float64Array, row: number, vector: Float64Array, dof
     + matrix[row + 5] * vector[dofs[start + 5]]
     + matrix[row + 6] * vector[dofs[start + 6]]
     + matrix[row + 7] * vector[dofs[start + 7]]
-}
-
-interface Analysis {
-  gradient: Float64Array
-  displacements: Float64Array[]
-  vonMises: Float32Array
-  compliance: number
-  maxVonMises: number
 }
 
 export class Simp2D {
@@ -34,7 +26,18 @@ export class Simp2D {
   private readonly ke: Float64Array
   private readonly stressD: Float64Array
   private readonly design: Float64Array
-  private previous?: Analysis
+  private readonly density: Float64Array
+  private readonly modulus: Float64Array
+  private readonly diagonal: Float64Array
+  private readonly pcgWorkspace: PcgWorkspace
+  private readonly displacements: Float64Array[]
+  private readonly vonMises: Float32Array
+  private readonly physicalGradient: Float64Array
+  private readonly gradient: Float64Array
+  private readonly drive: Float64Array
+  private readonly lower: Float64Array
+  private readonly upper: Float64Array
+  private readonly trial: Float64Array
   private iteration = 0
   private done = false
 
@@ -105,9 +108,21 @@ export class Simp2D {
     if ([passive?.solid, passive?.void].some(mask => mask && mask.length !== elements)) {
       throw new Error('Passive masks must contain one entry per element.')
     }
-    this.filter = new DensityFilter(grid, params.rmin)
+    this.filter = new DensityFilter(grid, params.rmin, passive?.void)
     this.mask = new Int8Array(elements)
     this.design = new Float64Array(elements)
+    this.density = new Float64Array(elements)
+    this.modulus = new Float64Array(elements)
+    this.diagonal = new Float64Array(this.fixed.length)
+    this.pcgWorkspace = new PcgWorkspace(this.fixed.length)
+    this.displacements = this.forces.map(force => new Float64Array(force.length))
+    this.vonMises = new Float32Array(elements)
+    this.physicalGradient = new Float64Array(elements)
+    this.gradient = new Float64Array(elements)
+    this.drive = new Float64Array(elements)
+    this.lower = new Float64Array(elements)
+    this.upper = new Float64Array(elements)
+    this.trial = new Float64Array(elements)
     const volumeAtOutput = new Float64Array(elements)
     let solidCount = 0
     for (let e = 0; e < elements; e++) {
@@ -123,7 +138,7 @@ export class Simp2D {
       }
     }
 
-    // Passive variables act as fixed filter inputs, and passive outputs are overwritten.
+    // Passive solids are fixed filter inputs, and passive outputs are prescribed.
     // Only free output rows contribute derivatives with respect to the filter inputs.
     this.volumeGradient = this.filter.transpose(volumeAtOutput)
     this.fixedVolume = solidCount + this.volumeGradient.reduce((sum, weight, e) => sum + weight * this.design[e], 0)
@@ -144,48 +159,64 @@ export class Simp2D {
   }
 
   private physicalDensity() {
-    const density = this.filter.apply(this.design)
+    const density = this.filter.apply(this.design, this.density)
     for (let e = 0; e < density.length; e++) {
-      if (this.mask[e]) density[e] = this.mask[e] === 1 ? 1 : 0
-      else density[e] = Math.min(1, density[e])
+      if (this.mask[e] === 1) density[e] = 1
     }
     return density
   }
 
-  private analyze(density: Float64Array): Analysis {
-    const { E0, Emin } = this.problem.material
-    const { penal } = this.problem.params
-    const { dofs, ke, fixed, stressD } = this
-    const modulus = density.map(value => Emin + (E0 - Emin) * value ** penal)
-    const diagonal = new Float64Array(fixed.length)
+  private readonly multiply = (input: Float64Array, output: Float64Array) => {
+    const { modulus, dofs, ke } = this
+    output.fill(0)
     for (let e = 0; e < modulus.length; e++) {
       const start = 8 * e
-      for (let i = 0; i < 8; i++) diagonal[dofs[start + i]] += modulus[e] * ke[9 * i]
-    }
-    const multiply = (input: Float64Array, output: Float64Array) => {
-      output.fill(0)
-      for (let e = 0; e < modulus.length; e++) {
-        const start = 8 * e
-        const scale = modulus[e]
-        for (let i = 0; i < 8; i++) {
-          output[dofs[start + i]] += scale * dotElement(ke, 8 * i, input, dofs, start)
-        }
+      const scale = modulus[e]
+      const u0 = input[dofs[start]]
+      const u1 = input[dofs[start + 1]]
+      const u2 = input[dofs[start + 2]]
+      const u3 = input[dofs[start + 3]]
+      const u4 = input[dofs[start + 4]]
+      const u5 = input[dofs[start + 5]]
+      const u6 = input[dofs[start + 6]]
+      const u7 = input[dofs[start + 7]]
+      for (let i = 0; i < 8; i++) {
+        const row = 8 * i
+        output[dofs[start + i]] += scale * (
+          ke[row] * u0 + ke[row + 1] * u1 + ke[row + 2] * u2 + ke[row + 3] * u3
+          + ke[row + 4] * u4 + ke[row + 5] * u5 + ke[row + 6] * u6 + ke[row + 7] * u7
+        )
       }
     }
-    const gradient = new Float64Array(density.length)
-    const vonMises = new Float32Array(density.length)
+  }
+
+  private analyze(density: Float64Array) {
+    const { E0, Emin } = this.problem.material
+    const { penal } = this.problem.params
+    const { dofs, ke, fixed, stressD, modulus, diagonal, physicalGradient, vonMises } = this
+    diagonal.fill(0)
+    for (let e = 0; e < modulus.length; e++) {
+      const stiffness = Emin + (E0 - Emin) * density[e] ** penal
+      modulus[e] = stiffness
+      const start = 8 * e
+      for (let i = 0; i < 8; i++) diagonal[dofs[start + i]] += stiffness * ke[9 * i]
+    }
+    physicalGradient.fill(0)
+    vonMises.fill(0)
     let compliance = 0
     let maxVonMises = 0
-    const displacements = this.forces.map((force, caseIndex) => {
-      const result = pcg(multiply, diagonal, force, fixed, {
-        initial: this.previous?.displacements[caseIndex],
-        tolerance: 1e-9,
+    for (let caseIndex = 0; caseIndex < this.forces.length; caseIndex++) {
+      const force = this.forces[caseIndex]
+      const u = this.displacements[caseIndex]
+      const result = pcg(this.multiply, diagonal, force, fixed, {
+        initial: u,
+        output: u,
+        workspace: this.pcgWorkspace,
         maxIterations: Math.max(1000, fixed.length * 4),
       })
       if (!result.converged) {
         throw new Error(`PCG failed for load case ${caseIndex + 1} (relative residual ${result.relativeResidual.toExponential(2)}).`)
       }
-      const { u } = result
       for (let i = 0; i < force.length; i++) compliance += force[i] * u[i]
       for (let e = 0; e < density.length; e++) {
         if (this.mask[e] === -1) continue
@@ -195,7 +226,7 @@ export class Simp2D {
           for (let i = 0; i < 8; i++) {
             energy += u[dofs[start + i]] * dotElement(ke, 8 * i, u, dofs, start)
           }
-          gradient[e] -= penal * (E0 - Emin) * density[e] ** (penal - 1) * Math.max(0, energy)
+          physicalGradient[e] -= penal * (E0 - Emin) * density[e] ** (penal - 1) * Math.max(0, energy)
         }
         const ex = dotElement(centerB, 0, u, dofs, start)
         const ey = dotElement(centerB, 8, u, dofs, start)
@@ -207,16 +238,15 @@ export class Simp2D {
         vonMises[e] = Math.max(vonMises[e], stress)
         maxVonMises = Math.max(maxVonMises, stress)
       }
-      return u
-    })
-    return { gradient: this.filter.transpose(gradient), displacements, vonMises, compliance, maxVonMises }
+    }
+    this.filter.transpose(physicalGradient, this.gradient)
+    return { compliance, maxVonMises }
   }
 
   private update(gradient: Float64Array): number {
-    const { design, volumeGradient } = this
+    const { design, volumeGradient, drive, lower, upper, trial } = this
     const { moveLimit, volFrac } = this.problem.params
     const target = volFrac * design.length
-    const drive = new Float64Array(design.length)
     let maxDrive = 0
     for (let e = 0; e < design.length; e++) {
       if (volumeGradient[e] === 0) continue
@@ -225,15 +255,14 @@ export class Simp2D {
     }
     if (maxDrive === 0) return 0
 
-    const lower = design.map(value => Math.max(0, value - moveLimit))
-    const upper = design.map(value => Math.min(1, value + moveLimit))
-    const trial = design.slice()
     let lo = 0
     let hi = 0
     // Search in the Lagrange multiplier coordinate t = sqrt(maxDrive / lambda).
     // A small positive seed lets a variable at zero regain material if its sensitivity rises.
     for (let e = 0; e < design.length; e++) {
       if (volumeGradient[e] === 0) continue
+      lower[e] = Math.max(0, design[e] - moveLimit)
+      upper[e] = Math.min(1, design[e] + moveLimit)
       drive[e] = Math.max(1e-8, design[e]) * Math.sqrt(Math.max(1e-12, drive[e] / maxDrive))
       hi = Math.max(hi, upper[e] / drive[e])
     }
@@ -251,6 +280,7 @@ export class Simp2D {
     }
     let change = 0
     for (let e = 0; e < design.length; e++) {
+      if (volumeGradient[e] === 0) continue
       change = Math.max(change, Math.abs(trial[e] - design[e]))
       design[e] = trial[e]
     }
@@ -260,18 +290,17 @@ export class Simp2D {
   step(): IterationSnapshot {
     if (this.done) throw new Error('This optimization has already finished.')
     const { params } = this.problem
-    if (!this.previous) this.previous = this.analyze(this.physicalDensity())
-    const change = this.update(this.previous.gradient)
+    if (this.iteration === 0) this.analyze(this.physicalDensity())
+    const change = this.update(this.gradient)
     const physical = this.physicalDensity()
     const analysis = this.analyze(physical)
-    this.previous = analysis
     this.iteration++
     this.done = this.iteration >= params.maxIter || change <= params.changeTol
     return {
       iteration: this.iteration,
       density: Float32Array.from(physical),
-      vonMises: analysis.vonMises,
-      displacements: analysis.displacements.map(u => u.slice()),
+      vonMises: this.vonMises.slice(),
+      displacements: this.displacements.map(u => u.slice()),
       compliance: analysis.compliance,
       volFrac: physical.reduce((sum, value) => sum + value, 0) / physical.length,
       change,

@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from 'react'
+import { useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { SimpProblem } from '../solver/types'
 import type { TimedSnapshot } from '../workers/protocol'
 
@@ -55,8 +55,8 @@ function drawForce(ctx: CanvasRenderingContext2D, point: Point, fx: number, fy: 
 }
 
 function paint(
-  canvas: HTMLCanvasElement, problem: SimpProblem, frame: TimedSnapshot | undefined,
-  mode: ViewMode, overlays: Overlays, magnification: number,
+  canvas: HTMLCanvasElement, raster: HTMLCanvasElement, problem: SimpProblem, frame: TimedSnapshot | undefined,
+  mode: ViewMode, overlays: Overlays, magnification: number, stressLimit: number,
 ) {
   const { clientWidth: width, clientHeight: height } = canvas
   const ratio = window.devicePixelRatio || 1
@@ -84,7 +84,7 @@ function paint(
   const density = (e: number) => frame?.density[e] ?? (passive?.void?.[e] ? 0 : passive?.solid?.[e] ? 1 : params.volFrac)
   const palette = mode === 'stress' ? stressStops : densityStops
   const valueAt = (e: number) => mode === 'stress'
-    ? (frame?.vonMises[e] ?? 0) / (frame?.maxVonMises || 1)
+    ? (frame?.vonMises[e] ?? 0) / (stressLimit || 1)
     : density(e)
 
   ctx.fillStyle = '#141d25'
@@ -109,9 +109,8 @@ function paint(
       }
     }
   } else {
-    const raster = document.createElement('canvas')
-    raster.width = nelx
-    raster.height = nely
+    if (raster.width !== nelx) raster.width = nelx
+    if (raster.height !== nely) raster.height = nely
     const rasterCtx = raster.getContext('2d')
     if (rasterCtx) {
       const image = rasterCtx.createImageData(nelx, nely)
@@ -206,10 +205,32 @@ function paint(
 
 export function Viewport({ problem, frame }: { problem: SimpProblem; frame: TimedSnapshot | undefined }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const rasterRef = useRef<HTMLCanvasElement>(null)
   const [mode, setMode] = useState<ViewMode>('density')
-  const [magnification, setMagnification] = useState(25)
+  const [deformationPercent, setDeformationPercent] = useState(50)
   const [overlays, setOverlays] = useState<Overlays>({ supports: true, forces: true, passive: true, smooth: false })
   const [size, setSize] = useState({ width: 0, height: 0 })
+  const { nelx, nely } = problem.grid
+  const displacement = mode === 'deformed' ? frame?.displacements[0] : undefined
+  const stressFrame = mode === 'stress' ? frame : undefined
+  const autoScale = useMemo(() => {
+    let maxU = 0
+    if (displacement) {
+      for (const component of displacement) maxU = Math.max(maxU, Math.abs(component))
+    }
+    return maxU > 1e-12 ? 0.15 * Math.max(nelx, nely) / maxU : 1
+  }, [displacement, nelx, nely])
+  const magnification = deformationPercent / 100 * autoScale
+  const stressLimit = useMemo(() => {
+    if (!stressFrame) return 0
+    const { density, vonMises, maxVonMises } = stressFrame
+    const sample: number[] = []
+    for (let e = 0; e < vonMises.length; e++) {
+      if (density[e] > 0.2) sample.push(vonMises[e])
+    }
+    sample.sort((a, b) => a - b)
+    return sample[Math.ceil(0.95 * sample.length) - 1] || maxVonMises
+  }, [stressFrame])
 
   useLayoutEffect(() => {
     const canvas = canvasRef.current!
@@ -223,9 +244,10 @@ export function Viewport({ problem, frame }: { problem: SimpProblem; frame: Time
 
   useLayoutEffect(() => {
     if (canvasRef.current && size.width && size.height) {
-      paint(canvasRef.current, problem, frame, mode, overlays, magnification)
+      rasterRef.current ??= document.createElement('canvas')
+      paint(canvasRef.current, rasterRef.current, problem, frame, mode, overlays, magnification, stressLimit)
     }
-  }, [problem, frame, mode, overlays, magnification, size])
+  }, [problem, frame, mode, overlays, magnification, stressLimit, size])
 
   const toggle = (key: keyof Overlays) => setOverlays(current => ({ ...current, [key]: !current[key] }))
   return (
@@ -249,16 +271,23 @@ export function Viewport({ problem, frame }: { problem: SimpProblem; frame: Time
         <canvas ref={canvasRef} aria-label={`${modes[mode]} field, ${problem.grid.nelx} by ${problem.grid.nely} elements`} role="img" />
         <div className="field-caption">{problem.grid.nelx} × {problem.grid.nely} ELEMENTS</div>
         {mode === 'deformed' && (
-          <label className="magnification" htmlFor="exaggeration">
-            Exaggeration <input id="exaggeration" type="range" min="0" max="150" value={magnification}
-              onChange={event => setMagnification(event.target.valueAsNumber)} />
-            <output>{magnification}×</output>
-          </label>
+          <div className="magnification">
+            <label htmlFor="deformation-percent">Deformation</label>
+            <input id="deformation-percent" type="range" min="0" max="200" value={deformationPercent}
+              aria-valuetext={`${deformationPercent}% of automatic scale`}
+              onChange={event => setDeformationPercent(event.target.valueAsNumber)} />
+            <output htmlFor="deformation-percent">
+              {deformationPercent}% · {displacement ? `${Number(magnification.toPrecision(3))}×` : '—'}
+            </output>
+          </div>
         )}
         <div className="scale" aria-label={mode === 'stress' ? 'Stress color scale in MPa' : 'Density color scale from 0 to 1'}>
           <span>{mode === 'stress' ? 'MPa' : 'Density'}</span>
           <div className={`scale-ramp ${mode === 'stress' ? 'stress-ramp' : 'density-ramp'}`} />
-          <div className="scale-labels"><span>0</span><span>{mode === 'stress' ? frame?.maxVonMises.toPrecision(3) ?? '—' : '1'}</span></div>
+          <div className="scale-labels">
+            <span>0</span><span>{mode === 'stress' ? (frame ? stressLimit.toPrecision(3) : '—') : '1'}</span>
+          </div>
+          {mode === 'stress' && frame && <div className="scale-peak">Max {frame.maxVonMises.toPrecision(4)} MPa</div>}
         </div>
       </div>
     </section>

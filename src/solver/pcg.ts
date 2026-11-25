@@ -3,6 +3,23 @@ export interface PcgOptions {
   tolerance?: number
   maxIterations?: number
   initial?: Float64Array
+  /** Optional solution buffer. It may also be supplied as the warm start. */
+  output?: Float64Array
+  workspace?: PcgWorkspace
+}
+
+export class PcgWorkspace {
+  readonly residual: Float64Array
+  readonly direction: Float64Array
+  readonly product: Float64Array
+  readonly inverse: Float64Array
+
+  constructor(size: number) {
+    this.residual = new Float64Array(size)
+    this.direction = new Float64Array(size)
+    this.product = new Float64Array(size)
+    this.inverse = new Float64Array(size)
+  }
 }
 
 export interface PcgResult {
@@ -20,18 +37,21 @@ export function pcg(
   diagonal: Float64Array,
   force: Float64Array,
   fixed: Uint8Array,
-  { tolerance = 1e-9, maxIterations = force.length * 2, initial }: PcgOptions = {},
+  {
+    tolerance = 1e-6, maxIterations = force.length * 2, initial,
+    output = new Float64Array(force.length), workspace = new PcgWorkspace(force.length),
+  }: PcgOptions = {},
 ): PcgResult {
   const size = force.length
-  const u = initial?.slice() ?? new Float64Array(size)
-  const residual = new Float64Array(size)
-  const direction = new Float64Array(size)
-  const product = new Float64Array(size)
-  const inverse = new Float64Array(size)
+  const u = output
+  if (!initial) u.fill(0)
+  else if (initial !== u) u.set(initial)
+  const { residual, direction, product, inverse } = workspace
   let forceSquared = 0
   for (let i = 0; i < size; i++) {
     if (fixed[i]) {
       u[i] = 0
+      inverse[i] = 0
     } else {
       if (!(diagonal[i] > 0) || !Number.isFinite(diagonal[i])) {
         throw new Error('The free stiffness diagonal must be finite and positive.')
@@ -94,6 +114,7 @@ export function pcg(
     preconditioned = nextPreconditioned
   }
 
-  const relativeResidual = Math.sqrt(restartResidual().squared / forceSquared)
+  const verifiedSquared = squared <= target ? squared : restartResidual().squared
+  const relativeResidual = Math.sqrt(verifiedSquared / forceSquared)
   return { u, iterations, relativeResidual, converged: relativeResidual <= tolerance }
 }

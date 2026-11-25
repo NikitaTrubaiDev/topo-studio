@@ -11,4 +11,5 @@ export interface TimedSnapshot extends IterationSnapshot {
 export type WorkerEvent =
   | { type: 'frame'; snapshot: TimedSnapshot }
   | { type: 'paused' }
+  | { type: 'done' }
   | { type: 'error'; message: string }

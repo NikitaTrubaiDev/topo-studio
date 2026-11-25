@@ -5,6 +5,25 @@ import type { WorkerCommand, WorkerEvent } from '../protocol'
 afterEach(() => {
   vi.useRealTimers()
   vi.unstubAllGlobals()
+  vi.resetModules()
+})
+
+it('reports completion when asked to step after the final frame', async () => {
+  const postMessage = vi.fn<(event: WorkerEvent) => void>()
+  const scope = {
+    onmessage: undefined as ((event: { data: WorkerCommand }) => void) | undefined,
+    postMessage,
+  }
+  vi.stubGlobal('self', scope)
+  await import('../simpWorker')
+  const problem = makePreset('mbb', { nelx: 12, nely: 4 })
+  problem.params = { ...problem.params, maxIter: 1 }
+
+  scope.onmessage!({ data: { type: 'init', problem } })
+  scope.onmessage!({ data: { type: 'step' } })
+  expect(postMessage.mock.calls[0][0]).toMatchObject({ type: 'frame', snapshot: { done: true } })
+  scope.onmessage!({ data: { type: 'step' } })
+  expect(postMessage.mock.calls.map(([event]) => event.type)).toEqual(['frame', 'done'])
 })
 
 it('steps once, streams transferable frames, pauses, resumes, and clears queued work on init', async () => {

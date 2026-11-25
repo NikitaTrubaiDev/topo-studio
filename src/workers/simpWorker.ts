@@ -21,7 +21,7 @@ function stop() {
 
 function reportError(error: unknown) {
   stop()
-  finished = true
+  solver = undefined
   send({ type: 'error', message: error instanceof Error ? error.message : String(error) })
 }
 
@@ -63,7 +63,9 @@ scope.onmessage = ({ data }: MessageEvent<WorkerCommand>) => {
         send({ type: 'paused' })
         break
       case 'step':
-        if (!running) iterate()
+        if (!solver) send({ type: 'paused' })
+        else if (finished) send({ type: 'done' })
+        else if (!running) iterate()
         break
     }
   } catch (error) {

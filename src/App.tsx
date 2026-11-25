@@ -86,6 +86,9 @@ export default function App() {
             case 'paused':
               setRunState(state => state === 'complete' || state === 'error' ? state : 'paused')
               break
+            case 'done':
+              setRunState('complete')
+              break
             case 'error':
               setError(data.message)
               setRunState('error')

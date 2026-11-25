@@ -66,6 +66,42 @@ describe('2D SIMP optimization', () => {
     }
   })
 
+  it('matches compliance and volume finite differences around the L-bracket cutout', () => {
+    const problem = makePreset('bracket', { nelx: 8, nely: 6 })
+    const solver = new Simp2D(problem)
+    const design = solver['design']
+    const mask = solver['mask']
+    for (let e = 0; e < design.length; e++) {
+      if (!mask[e]) design[e] = 0.55 + 0.15 * Math.sin(e)
+    }
+
+    function evaluate() {
+      // Cold starts give both sides of the central difference the same residual target.
+      for (const u of solver['displacements']) u.fill(0)
+      const density = solver['physicalDensity']()
+      const volume = density.reduce((sum, value) => sum + value, 0)
+      return { volume, compliance: solver['analyze'](density).compliance }
+    }
+
+    evaluate()
+    const dc = solver['gradient'].slice()
+    const dv = solver['volumeGradient']
+    const h = 1e-3
+    for (let e = 0; e < design.length; e++) {
+      if (mask[e]) continue
+      const original = design[e]
+      design[e] = original + h
+      const plus = evaluate()
+      design[e] = original - h
+      const minus = evaluate()
+      design[e] = original
+      const fdCompliance = (plus.compliance - minus.compliance) / (2 * h)
+      const fdVolume = (plus.volume - minus.volume) / (2 * h)
+      expect(Math.abs(dc[e] / fdCompliance - 1), `compliance gradient at element ${e}`).toBeLessThan(1e-4)
+      expect(Math.abs(dv[e] / fdVolume - 1), `volume gradient at element ${e}`).toBeLessThan(1e-4)
+    }
+  })
+
   it('sums opposite load cases and retains the symmetric cantilever solution', () => {
     const grid = { nelx: 30, nely: 14 }
     const one = makePreset('cantilever', grid, { ...params, maxIter: 20 })
