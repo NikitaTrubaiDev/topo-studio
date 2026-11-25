@@ -45,6 +45,7 @@ export interface NodalForce {
 }
 
 export interface LoadCase {
+  id: string
   name: string
   forces: readonly NodalForce[]
 }

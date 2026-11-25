@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest'
-import { addLoadCase, editSupport, hasFreeLoad, paintMask, setForce, supportError } from '../design'
+import { addLoadCase, editSupport, hasFreeLoad, loadCaseIndex, paintMask, setForce, supportError } from '../design'
 import { makePreset, presets, type PresetId } from '../presets'
 import { Simp2D } from '../simp2d'
 import { nodeIndex } from '../types'
@@ -72,4 +72,22 @@ it('edits a second load case, preserves the first, and solves the exact stress e
     expect(caseVonMises[0].some((stress, e) => stress !== caseVonMises[1][e])).toBe(true)
     expect(vonMises.every((stress, e) => Number.isFinite(stress) && stress === Math.max(caseVonMises[0][e], caseVonMises[1][e]))).toBe(true)
   }
+})
+
+it('looks up the same case across deletion, undo, and redo by ID', () => {
+  const problem = makePreset('cantilever', { nelx: 30, nely: 10 })
+  const before = addLoadCase(addLoadCase(problem.loadCases))
+  const [first, second, selected] = before
+  const after = [{ ...second, name: selected.name }, selected]
+
+  expect(loadCaseIndex(before, selected.id)).toBe(2)
+  expect(loadCaseIndex(after, selected.id)).toBe(1)
+  expect(loadCaseIndex(before, selected.id)).toBe(2) // Undo
+  expect(loadCaseIndex(after, selected.id)).toBe(1) // Redo
+  expect(loadCaseIndex(after, first.id)).toBe(-1)
+
+  const replacement = addLoadCase([first, second]).at(-1)!
+  expect(replacement.name).toBe(selected.name)
+  expect(replacement.id).not.toBe(selected.id)
+  expect(loadCaseIndex([first, second, replacement], selected.id)).toBe(-1)
 })

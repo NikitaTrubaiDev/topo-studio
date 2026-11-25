@@ -1,7 +1,9 @@
 import { useLayoutEffect, useMemo, useRef, useState, type PointerEvent } from 'react'
 import type { ContourLoop } from '../solver/contour'
-import { editSupport, paintMask, setForce, supportKind, type MaskTool, type SupportAction } from '../solver/design'
-import { nodeIndex, type Grid, type SimpProblem } from '../solver/types'
+import { initialPhysicalDensity } from '../solver/density'
+import { editSupport, isValidForce, loadCaseIndex, MAX_NODAL_FORCE, paintMask, setForce, supportKind, type MaskTool, type SupportAction } from '../solver/design'
+import { nodeIndex, type Grid, type LoadCase, type SimpProblem } from '../solver/types'
+import { DEFORMED_DENSITY_THRESHOLD, deformedNodes, hitTestDeformedMesh, quadNodes } from './deformedMesh'
 import { caseColor } from './LoadCases'
 import type { TimedSnapshot } from '../workers/protocol'
 
@@ -14,7 +16,7 @@ const densityStops = [[20, 32, 41], [32, 95, 104], [131, 233, 219]]
 const stressStops = [[24, 40, 64], [18, 123, 168], [60, 195, 156], [244, 213, 104], [248, 107, 96]]
 
 function colorAt(stops: number[][], value: number) {
-  const position = Math.max(0, Math.min(1, value)) * (stops.length - 1)
+  const position = (Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0) * (stops.length - 1)
   const index = Math.min(stops.length - 2, Math.floor(position))
   return stops[index].map((channel, i) => Math.round(channel + (stops[index + 1][i] - channel) * (position - index)))
 }
@@ -58,9 +60,9 @@ function drawForce(ctx: CanvasRenderingContext2D, point: Point, fx: number, fy: 
 }
 
 function paint(
-  canvas: HTMLCanvasElement, raster: HTMLCanvasElement, problem: SimpProblem, frame: TimedSnapshot | undefined,
-  mode: ViewMode, overlays: Overlays, magnification: number, stressLimit: number,
-  displacement: Float64Array | undefined, stress: Float32Array | undefined, loops: ContourLoop[], activeCase: number, resultCase: number,
+  canvas: HTMLCanvasElement, raster: HTMLCanvasElement, problem: SimpProblem, density: Float32Array,
+  mode: ViewMode, overlays: Overlays, positions: Float64Array | undefined, stressLimit: number,
+  stress: Float32Array | undefined, loops: ContourLoop[], activeCase: number, resultCase: number,
 ) {
   const { clientWidth: width, clientHeight: height } = canvas
   const ratio = window.devicePixelRatio || 1
@@ -73,19 +75,20 @@ function paint(
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0)
   ctx.clearRect(0, 0, width, height)
 
-  const { grid: { nelx, nely }, params, passive, supports, loadCases } = problem
-  const { cell, left, bottom } = canvasLayout(width, height, problem.grid)
+  const { grid, passive, supports, loadCases } = problem
+  const { nelx, nely } = grid
+  const { cell, left, bottom } = canvasLayout(width, height, grid)
   const top = bottom - nely * cell
-  const sizeMm = problem.grid.cellSizeMm ?? 1
-  const point = (x: number, y: number, deform = false): Point => {
-    const dof = 2 * (y * (nelx + 1) + x)
-    const dx = deform && displacement ? displacement[dof] * magnification / sizeMm : 0
-    const dy = deform && displacement ? displacement[dof + 1] * magnification / sizeMm : 0
-    return [left + (x + dx) * cell, bottom - (y + dy) * cell]
+  const point = (x: number, y: number): Point => [left + x * cell, bottom - y * cell]
+  const nodePoint = (node: number, deform = false) => {
+    if (deform && positions) return point(positions[2 * node], positions[2 * node + 1])
+    return point(node % (nelx + 1), Math.floor(node / (nelx + 1)))
   }
-  const density = (e: number) => frame?.density[e] ?? (passive?.void?.[e] ? 0 : passive?.solid?.[e] ? 1 : params.volFrac)
   const palette = stress || mode === 'stress' ? stressStops : densityStops
-  const valueAt = (e: number) => stress ? stress[e] / (stressLimit || 1) : mode === 'stress' ? 0 : density(e)
+  const valueAt = (e: number) => {
+    if (stress) return Number.isFinite(stress[e]) ? stress[e] / (stressLimit || 1) : 0
+    return mode === 'stress' ? 0 : density[e]
+  }
 
   ctx.fillStyle = '#141d25'
   ctx.fillRect(left, top, nelx * cell, nely * cell)
@@ -112,19 +115,20 @@ function paint(
     ctx.strokeStyle = '#e6f6fc'
     ctx.stroke()
     ctx.restore()
-  } else if (displacement) {
+  } else if (positions) {
     for (let y = 0; y < nely; y++) {
       for (let x = 0; x < nelx; x++) {
         const e = y * nelx + x
-        if (density(e) < 0.05) continue
+        if (density[e] < DEFORMED_DENSITY_THRESHOLD) continue
+        const [a, b, c, d] = quadNodes(grid, x, y)
         ctx.fillStyle = `rgb(${colorAt(palette, valueAt(e)).join(' ')})`
         ctx.strokeStyle = '#0e3339'
         ctx.lineWidth = 0.65
         ctx.beginPath()
-        ctx.moveTo(...point(x, y, true))
-        ctx.lineTo(...point(x + 1, y, true))
-        ctx.lineTo(...point(x + 1, y + 1, true))
-        ctx.lineTo(...point(x, y + 1, true))
+        ctx.moveTo(...nodePoint(a, true))
+        ctx.lineTo(...nodePoint(b, true))
+        ctx.lineTo(...nodePoint(c, true))
+        ctx.lineTo(...nodePoint(d, true))
         ctx.closePath()
         ctx.fill()
         ctx.stroke()
@@ -153,7 +157,7 @@ function paint(
 
   ctx.lineWidth = 1
   ctx.strokeStyle = '#607c89'
-  if (displacement) ctx.setLineDash([4, 4])
+  if (positions) ctx.setLineDash([4, 4])
   ctx.strokeRect(left, top, nelx * cell, nely * cell)
   ctx.setLineDash([])
 
@@ -190,7 +194,6 @@ function paint(
     }
   }
 
-  const nodePoint = (node: number, deform = false) => point(node % (nelx + 1), Math.floor(node / (nelx + 1)), deform)
   if (overlays.supports) {
     ctx.strokeStyle = '#7ac4fb'
     ctx.lineWidth = 1.3
@@ -217,13 +220,13 @@ function paint(
       if (visibleCase >= 0 && index !== visibleCase) return
       ctx.strokeStyle = caseColor(index)
       ctx.globalAlpha = index === activeCase || resultCase === index ? 1 : 0.73
-      const peak = forces.reduce((max, force) => Math.max(max, Math.hypot(force.fx, force.fy)), 1)
+      const peak = forces.reduce((max, { fx, fy }) => isValidForce(fx, fy) ? Math.max(max, Math.hypot(fx, fy)) : max, 1)
       const stride = Math.max(1, Math.ceil(12 / cell))
       for (let i = 0; i < forces.length; i++) {
         if (forces.length > nelx && i % stride !== 0 && i !== forces.length - 1) continue
         const { node, fx, fy } = forces[i]
         const magnitude = Math.hypot(fx, fy)
-        if (!magnitude) continue
+        if (!magnitude || !isValidForce(fx, fy)) continue
         const point = nodePoint(node, true)
         const cases = casesAtNode.get(node)
         if (cases && cases.length > 1) {
@@ -267,40 +270,43 @@ function gridPoint(event: PointerEvent<HTMLCanvasElement>, grid: Grid): Point {
 }
 
 function ForceEditor({ node, problem, activeCase, onChange }: {
-  node: number; problem: SimpProblem; activeCase: number; onChange: (problem: SimpProblem) => void
+  node: number; problem: SimpProblem; activeCase: LoadCase; onChange: (problem: SimpProblem) => void
 }) {
-  const load = problem.loadCases[activeCase]
-  const force = load.forces.find(force => force.node === node)
+  const [invalid, setInvalid] = useState(false)
+  const force = activeCase.forces.find(force => force.node === node)
   const width = problem.grid.nelx + 1
   function change(value: { fx: number; fy: number } | null) {
-    const next = setForce(load, node, value)
-    if (next !== load) onChange({ ...problem, loadCases: problem.loadCases.map((item, i) => i === activeCase ? next : item) })
+    const next = setForce(activeCase, node, value)
+    if (next !== activeCase) onChange({ ...problem, loadCases: problem.loadCases.map(item => item.id === activeCase.id ? next : item) })
   }
   return (
-    <form className="force-editor" onSubmit={event => {
+    <form className="force-editor" onChange={() => setInvalid(false)} onSubmit={event => {
       event.preventDefault()
       const data = new FormData(event.currentTarget)
       const fx = Number(data.get('fx')), fy = Number(data.get('fy'))
-      if (Number.isFinite(fx) && Number.isFinite(fy)) change({ fx, fy })
+      if (isValidForce(fx, fy)) change({ fx, fy })
+      else setInvalid(true)
     }}>
-      <span>Node ({node % width}, {Math.floor(node / width)}) · {load.name}</span>
+      <span>Node ({node % width}, {Math.floor(node / width)}) · {activeCase.name}</span>
       <label>Fx (N) <input type="number" className="field-input" required name="fx" step="any" defaultValue={force?.fx ?? 0} /></label>
       <label>Fy (N) <input type="number" className="field-input" required name="fy" step="any" defaultValue={force?.fy ?? -100} /></label>
       <button className="tool-button" type="submit">Apply force</button>
       <button className="tool-button" type="button" disabled={!force} onClick={() => change(null)}>Remove force</button>
+      {invalid && <span role="alert">Enter a finite force with magnitude at most {MAX_NODAL_FORCE.toExponential()} N.</span>}
     </form>
   )
 }
 
 export function Viewport({
-  problem, frame, loops, mode, setMode, activeCase, onChange,
+  problem, frame, initialDensity, loops, mode, setMode, activeCase, onChange,
 }: {
   problem: SimpProblem
   frame: TimedSnapshot | undefined
+  initialDensity: Float32Array
   loops: ContourLoop[]
   mode: ViewMode
   setMode: (mode: ViewMode) => void
-  activeCase: number
+  activeCase: LoadCase
   onChange: (problem: SimpProblem) => void
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -313,15 +319,21 @@ export function Viewport({
   const [supportAction, setSupportAction] = useState<SupportAction>('cycle')
   const [selectedNode, setSelectedNode] = useState<number>()
   const [hover, setHover] = useState<Point>()
-  const [resultCase, setResultCase] = useState(-1)
+  const [resultCaseId, setResultCaseId] = useState<string>()
   const [deformationPercent, setDeformationPercent] = useState(50)
   const [overlays, setOverlays] = useState<Overlays>({ supports: true, forces: true, passive: true, smooth: false })
   const [size, setSize] = useState({ width: 0, height: 0 })
-  const { grid } = problem
+  const { grid, params, passive } = problem
   const { nelx, nely } = grid
   const preview = draft ?? problem
   const previewFrame = draft ? undefined : frame
-  const caseIndex = resultCase < problem.loadCases.length ? resultCase : -1
+  const previewPassive = preview.passive
+  const initialPreview = useMemo(() => previewPassive === passive
+    ? initialDensity : initialPhysicalDensity({ grid, params, passive: previewPassive }),
+  [previewPassive, passive, initialDensity, grid, params])
+  const previewDensity = previewFrame?.density ?? initialPreview
+  const caseIndex = loadCaseIndex(problem.loadCases, resultCaseId)
+  const activeCaseIndex = loadCaseIndex(problem.loadCases, activeCase.id)
   const stress = caseIndex < 0 ? previewFrame?.vonMises : previewFrame?.caseVonMises[caseIndex]
 
   const deformation = useMemo(() => {
@@ -339,12 +351,15 @@ export function Viewport({
   const peak = Math.sqrt(deformation?.peak ?? 0)
   const autoScale = peak > 1e-12 ? 0.15 * Math.max(nelx, nely) * (grid.cellSizeMm ?? 1) / peak : 1
   const magnification = deformationPercent / 100 * autoScale
+  const positions = useMemo(() => displacement ? deformedNodes(grid, displacement, magnification) : undefined,
+    [grid, displacement, magnification])
   const stressMode = mode === 'stress' || mode === 'deformed'
   const { stressLimit, maxStress } = useMemo(() => {
     if (!stressMode || !stress || !previewFrame) return { stressLimit: 0, maxStress: 0 }
     const sample: number[] = []
     let maxStress = 0
     for (let e = 0; e < stress.length; e++) {
+      if (!Number.isFinite(stress[e])) continue
       if (previewFrame.density[e] > 0.2) sample.push(stress[e])
       maxStress = Math.max(maxStress, stress[e])
     }
@@ -365,10 +380,10 @@ export function Viewport({
   useLayoutEffect(() => {
     if (canvasRef.current && size.width && size.height) {
       rasterRef.current ??= document.createElement('canvas')
-      paint(canvasRef.current, rasterRef.current, preview, previewFrame, mode, overlays, magnification,
-        stressLimit, displacement, stressMode ? stress : undefined, loops, activeCase, caseIndex)
+      paint(canvasRef.current, rasterRef.current, preview, previewDensity, mode, overlays, positions,
+        stressLimit, stressMode ? stress : undefined, loops, activeCaseIndex, caseIndex)
     }
-  }, [preview, previewFrame, mode, overlays, magnification, stressLimit, size, displacement, stressMode, stress, loops, activeCase, caseIndex])
+  }, [preview, previewDensity, mode, overlays, positions, stressLimit, size, stressMode, stress, loops, activeCaseIndex, caseIndex])
 
   const toggle = (key: keyof Overlays) => setOverlays(current => ({ ...current, [key]: !current[key] }))
   const isBrush = tool === 'void' || tool === 'solid' || tool === 'erase' || tool === 'bolt'
@@ -426,13 +441,17 @@ export function Viewport({
     if (commit && current?.original === problem && current.problem !== problem) onChange(current.problem)
   }
 
-  const inspectIndex = hover && inside(hover)
-    ? Math.min(nelx - 1, Math.floor(hover[0])) + nelx * Math.min(nely - 1, Math.floor(hover[1])) : undefined
-  const hoverDensity = inspectIndex === undefined ? undefined : previewFrame?.density[inspectIndex]
-    ?? (preview.passive?.void?.[inspectIndex] ? 0 : preview.passive?.solid?.[inspectIndex] ? 1 : problem.params.volFrac)
-  const hoverStress = inspectIndex === undefined ? undefined : stress?.[inspectIndex]
+  let inspectIndex = null
+  if (tool === 'inspect' && hover) {
+    if (positions) inspectIndex = hitTestDeformedMesh(grid, positions, previewDensity, hover)
+    else if (inside(hover)) {
+      inspectIndex = Math.min(nelx - 1, Math.floor(hover[0])) + nelx * Math.min(nely - 1, Math.floor(hover[1]))
+    }
+  }
+  const hoverDensity = inspectIndex === null ? undefined : previewDensity[inspectIndex]
+  const hoverStress = inspectIndex === null ? undefined : stress?.[inspectIndex]
   const hoverLayout = canvasLayout(size.width, size.height, grid)
-  const selectedForce = problem.loadCases[activeCase].forces.find(force => force.node === selectedNode)
+  const selectedForce = activeCase.forces.find(force => force.node === selectedNode)
 
   return (
     <section className="viewport panel" aria-label="Simulation viewport">
@@ -476,14 +495,14 @@ export function Viewport({
           </select>
         </label>}
         {stressMode && <label className="compact-input">Result case
-          <select className="field-input" value={caseIndex} onChange={event => setResultCase(Number(event.target.value))}>
-            <option value={-1}>Combined stress envelope</option>
-            {problem.loadCases.map((load, i) => <option key={i} value={i}>{load.name}</option>)}
+          <select className="field-input" value={caseIndex < 0 ? '' : resultCaseId} onChange={event => setResultCaseId(event.target.value || undefined)}>
+            <option value="">Combined stress envelope</option>
+            {problem.loadCases.map(load => <option key={load.id} value={load.id}>{load.name}</option>)}
           </select>
         </label>}
         {tool === 'loads' && selectedNode === undefined && <p className="hint">Select a grid node to edit its force.</p>}
         {tool === 'loads' && selectedNode !== undefined && (
-          <ForceEditor key={`${activeCase}:${selectedNode}:${selectedForce?.fx}:${selectedForce?.fy}`} node={selectedNode}
+          <ForceEditor key={`${activeCase.id}:${selectedNode}:${selectedForce?.fx}:${selectedForce?.fy}`} node={selectedNode}
             problem={problem} activeCase={activeCase} onChange={onChange} />
         )}
       </div>
@@ -508,10 +527,10 @@ export function Viewport({
         {tool === 'loads' && selectedNode !== undefined && <div className="node-cursor" style={{
           left: hoverLayout.left + (selectedNode % (nelx + 1)) * hoverLayout.cell,
           top: hoverLayout.bottom - Math.floor(selectedNode / (nelx + 1)) * hoverLayout.cell,
-          borderColor: caseColor(activeCase),
+          borderColor: caseColor(activeCaseIndex),
         }} />}
         {tool === 'inspect' && hoverDensity !== undefined && (
-          <div className="inspect-readout">ρ {hoverDensity.toFixed(3)} · σ<sub>VM</sub> {hoverStress === undefined ? '—' : `${hoverStress.toPrecision(4)} MPa`}</div>
+          <div className="inspect-readout">ρ {hoverDensity.toFixed(3)} · σ<sub>VM</sub> {hoverStress !== undefined && Number.isFinite(hoverStress) ? `${hoverStress.toPrecision(4)} MPa` : '—'}</div>
         )}
         {mode === 'deformed' && (
           <div className="magnification">

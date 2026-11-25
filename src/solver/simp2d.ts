@@ -1,7 +1,8 @@
-import { supportError } from './design'
+import { isValidForce, MAX_NODAL_FORCE, supportError } from './design'
+import { filterPhysicalDensity, initializeDensity } from './density'
 import { Stiffness2D } from './stiffness'
 import { centerB, elementStiffness, planeStressD } from './elementQ4'
-import { DensityFilter } from './filter'
+import type { DensityFilter } from './filter'
 import { pcg, PcgWorkspace } from './pcg'
 import { nodeIndex, type IterationSnapshot, type SimpProblem } from './types'
 
@@ -45,7 +46,7 @@ export class Simp2D {
   private done = false
 
   constructor(private readonly problem: SimpProblem) {
-    const { grid, params, material, supports, loadCases, passive } = problem
+    const { grid, params, material, supports, loadCases } = problem
     const { nelx, nely } = grid
     if (!Number.isSafeInteger(nelx) || !Number.isSafeInteger(nely) || nelx < 1 || nely < 1) {
       throw new Error('Grid dimensions must be positive integers.')
@@ -87,25 +88,39 @@ export class Simp2D {
     for (const { node, fixedX, fixedY } of supports) {
       if (fixedX) this.fixed[2 * node] = 1
       if (fixedY) this.fixed[2 * node + 1] = 1
-    }    if (!loadCases.length) throw new Error('At least one load case is required.')
-    this.forces = loadCases.map(({ forces }) => {
+    }
+    if (!loadCases.length) throw new Error('At least one load case is required.')
+    this.forces = loadCases.map(({ forces }, caseIndex) => {
       const vector = new Float64Array(nodes * 2)
       for (const { node, fx, fy } of forces) {
-        if (!Number.isInteger(node) || node < 0 || node >= nodes || !Number.isFinite(fx) || !Number.isFinite(fy)) {
+        if (!Number.isInteger(node) || node < 0 || node >= nodes) {
           throw new Error('Invalid nodal load.')
+        }
+        if (!isValidForce(fx, fy)) {
+          throw new Error(`Load case ${caseIndex + 1}: nodal forces must be finite and at most ${MAX_NODAL_FORCE.toExponential()} N.`)
         }
         vector[2 * node] += fx
         vector[2 * node + 1] += fy
       }
+      for (const { node } of forces) {
+        if (!isValidForce(vector[2 * node], vector[2 * node + 1])) {
+          throw new Error(`Load case ${caseIndex + 1}: net force at a node must be at most ${MAX_NODAL_FORCE.toExponential()} N.`)
+        }
+      }
       return vector
     })
 
-    if ([passive?.solid, passive?.void].some(mask => mask && mask.length !== elements)) {
-      throw new Error('Passive masks must contain one entry per element.')
+    const { filter, mask, design, volumeGradient, fixedVolume, volumeRange } = initializeDensity(problem)
+    const [min, max] = volumeRange
+    if (params.volFrac < min - 1e-12 || params.volFrac > max + 1e-12) {
+      throw new Error('The target volume fraction is infeasible with the passive masks and filter radius.')
     }
-    this.filter = new DensityFilter(grid, params.rmin, passive?.void)
-    this.mask = new Int8Array(elements)
-    this.design = new Float64Array(elements)
+    this.filter = filter
+    this.mask = mask
+    this.design = design
+    this.volumeGradient = volumeGradient
+    this.fixedVolume = fixedVolume
+    this.volumeRange = volumeRange
     this.density = new Float64Array(elements)
     this.modulus = new Float64Array(elements)
     this.stiffness = new Stiffness2D(grid, this.fixed, this.dofs)
@@ -119,47 +134,10 @@ export class Simp2D {
     this.lower = new Float64Array(elements)
     this.upper = new Float64Array(elements)
     this.trial = new Float64Array(elements)
-    const volumeAtOutput = new Float64Array(elements)
-    let solidCount = 0
-    for (let e = 0; e < elements; e++) {
-      if (passive?.solid?.[e] && passive?.void?.[e]) throw new Error('Passive solid and void masks overlap.')
-      if (passive?.solid?.[e]) {
-        this.mask[e] = 1
-        this.design[e] = 1
-        solidCount++
-      } else if (passive?.void?.[e]) {
-        this.mask[e] = -1
-      } else {
-        volumeAtOutput[e] = 1
-      }
-    }
-
-    // Passive solids are fixed filter inputs, and passive outputs are prescribed.
-    // Only free output rows contribute derivatives with respect to the filter inputs.
-    this.volumeGradient = this.filter.transpose(volumeAtOutput)
-    this.fixedVolume = solidCount + this.volumeGradient.reduce((sum, weight, e) => sum + weight * this.design[e], 0)
-    let freeVolume = 0
-    for (let e = 0; e < elements; e++) {
-      if (this.mask[e]) this.volumeGradient[e] = 0
-      freeVolume += this.volumeGradient[e]
-    }
-    this.volumeRange = [this.fixedVolume / elements, (this.fixedVolume + freeVolume) / elements]
-    const [min, max] = this.volumeRange
-    if (params.volFrac < min - 1e-12 || params.volFrac > max + 1e-12) {
-      throw new Error('The target volume fraction is infeasible with the passive masks and filter radius.')
-    }
-    const initial = max > min ? Math.max(0, Math.min(1, (params.volFrac - min) / (max - min))) : 0
-    for (let e = 0; e < elements; e++) {
-      if (!this.mask[e]) this.design[e] = initial
-    }
   }
 
   private physicalDensity() {
-    const density = this.filter.apply(this.design, this.density)
-    for (let e = 0; e < density.length; e++) {
-      if (this.mask[e] === 1) density[e] = 1
-    }
-    return density
+    return filterPhysicalDensity(this.filter, this.mask, this.design, this.density)
   }
 
   private analyze(density: Float64Array) {
@@ -207,7 +185,11 @@ export class Simp2D {
         const sy = modulus[e] * (stressD[3] * ex + stressD[4] * ey)
         const shear = modulus[e] * stressD[8] * gamma
         const stress = Math.sqrt(sx * sx - sx * sy + sy * sy + 3 * shear * shear)
-        caseStress[e] = stress
+        const storedStress = Math.fround(stress)
+        if (!Number.isFinite(storedStress)) {
+          throw new Error(`Stress exceeds the representable range for load case ${caseIndex + 1}.`)
+        }
+        caseStress[e] = storedStress
         vonMises[e] = Math.max(vonMises[e], caseStress[e])
         maxVonMises = Math.max(maxVonMises, stress)
       }

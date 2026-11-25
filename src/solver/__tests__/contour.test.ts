@@ -60,3 +60,16 @@ it('switches the saddle pairing as the dominant diagonal changes', () => {
   expect(extractContours([0.45, 0.95, 0.95, 0.45], grid)).toHaveLength(1)
   expect(extractContours([0.05, 0.55, 0.55, 0.05], grid)).toHaveLength(2)
 })
+
+it('preserves at least half the original area of a one-cell hole at 3 and 12 smoothing passes', () => {
+  const field = new Float32Array(grid.nelx * grid.nely).fill(1)
+  field[grid.nelx * 5 + 5] = 0
+  const [, rawHole] = extractContours(field, grid)
+  const originalArea = -signedArea(rawHole.points)
+  expect(originalArea).toBeCloseTo(0.5)
+  for (const passes of [3, 12]) {
+    const loops = extractContours(field, grid, 0.5, passes)
+    expect(loops.map(loop => [loop.hole, loop.parent])).toEqual([[false, -1], [true, 0]])
+    expect(-signedArea(loops[1].points)).toBeGreaterThanOrEqual(originalArea * 0.5)
+  }
+})

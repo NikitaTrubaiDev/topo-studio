@@ -8,8 +8,8 @@ export function caseColor(index: number) {
 
 export function LoadCases({ cases, active, onSelect, onAdd, onRemove, onRename }: {
   cases: readonly LoadCase[]
-  active: number
-  onSelect: (index: number) => void
+  active: LoadCase
+  onSelect: (id: string) => void
   onAdd: () => void
   onRemove: () => void
   onRename: (name: string) => void
@@ -19,7 +19,7 @@ export function LoadCases({ cases, active, onSelect, onAdd, onRemove, onRename }
       <h3>Load cases</h3>
       <div className="case-list" role="group" aria-label="Active load case">
         {cases.map((load, index) => (
-          <button className="case-row" key={index} type="button" aria-pressed={active === index} onClick={() => onSelect(index)}>
+          <button className="case-row" key={load.id} type="button" aria-pressed={active.id === load.id} onClick={() => onSelect(load.id)}>
             <i style={{ backgroundColor: caseColor(index) }} />
             <span>{load.name || `Case ${index + 1}`}</span>
             <small>{load.forces.length}</small>
@@ -27,11 +27,11 @@ export function LoadCases({ cases, active, onSelect, onAdd, onRemove, onRename }
         ))}
       </div>
       <label htmlFor="case-name">Case name</label>
-      <input id="case-name" className="field-input" key={`${active} ${cases[active].name}`} defaultValue={cases[active].name} maxLength={48}
+      <input id="case-name" className="field-input" key={`${active.id} ${active.name}`} defaultValue={active.name} maxLength={48}
         onBlur={event => {
-          const name = event.target.value.trim() || cases[active].name
+          const name = event.target.value.trim() || active.name
           event.target.value = name
-          if (name !== cases[active].name) onRename(name)
+          if (name !== active.name) onRename(name)
         }}
         onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }} />
       <div className="action-row">

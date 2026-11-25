@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest'
-import { extractContours, type ContourLoop } from '../contour'
+import { extractContours, signedArea, type ContourLoop } from '../contour'
 import { exportDxf, exportStl, exportSvg } from '../export'
 
 const grid = { nelx: 28, nely: 20, cellSizeMm: 0.75 }
@@ -20,6 +20,10 @@ it('exports closed LWPOLYLINE entities on the contour layer with finite mm coord
   const dxf = exportDxf(loops, grid).trimEnd().split(/\r?\n/)
   expect(dxf.slice(-2)).toEqual(['0', 'EOF'])
   expect(dxf.join('\n')).toContain('$INSUNITS\n70\n4')
+  const layerTable = dxf.indexOf('TABLE')
+  expect(dxf.slice(layerTable + 1, layerTable + 9)).toEqual([
+    '2', 'LAYER', '5', expect.stringMatching(/^[1-9A-F][0-9A-F]*$/), '100', 'AcDbSymbolTable', '70', '1',
+  ])
   const starts = dxf.flatMap((value, i) => value === 'LWPOLYLINE' ? [i] : [])
   expect(starts).toHaveLength(2)
   starts.forEach((start, i) => {
@@ -37,8 +41,8 @@ it('exports closed LWPOLYLINE entities on the contour layer with finite mm coord
   })
 })
 
-function verifyStl(contours: ContourLoop[], expectedVolume: number, thickness = 10) {
-  const mesh = exportStl(contours, grid, thickness)
+function verifyStl(contours: ContourLoop[], expectedVolume: number, thickness = 10, exportGrid = grid) {
+  const mesh = exportStl(contours, exportGrid, thickness)
   const view = new DataView(mesh.data)
   expect(view.getUint32(80, true)).toBe(mesh.triangleCount)
   expect(mesh.triangleCount).toBeGreaterThan(0)
@@ -75,6 +79,16 @@ it('extrudes a smoothed plate with a hole into an exactly watertight STL with ou
     return area + (x * ny - nx * y) / 2
   }, 0), 0)
   verifyStl(loops, area * grid.cellSizeMm ** 2 * 10)
+})
+
+it('extrudes the 30 × 10 collinear contour fixture into a watertight binary STL', () => {
+  const fixtureGrid = { nelx: 30, nely: 10, cellSizeMm: 1 }
+  const rows = ['0111100000', '0100010000', '0110001000', '0100000100', '0010000010', '0001110010', '0000001110']
+  const field = new Float32Array(fixtureGrid.nelx * fixtureGrid.nely)
+  rows.forEach((row, y) => field.set(Array.from(row, Number), (y + 1) * fixtureGrid.nelx))
+  const contours = extractContours(field, fixtureGrid, 0.5, 0)
+  const area = contours.reduce((sum, loop) => sum + signedArea(loop.points), 0)
+  verifyStl(contours, area * 10, 10, fixtureGrid)
 })
 
 it('keeps exact cap to wall connectivity for multiple holes aligned on the same Y coordinate', () => {

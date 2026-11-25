@@ -43,19 +43,20 @@ export function makePreset(
       return {
         ...problem,
         supports: [...leftEdge.map((_, y) => support(0, y, 'roller-y')), support(nelx, 0, 'roller-x')],
-        loadCases: [{ name: 'Top-left load', forces: [force(0, nely)] }],
+        loadCases: [{ id, name: 'Top-left load', forces: [force(0, nely)] }],
       }
     case 'cantilever': {
       const lower = Math.floor(nely / 2)
       const upper = Math.ceil(nely / 2)
       const forces = lower === upper ? [force(nelx, lower)] : [force(nelx, lower, -50), force(nelx, upper, -50)]
-      return { ...problem, supports: leftEdge, loadCases: [{ name: 'Tip load', forces }] }
+      return { ...problem, supports: leftEdge, loadCases: [{ id, name: 'Tip load', forces }] }
     }
     case 'bridge':
       return {
         ...problem,
         supports: [support(0, 0, 'pin'), support(nelx, 0, 'roller-x')],
         loadCases: [{
+          id,
           name: 'Deck load',
           forces: Array.from({ length: nelx + 1 }, (_, x) =>
             force(x, nely, -(x === 0 || x === nelx ? 50 : 100) / nelx)),
@@ -76,7 +77,7 @@ export function makePreset(
       return {
         ...problem,
         supports: Array.from({ length: left + 1 }, (_, x) => support(x, nely)),
-        loadCases: [{ name: 'Right tip load', forces: [force(nelx, base)] }],
+        loadCases: [{ id, name: 'Right tip load', forces: [force(nelx, base)] }],
         passive: { solid, void: voidMask },
       }
     }

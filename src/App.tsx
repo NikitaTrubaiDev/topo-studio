@@ -4,8 +4,9 @@ import { Controls, resolutions, type Settings } from './components/Controls'
 import { Viewport, type ViewMode } from './components/Viewport'
 import { LoadCases } from './components/LoadCases'
 import { ExportDialog, type ContourSettings } from './components/ExportDialog'
-import { contourField, extractContours } from './solver/contour'
-import { addLoadCase, hasFreeLoad, supportError } from './solver/design'
+import { extractContours } from './solver/contour'
+import { initialPhysicalDensity } from './solver/density'
+import { addLoadCase, hasFreeLoad, loadCaseIndex, supportError } from './solver/design'
 import type { SimpProblem } from './solver/types'
 import { defaultParams, makePreset, materials, presets } from './solver/presets'
 import type { TimedSnapshot, WorkerCommand, WorkerEvent } from './workers/protocol'
@@ -42,7 +43,8 @@ export default function App() {
   const [samples, setSamples] = useState<Sample[]>([])
   const [error, setError] = useState('')
   const [history, setHistory] = useState(initialHistory)
-  const [selectedCase, setSelectedCase] = useState(0)
+  // Preserve the requested case when it is absent from the current history entry.
+  const [selectedCaseId, setSelectedCaseId] = useState<string>()
   const [mode, setMode] = useState<ViewMode>('density')
   const [exportOpen, setExportOpen] = useState(false)
   const [contour, setContour] = useState<ContourSettings>({ threshold: 0.5, smoothing: 3, thickness: 10 })
@@ -54,13 +56,16 @@ export default function App() {
   ), [settings])
   const design = history.present
   const problem = useMemo(() => ({ ...presetProblem, ...design }), [presetProblem, design])
-  const activeCase = Math.min(selectedCase, problem.loadCases.length - 1)
+  const activeCase = problem.loadCases[Math.max(0, loadCaseIndex(problem.loadCases, selectedCaseId))]
   const constraint = useMemo(() => supportError(problem.grid, problem.supports)
     ?? (hasFreeLoad(problem) ? undefined : 'Apply a force to at least one unrestrained degree of freedom.'), [problem])
   const showContours = mode === 'cad' || exportOpen
+  const { grid, params, passive } = problem
+  const initialDensity = useMemo(() => initialPhysicalDensity({ grid, params, passive }), [grid, params, passive])
+  const density = frame?.density ?? initialDensity
   const loops = useMemo(() => showContours
-    ? extractContours(contourField(problem, frame?.density), problem.grid, contour.threshold, contour.smoothing) : [],
-  [showContours, problem, frame, contour.threshold, contour.smoothing])
+    ? extractContours(density, grid, contour.threshold, contour.smoothing) : [],
+  [showContours, density, grid, contour.threshold, contour.smoothing])
 
   useEffect(() => () => {
     workerRef.current?.terminate()
@@ -86,7 +91,7 @@ export default function App() {
     reset()
     if (value.preset !== settings.preset || value.resolution !== settings.resolution) {
       setHistory(initialHistory)
-      setSelectedCase(0)
+      setSelectedCaseId(undefined)
     }
     setSettings(value)
   }
@@ -201,18 +206,18 @@ export default function App() {
       </header>
       <main className="workspace">
         <Controls settings={settings} setSettings={changeSettings}>
-          <LoadCases cases={problem.loadCases} active={activeCase} onSelect={setSelectedCase}
+          <LoadCases cases={problem.loadCases} active={activeCase} onSelect={setSelectedCaseId}
             onAdd={() => {
-              edit({ ...problem, loadCases: addLoadCase(problem.loadCases) })
-              setSelectedCase(problem.loadCases.length)
+              const loadCases = addLoadCase(problem.loadCases)
+              edit({ ...problem, loadCases })
+              setSelectedCaseId(loadCases.at(-1)!.id)
             }}
             onRemove={() => {
               if (problem.loadCases.length === 1) return
-              edit({ ...problem, loadCases: problem.loadCases.filter((_, i) => i !== activeCase) })
-              setSelectedCase(Math.min(activeCase, problem.loadCases.length - 2))
+              edit({ ...problem, loadCases: problem.loadCases.filter(load => load.id !== activeCase.id) })
             }}
             onRename={name => edit({
-              ...problem, loadCases: problem.loadCases.map((load, i) => i === activeCase ? { ...load, name } : load),
+              ...problem, loadCases: problem.loadCases.map(load => load.id === activeCase.id ? { ...load, name } : load),
             })} />
         </Controls>
         <div className="results">
@@ -225,7 +230,7 @@ export default function App() {
               <button className="tool-button" type="button" onClick={() => {
                 if (design) edit(presetProblem)
                 else reset()
-                setSelectedCase(0)
+                setSelectedCaseId(undefined)
               }}>Reset to preset</button>
               <button className="tool-button export-trigger" type="button" onClick={() => {
                 setMode('cad')
@@ -235,7 +240,7 @@ export default function App() {
           </div>
           {error && <p role="alert" className="error">{error} Reset to run again.</p>}
           {constraint && <p className="constraint-warning" role="alert">{constraint}</p>}
-          <Viewport key={`${settings.preset}/${settings.resolution}`} problem={problem} frame={frame} loops={loops}
+          <Viewport key={`${settings.preset}/${settings.resolution}`} problem={problem} frame={frame} initialDensity={initialDensity} loops={loops}
             mode={mode} setMode={setMode} activeCase={activeCase} onChange={edit} />
           {exportOpen && <ExportDialog loops={loops} grid={problem.grid} settings={contour}
             setSettings={setContour} onClose={() => setExportOpen(false)} />}

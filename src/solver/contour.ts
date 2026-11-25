@@ -1,4 +1,4 @@
-import type { Grid, SimpProblem } from './types'
+import type { Grid } from './types'
 
 export type Point2 = [number, number]
 
@@ -42,14 +42,6 @@ function orientLoops(polygons: Point2[][]): ContourLoop[] {
     loops.push({ points, hole, parent })
   }
   return loops
-}
-
-/** Iteration zero displays the initial designable density and the exact passive masks. */
-export function contourField(problem: SimpProblem, density?: Float32Array): Float32Array {
-  if (density) return density
-  const { grid, params, passive } = problem
-  return Float32Array.from({ length: grid.nelx * grid.nely }, (_, e) =>
-    passive?.void?.[e] ? 0 : passive?.solid?.[e] ? 1 : params.volFrac)
 }
 
 /** Interpolate element-center samples, extending boundary cells to the domain edges.
@@ -201,6 +193,7 @@ function validSmoothing(loops: ContourLoop[], stride: number) {
 
 export function smoothContours(loops: ContourLoop[], { nelx, nely }: Grid, iterations: number): ContourLoop[] {
   const locked = loops.map(loop => loop.points.map(([x, y]) => x === 0 || x === nelx || y === 0 || y === nely))
+  const minimumAreas = loops.map(loop => Math.abs(signedArea(loop.points)) * 0.5)
   let result = loops
   for (let i = 0; i < iterations; i++) {
     let candidate = result
@@ -220,6 +213,8 @@ export function smoothContours(loops: ContourLoop[], { nelx, nely }: Grid, itera
         }),
       }))
     }
+    candidate = candidate.map((loop, l) =>
+      signedArea(loop.points) * (loop.hole ? -1 : 1) >= minimumAreas[l] ? loop : result[l])
     if (!validSmoothing(candidate, nelx + 1)) break
     result = candidate
   }

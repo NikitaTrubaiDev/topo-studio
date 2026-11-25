@@ -38,7 +38,7 @@ it('steps once, streams transferable frames, pauses, resumes, and clears queued 
   vi.stubGlobal('self', scope)
   await import('../simpWorker')
   const problem = makePreset('mbb', { nelx: 12, nely: 4 })
-  problem.loadCases = [...problem.loadCases, { name: 'Unloaded', forces: [] }]
+  problem.loadCases = [...problem.loadCases, { id: 'unloaded', name: 'Unloaded', forces: [] }]
   const send = (data: WorkerCommand) => scope.onmessage!({ data })
   const iterations = () => events.flatMap(event => event.type === 'frame' ? [event.snapshot.iteration] : [])
 

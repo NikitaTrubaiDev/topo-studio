@@ -5,6 +5,12 @@ export type SupportKind = NonNullable<Support['kind']>
 export type SupportAction = SupportKind | 'cycle' | 'remove'
 const supportKinds: SupportKind[] = ['fixed', 'pin', 'roller-x', 'roller-y']
 
+export const MAX_NODAL_FORCE = 1e12
+
+export function isValidForce(fx: number, fy: number): boolean {
+  return Math.hypot(fx, fy) <= MAX_NODAL_FORCE
+}
+
 export function supportKind(support: Support): SupportKind {
   return support.kind ?? (support.fixedX ? support.fixedY ? 'fixed' : 'roller-y' : 'roller-x')
 }
@@ -60,10 +66,16 @@ export function setForce(loadCase: LoadCase, node: number, value: Omit<NodalForc
   return forces.length === loadCase.forces.length ? loadCase : { ...loadCase, forces }
 }
 
+let nextCaseId = 1
+
 export function addLoadCase(loadCases: readonly LoadCase[]): LoadCase[] {
   let number = loadCases.length + 1
   while (loadCases.some(load => load.name === `Case ${number}`)) number++
-  return [...loadCases, { name: `Case ${number}`, forces: [] }]
+  return [...loadCases, { id: `case-${nextCaseId++}`, name: `Case ${number}`, forces: [] }]
+}
+
+export function loadCaseIndex(loadCases: readonly LoadCase[], id: string | undefined): number {
+  return loadCases.findIndex(load => load.id === id)
 }
 
 export function hasFreeLoad({ supports, loadCases }: SimpProblem): boolean {

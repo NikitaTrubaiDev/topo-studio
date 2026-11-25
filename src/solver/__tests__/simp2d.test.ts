@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest'
+import { initialPhysicalDensity } from '../density'
+import { MAX_NODAL_FORCE } from '../design'
 import { defaultParams, makePreset } from '../presets'
 import { Simp2D } from '../simp2d'
 import type { Grid, SimpProblem } from '../types'
@@ -66,6 +68,41 @@ describe('2D SIMP optimization', () => {
     }
   })
 
+  it('matches the solver initial physical density for an L-bracket preview', () => {
+    const grid = { nelx: 30, nely: 10 }
+    const problem = makePreset('bracket', grid)
+    const preview = initialPhysicalDensity(problem)
+    const unloaded = { ...problem, loadCases: problem.loadCases.map(load => ({ ...load, forces: [] })) }
+    // With no force there is no initial design update.
+    expect(preview).toEqual(new Simp2D(unloaded).step().density)
+    expect(preview.reduce((sum, density) => sum + density, 0) / preview.length).toBeCloseTo(problem.params.volFrac, 7)
+    const { solid, void: voidMask } = problem.passive!
+    expect(preview.every((density, e) => (!solid![e] || density === 1) && (!voidMask![e] || density === 0))).toBe(true)
+    const besideSolid = (grid.nely - 2) * grid.nelx
+    expect(preview[besideSolid]).toBeGreaterThan(preview[0])
+  })
+
+  it('rejects invalid, extreme, and accumulated excessive nodal forces and accepts the limit', () => {
+    const problem = makePreset('cantilever', { nelx: 12, nely: 4 })
+    const [load] = problem.loadCases
+    const [{ node }] = load.forces
+    const solve = (forces: typeof load.forces) => new Simp2D({ ...problem, loadCases: [{ ...load, forces }] })
+    for (const fy of [Infinity, -Infinity, NaN, MAX_NODAL_FORCE * 2]) {
+      expect(() => solve([{ node, fx: 0, fy }])).toThrow(/nodal forces must be finite and at most/)
+    }
+    expect(() => solve([{ node, fx: MAX_NODAL_FORCE, fy: MAX_NODAL_FORCE }])).toThrow(/nodal forces/)
+    const partial = { node, fx: 0, fy: -0.75 * MAX_NODAL_FORCE }
+    expect(() => solve([partial, partial])).toThrow(/net force at a node/)
+    const { vonMises } = solve([{ node, fx: 0, fy: -MAX_NODAL_FORCE }]).step()
+    expect(vonMises.every(Number.isFinite)).toBe(true)
+    expect(vonMises.some(stress => stress > 0)).toBe(true)
+  })
+
+  it('rejects computed stress that would overflow a Float32 result field', () => {
+    const problem = makePreset('cantilever', { nelx: 12, nely: 4, cellSizeMm: 1e-40 })
+    expect(() => new Simp2D(problem).step()).toThrow(/Stress exceeds the representable range/)
+  })
+
   it('matches compliance and volume finite differences around the L-bracket cutout', () => {
     const problem = makePreset('bracket', { nelx: 8, nely: 6 })
     const solver = new Simp2D(problem)
@@ -105,7 +142,7 @@ describe('2D SIMP optimization', () => {
   it('sums opposite load cases and retains the symmetric cantilever solution', () => {
     const grid = { nelx: 30, nely: 14 }
     const one = makePreset('cantilever', grid, { ...params, maxIter: 20 })
-    const opposite = { name: 'Upward tip load', forces: one.loadCases[0].forces.map(force => ({ ...force, fy: -force.fy })) }
+    const opposite = { id: 'opposite', name: 'Upward tip load', forces: one.loadCases[0].forces.map(force => ({ ...force, fy: -force.fy })) }
     const { last } = run({ ...one, loadCases: [...one.loadCases, opposite] })
     const reference = run(one).last
     expect(last.displacements).toHaveLength(2)
