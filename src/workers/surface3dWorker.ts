@@ -1,7 +1,7 @@
 /// <reference lib="webworker" />
 
 import { creaseGeometry3D } from '../solver3d/surface3d'
-import { prepareCadSurface3D, prepareSurface3D } from '../solver3d/marchingCubes'
+import { CadTriangleBudgetError, prepareCadSurface3D, prepareSurface3D } from '../solver3d/marchingCubes'
 import { elementSurface3D } from '../solver3d/mesh3d'
 import type { FemRequest3D, SurfaceEvent3D, SurfaceRequest3D } from './protocol3d'
 
@@ -23,7 +23,7 @@ scope.onmessage = ({ data }: MessageEvent<SurfaceRequest3D | FemRequest3D>) => {
     const render = cad && valid.stl ? creaseGeometry3D(surface) : undefined
     if (render) transfer.push(render.positions.buffer, render.normals.buffer)
     send({ type: 'surface', requestId, surface, valid, render }, transfer)
-  } catch {
-    send({ type: 'error', requestId })
+  } catch (error) {
+    send({ type: 'error', requestId, ...(error instanceof CadTriangleBudgetError && { reason: 'triangle-budget' }) })
   }
 }

@@ -19,6 +19,39 @@ it('allows conventional left orbit and right or middle pan in Standard mode', ()
   expect(cameraGesture('standard', 1, false, false)).toBe('pan')
 })
 
+it('suppresses the click after Shift+LMB pan even when Shift is released first', () => {
+  const canvas = document.createElement('canvas')
+  Object.defineProperty(canvas, 'setPointerCapture', { value: () => {} })
+  const controls = createCamera3D(canvas, new PerspectiveCamera(), new Vector3(), 100, () => {})
+  controls.setEditing(true)
+  const pointer = { pointerId: 1, button: 0 }
+  canvas.dispatchEvent(new PointerEvent('pointerdown', { ...pointer, shiftKey: true }))
+  canvas.dispatchEvent(new PointerEvent('pointerup', pointer))
+  canvas.dispatchEvent(new PointerEvent('lostpointercapture', pointer))
+  expect(controls.claimedEditEvent(new PointerEvent('click', pointer))).toBe(true)
+  expect(controls.claimedEditEvent(new MouseEvent('click'))).toBe(true)
+  expect(controls.claimedEditEvent(new PointerEvent('click', { ...pointer, pointerId: 2 }))).toBe(false)
+  canvas.dispatchEvent(new PointerEvent('pointerdown', pointer))
+  canvas.dispatchEvent(new PointerEvent('pointerup', pointer))
+  expect(controls.claimedEditEvent(new PointerEvent('click', pointer))).toBe(false)
+  controls.dispose()
+})
+
+it('keeps the entire part within the far plane at maximum zoom distance', () => {
+  const canvas = document.createElement('canvas')
+  const center = new Vector3(60, 30, 20)
+  const span = 2 * center.length()
+  const camera = new PerspectiveCamera(37, 1, 0.1, span * 25)
+  const controls = createCamera3D(canvas, camera, center, span, () => {})
+  controls.fit('iso')
+  for (let i = 0; i < 10; i++) canvas.dispatchEvent(new WheelEvent('wheel', { deltaY: 1000 }))
+  expect(camera.position.distanceTo(center)).toBeCloseTo(span * 30)
+  expect(camera.far).toBeGreaterThan(span * 31)
+  camera.updateMatrixWorld()
+  expect(new Vector3().project(camera).z).toBeLessThan(1)
+  controls.dispose()
+})
+
 it('fits with physical F on Russian, German and English layouts and ignores form fields', () => {
   function press(target: EventTarget, key: string, code?: string, ctrlKey = false) {
     let fit = false

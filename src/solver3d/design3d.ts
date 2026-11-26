@@ -1,4 +1,4 @@
-import { cellSize, nodeCount, nodeIndex3D, nodePosition, type Force3D, type Grid3D, type SimpProblem3D, type Support3D } from './types3d'
+import { cellSize, elementCount, elementIndex, nodeCount, nodeIndex3D, nodePosition, type Force3D, type Grid3D, type SimpProblem3D, type Support3D } from './types3d'
 
 export type ForceVector3D = Omit<Force3D, 'node'>
 export type Boundary3D = Pick<SimpProblem3D, 'supports' | 'loadCases'>
@@ -20,10 +20,50 @@ export function forceMagnitude3D({ fx, fy, fz }: ForceVector3D) {
   return Math.hypot(fx, fy, fz)
 }
 
+export const minForceMagnitude3D = 1e-6
+export const maxForceMagnitude3D = 1e9
+
+export function validForceMagnitude3D(magnitude: number) {
+  return magnitude >= minForceMagnitude3D && magnitude <= maxForceMagnitude3D
+}
+
 export function snapNode3D(grid: Grid3D, point: readonly number[]) {
   const [x, y, z] = cellSize(grid).map((size, i) =>
     Math.max(0, Math.min([grid.nelx, grid.nely, grid.nelz][i], Math.round(point[i] / size))))
   return nodeIndex3D(grid, x, y, z)
+}
+
+/** Brick masks are mirrored across the same representatives used by the optimizer. */
+export function brickMasks3D({ grid, params, passive }: Pick<SimpProblem3D, 'grid' | 'params' | 'passive'>) {
+  const { nelx, nely, nelz } = grid
+  const count = elementCount(grid)
+  const representatives = new Int32Array(count)
+  const solid = new Uint8Array(count), voidMask = new Uint8Array(count)
+  const mirrorY = params.symmetry?.includes('y'), mirrorZ = params.symmetry?.includes('z')
+  for (let z = 0, e = 0; z < nelz; z++) for (let y = 0; y < nely; y++) for (let x = 0; x < nelx; x++, e++) {
+    const rep = elementIndex(grid, x, mirrorY ? Math.min(y, nely - 1 - y) : y, mirrorZ ? Math.min(z, nelz - 1 - z) : z)
+    representatives[e] = rep
+    if (passive?.solid?.[e]) solid[rep] = 1
+    if (passive?.void?.[e]) voidMask[rep] = 1
+  }
+  for (let e = 0; e < count; e++) {
+    solid[e] = solid[representatives[e]]
+    voidMask[e] = voidMask[representatives[e]]
+  }
+  return { representatives, solid, voidMask }
+}
+
+export function nodeTouchesMaterial3D(grid: Grid3D, node: number, voidMask: Uint8Array) {
+  const nx = grid.nelx + 1, ny = grid.nely + 1
+  const x = node % nx, y = Math.floor(node / nx) % ny, z = Math.floor(node / (nx * ny))
+  for (let k = Math.max(0, z - 1); k < Math.min(z + 1, grid.nelz); k++) {
+    for (let j = Math.max(0, y - 1); j < Math.min(y + 1, grid.nely); j++) {
+      for (let i = Math.max(0, x - 1); i < Math.min(x + 1, grid.nelx); i++) {
+        if (!voidMask[elementIndex(grid, i, j, k)]) return true
+      }
+    }
+  }
+  return false
 }
 
 export function editCase3D(design: Boundary3D, id: string, edit: (forces: readonly Force3D[]) => readonly Force3D[]) {
@@ -40,9 +80,9 @@ export function deleteCase3D(design: Boundary3D, id: string) {
 
 export function setForce3D(design: Boundary3D, id: string, node: number, force?: ForceVector3D) {
   return editCase3D(design, id, forces => {
-    const magnitude = force && forceMagnitude3D(force)
-    if (!force || !magnitude) return forces.filter(prior => prior.node !== node)
-    if (!Number.isFinite(magnitude)) return forces
+    const magnitude = force ? forceMagnitude3D(force) : 0
+    if (!force || magnitude === 0) return forces.filter(prior => prior.node !== node)
+    if (!validForceMagnitude3D(magnitude)) return forces
     const replacement = { ...force, node }
     return forces.some(prior => prior.node === node)
       ? forces.map(prior => prior.node === node ? replacement : prior)

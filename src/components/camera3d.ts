@@ -27,10 +27,14 @@ export function createCamera3D(canvas: HTMLCanvasElement, camera: PerspectiveCam
   let editing = false
   let isFitted = false
   let drag: { id: number; x: number; y: number; gesture: NonNullable<ReturnType<typeof cameraGesture>> } | undefined
+  let claimedPointer: number | undefined
+  const maxZoomDistance = span * 30
+  camera.far = Math.max(camera.far, maxZoomDistance + span * 2)
+  camera.updateProjectionMatrix()
 
   function zoom(factor: number) {
     offset.subVectors(camera.position, target)
-    offset.setLength(MathUtils.clamp(offset.length() * factor, span * 0.05, span * 30))
+    offset.setLength(MathUtils.clamp(offset.length() * factor, span * 0.05, maxZoomDistance))
     camera.position.copy(target).add(offset)
   }
 
@@ -64,7 +68,10 @@ export function createCamera3D(canvas: HTMLCanvasElement, camera: PerspectiveCam
 
   function down(event: PointerEvent) {
     const gesture = cameraGesture(editing ? 'nx' : mode, event.button, event.shiftKey, event.ctrlKey, event.pointerType === 'touch')
-    if (!gesture || drag) return
+    if (drag) return
+    claimedPointer = undefined
+    if (!gesture) return
+    claimedPointer = event.pointerId
     event.preventDefault()
     canvas.focus({ preventScroll: true })
     canvas.setPointerCapture(event.pointerId)
@@ -130,6 +137,10 @@ export function createCamera3D(canvas: HTMLCanvasElement, camera: PerspectiveCam
 
   return {
     fit, resize,
+    // The browser can synthesize a click after pointerup and lostpointercapture.
+    claimedEditEvent(event: MouseEvent) {
+      return claimedPointer !== undefined && (!('pointerId' in event) || event.pointerId === claimedPointer)
+    },
     setEditing(value: boolean) { editing = value },
     setMode(value: CameraMode3D) { mode = value; canvas.dataset.camera = value },
     dispose() {

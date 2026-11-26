@@ -2,7 +2,94 @@ import { signedTriangleVolume6, triangleNormal, type Surface3D } from './surface
 
 export type SurfaceValidity3D = { obj: boolean; stl: boolean }
 
-type Shell = { faces: number[]; min: number[]; max: number[]; volume: number }
+type Bounds = { min: number[]; max: number[] }
+type Shell = Bounds & { faces: number[]; volume: number }
+type BoundsTree<T> = Bounds & ({ items: T[] } | { left: BoundsTree<T>; right: BoundsTree<T> })
+
+function emptyBounds(): Bounds {
+  return { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] }
+}
+
+function boundsTree<T extends Bounds>(items: T[], start = 0, end = items.length): BoundsTree<T> {
+  const box = emptyBounds(), centers = emptyBounds()
+  for (let i = start; i < end; i++) for (let d = 0; d < 3; d++) {
+    box.min[d] = Math.min(box.min[d], items[i].min[d])
+    box.max[d] = Math.max(box.max[d], items[i].max[d])
+    const center = items[i].min[d] + items[i].max[d]
+    centers.min[d] = Math.min(centers.min[d], center)
+    centers.max[d] = Math.max(centers.max[d], center)
+  }
+  if (end - start <= 8) return { ...box, items: items.slice(start, end) }
+  const spread = centers.max.map((max, axis) => max - centers.min[axis])
+  const axis = spread.indexOf(Math.max(...spread))
+  const middle = (centers.min[axis] + centers.max[axis]) / 2
+  let split = start
+  for (let i = start; i < end; i++) {
+    if (items[i].min[axis] + items[i].max[axis] >= middle) continue
+    const item = items[split]
+    items[split++] = items[i]
+    items[i] = item
+  }
+  // Prevent deep trees when many bounds have identical or clustered centers.
+  if (split - start < (end - start) / 8 || end - split < (end - start) / 8) split = (start + end) >>> 1
+  return { ...box, left: boundsTree(items, start, split), right: boundsTree(items, split, end) }
+}
+
+function visitBounds<T extends Bounds>(tree: BoundsTree<T>, test: (box: Bounds) => boolean, visit: (item: T) => void) {
+  if (!test(tree)) return
+  if ('items' in tree) {
+    for (const item of tree.items) if (test(item)) visit(item)
+  } else {
+    visitBounds(tree.left, test, visit)
+    visitBounds(tree.right, test, visit)
+  }
+}
+
+const ray = [1, 0.754877666, 0.569840291]
+
+function faceBounds(vertices: ArrayLike<number>, triangles: Uint32Array, face: number) {
+  const box = emptyBounds()
+  for (let j = 0; j < 3; j++) for (let d = 0; d < 3; d++) {
+    const value = vertices[3 * triangles[3 * face + j] + d]
+    box.min[d] = Math.min(box.min[d], value)
+    box.max[d] = Math.max(box.max[d], value)
+  }
+  return { ...box, face }
+}
+
+function rayContains(vertices: ArrayLike<number>, triangles: Uint32Array, tree: BoundsTree<ReturnType<typeof faceBounds>>,
+  point: number[]) {
+  let intersections = 0, ambiguous = false
+  visitBounds(tree, box => {
+    let near = 0, far = Infinity
+    for (let d = 0; d < 3; d++) {
+      near = Math.max(near, (box.min[d] - point[d]) / ray[d])
+      far = Math.min(far, (box.max[d] - point[d]) / ray[d])
+    }
+    return far >= near
+  }, ({ face }) => {
+    const a = 3 * triangles[3 * face], b = 3 * triangles[3 * face + 1], c = 3 * triangles[3 * face + 2]
+    const ux = vertices[b] - vertices[a], uy = vertices[b + 1] - vertices[a + 1], uz = vertices[b + 2] - vertices[a + 2]
+    const vx = vertices[c] - vertices[a], vy = vertices[c + 1] - vertices[a + 1], vz = vertices[c + 2] - vertices[a + 2]
+    const px = ray[1] * vz - ray[2] * vy, py = ray[2] * vx - vz, pz = vy - ray[1] * vx
+    const det = ux * px + uy * py + uz * pz
+    const tx = point[0] - vertices[a], ty = point[1] - vertices[a + 1], tz = point[2] - vertices[a + 2]
+    const qx = ty * uz - tz * uy, qy = tz * ux - tx * uz, qz = tx * uy - ty * ux
+    const distanceNumerator = vx * qx + vy * qy + vz * qz
+    if (det === 0) {
+      if (distanceNumerator === 0) ambiguous = true
+      return
+    }
+    const u = (tx * px + ty * py + tz * pz) / det
+    const v = (qx + ray[1] * qy + ray[2] * qz) / det
+    const w = 1 - u - v
+    const tolerance = 1e-10
+    if (distanceNumerator / det < 0 || Math.min(u, v, w) < -tolerance) return
+    if (distanceNumerator === 0 || Math.min(u, v, w) <= tolerance) ambiguous = true
+    intersections += Math.sign(det)
+  })
+  return ambiguous ? undefined : intersections !== 0
+}
 
 function findShells(opposite: Int32Array) {
   const seen = new Uint8Array(opposite.length / 3)
@@ -29,7 +116,7 @@ function findShells(opposite: Int32Array) {
 function hasOutwardShells(vertices: ArrayLike<number>, triangles: Uint32Array, components: number[][], rejected?: Uint8Array) {
   const shells: Shell[] = []
   for (const faces of components) {
-    const shell: Shell = { faces, min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity], volume: 0 }
+    const shell: Shell = { faces, volume: 0, ...emptyBounds() }
     const origin = triangles[3 * faces[0]]
     for (const face of faces) {
       const f = 3 * face
@@ -43,11 +130,21 @@ function hasOutwardShells(vertices: ArrayLike<number>, triangles: Uint32Array, c
     shells.push(shell)
   }
 
+  const search = boundsTree(shells.slice())
+  const triangleTrees = new Map<Shell, BoundsTree<ReturnType<typeof faceBounds>>>()
   function contains(outer: Shell, inner: Shell) {
-    if (!outer.min.every((min, axis) => min < inner.min[axis] && outer.max[axis] > inner.max[axis])) return false
     // The solid angle is ?4? inside a closed shell and zero outside, even for concave shells.
     const point = 3 * triangles[3 * inner.faces[0]]
     const x = vertices[point], y = vertices[point + 1], z = vertices[point + 2]
+    if (outer.faces.length > 64) {
+      let tree = triangleTrees.get(outer)
+      if (!tree) {
+        tree = boundsTree(outer.faces.map(face => faceBounds(vertices, triangles, face)))
+        triangleTrees.set(outer, tree)
+      }
+      const inside = rayContains(vertices, triangles, tree, [x, y, z])
+      if (inside !== undefined) return inside
+    }
     let winding = 0
     for (const f of outer.faces) {
       const a = 3 * triangles[3 * f], b = 3 * triangles[3 * f + 1], c = 3 * triangles[3 * f + 2]
@@ -71,18 +168,17 @@ function hasOutwardShells(vertices: ArrayLike<number>, triangles: Uint32Array, c
     if (!rejected) return
     // A nesting change can come from either wall. Localize it to shells
     // sharing the affected region, leaving independent components untouched.
-    for (const other of shells) {
-      if (!other.min.every((min, axis) => min <= shell.max[axis] && shell.min[axis] <= other.max[axis])) continue
+    visitBounds(search, box => box.min.every((min, axis) => min <= shell.max[axis] && shell.min[axis] <= box.max[axis]), other => {
       for (const face of other.faces) for (let j = 0; j < 3; j++) rejected[triangles[3 * face + j]] = 1
-    }
+    })
   }
   for (const shell of shells) {
     let depth = 0, outermost = shell
-    for (const other of shells) {
-      if (!contains(other, shell)) continue
+    visitBounds(search, box => box.min.every((min, axis) => min < shell.min[axis] && box.max[axis] > shell.max[axis]), other => {
+      if (!contains(other, shell)) return
       depth++
       if (outermost === shell || Math.abs(other.volume) > Math.abs(outermost.volume)) outermost = other
-    }
+    })
     // Material boundaries point outward at even depth, cavity walls inward at odd depth.
     if (!Number.isFinite(shell.volume) || shell.volume === 0 || (shell.volume > 0) !== (depth % 2 === 0)) reject(shell)
     netVolumes.set(outermost, (netVolumes.get(outermost) ?? 0) + shell.volume)

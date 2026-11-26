@@ -1,11 +1,11 @@
-import { rigidRank3D } from './design3d'
+import { brickMasks3D, forceMagnitude3D, nodeTouchesMaterial3D, rigidRank3D, validForceMagnitude3D } from './design3d'
 import { elasticity3D, h8Corners, h8Stiffness, strainDisplacementH8, vonMises3D } from './elementH8'
 import { tet4Templates, tetCorners, tetVolumeFraction } from './elementT4'
 import { DensityFilter3D, projectDensity3D } from './filter3d'
 import { fixedDofs3D, Pcg3D } from './pcg3d'
 import {
-  cellSize, elementCount, elementIndex, maxCellAspectRatio3D, nodeCount, nodeIndex3D, ProblemError3D,
-  type SimpProblem3D, type Snapshot3D,
+  cellSize, elementCount, maxCellAspectRatio3D, nodeCount, nodeIndex3D, ProblemError3D,
+  type SimpProblem3D, type Snapshot3D, type Support3D,
 } from './types3d'
 
 const positive = (value: number) => Number.isFinite(value) && value > 0
@@ -14,6 +14,33 @@ function dot(a: Float64Array, b: Float64Array) {
   let value = 0
   for (let i = 0; i < a.length; i++) value += a[i] * b[i]
   return value
+}
+
+function validateComponentSupports(problem: SimpProblem3D, voidMask: Uint8Array, loaded: Uint8Array) {
+  if (!voidMask.some(Boolean)) return
+  const { grid, supports } = problem
+  const { nelx, nely, nelz } = grid
+  const parent = Int32Array.from(loaded, (_, node) => node)
+  function root(node: number) {
+    while (parent[node] !== node) {
+      parent[node] = parent[parent[node]]
+      node = parent[node]
+    }
+    return node
+  }
+  // All five Tet4 elements in a non-void brick inherit its mask and are connected.
+  // Union at the nodes, including bricks meeting only at an edge or corner.
+  for (let z = 0, e = 0; z < nelz; z++) for (let y = 0; y < nely; y++) for (let x = 0; x < nelx; x++, e++) {
+    if (voidMask[e]) continue
+    const first = root(nodeIndex3D(grid, x, y, z))
+    for (const [dx, dy, dz] of h8Corners) parent[root(nodeIndex3D(grid, x + dx, y + dy, z + dz))] = first
+  }
+  const byComponent = new Map<number, Support3D[]>()
+  for (let node = 0; node < loaded.length; node++) if (loaded[node]) byComponent.set(root(node), [])
+  for (const support of supports) byComponent.get(root(support.node))?.push(support)
+  for (const restraints of byComponent.values()) {
+    if (rigidRank3D(grid, restraints) < 6) throw new ProblemError3D('componentSupport3dError')
+  }
 }
 
 export function validateProblem3D(problem: SimpProblem3D) {
@@ -33,47 +60,40 @@ export function validateProblem3D(problem: SimpProblem3D) {
   if ((passive?.void && passive.void.length !== count) || (passive?.solid && passive.solid.length !== count)) {
     throw new ProblemError3D('mask3dError')
   }
-  const representatives = new Int32Array(count)
-  const solid = new Uint8Array(count)
-  const voidMask = new Uint8Array(count)
+  const { representatives, solid, voidMask } = brickMasks3D(problem)
   const mirrorY = params.symmetry?.includes('y'), mirrorZ = params.symmetry?.includes('z')
-  let e = 0
-  for (let z = 0; z < nelz; z++) for (let y = 0; y < nely; y++) for (let x = 0; x < nelx; x++, e++) {
-    const rep = elementIndex(grid, x, mirrorY ? Math.min(y, nely - 1 - y) : y, mirrorZ ? Math.min(z, nelz - 1 - z) : z)
-    representatives[e] = rep
-    if (passive?.solid?.[e]) solid[rep] = 1
-    if (passive?.void?.[e]) voidMask[rep] = 1
-    if (solid[rep] && voidMask[rep]) throw new ProblemError3D('mask3dError')
-  }
   let solids = 0, allowed = 0
   const nodes = nodeCount(grid)
-  const attached = new Uint8Array(nodes)
-  e = 0
-  for (let z = 0; z < nelz; z++) for (let y = 0; y < nely; y++) for (let x = 0; x < nelx; x++, e++) {
-    solid[e] = solid[representatives[e]]
-    voidMask[e] = voidMask[representatives[e]]
+  for (let e = 0; e < count; e++) {
+    if (solid[e] && voidMask[e]) throw new ProblemError3D('mask3dError')
     solids += solid[e]
-    if (voidMask[e]) continue
-    allowed++
-    for (const [dx, dy, dz] of h8Corners) attached[nodeIndex3D(grid, x + dx, y + dy, z + dz)] = 1
+    allowed += 1 - voidMask[e]
   }
   const target = count * params.volFrac
   if (target < solids - 1e-9 || target > allowed + 1e-9) throw new ProblemError3D('volume3dError')
   const validNode = (node: number) => Number.isInteger(node) && node >= 0 && node < nodes
   for (const support of supports) {
     if (!validNode(support.node)) throw new ProblemError3D('support3dError')
-    if ((support.fixX || support.fixY || support.fixZ) && !attached[support.node]) throw new ProblemError3D('attachment3dError')
+    if ((support.fixX || support.fixY || support.fixZ) && !nodeTouchesMaterial3D(grid, support.node, voidMask)) {
+      throw new ProblemError3D('attachment3dError')
+    }
   }
   const fixed = fixedDofs3D(grid, supports)
   if (rigidRank3D(grid, supports) < 6) throw new ProblemError3D('support3dError')
   const ids = new Set<string>()
+  const loaded = new Uint8Array(nodes)
   const forces = loadCases.map(load => {
     if (!load.id || ids.has(load.id)) throw new ProblemError3D('load3dError')
     ids.add(load.id)
     const rhs = new Float64Array(fixed.length)
     for (const { node, fx, fy, fz } of load.forces) {
-      if (!validNode(node) || ![fx, fy, fz].every(Number.isFinite)) throw new ProblemError3D('load3dError')
-      if ((fx || fy || fz) && !attached[node]) throw new ProblemError3D('attachment3dError')
+      if (!validNode(node)) throw new ProblemError3D('load3dError')
+      const magnitude = forceMagnitude3D({ fx, fy, fz })
+      if (magnitude !== 0) {
+        if (!validForceMagnitude3D(magnitude)) throw new ProblemError3D('forceMagnitude3dError')
+        if (!nodeTouchesMaterial3D(grid, node, voidMask)) throw new ProblemError3D('attachment3dError')
+        loaded[node] = 1
+      }
       if (!fixed[3 * node]) rhs[3 * node] += fx
       if (!fixed[3 * node + 1]) rhs[3 * node + 1] += fy
       if (!fixed[3 * node + 2]) rhs[3 * node + 2] += fz
@@ -82,6 +102,7 @@ export function validateProblem3D(problem: SimpProblem3D) {
     return rhs
   })
   if (!forces.some(rhs => rhs.some(value => value !== 0))) throw new ProblemError3D('load3dError')
+  validateComponentSupports(problem, voidMask, loaded)
   if (elementType === 'hex8') return { solid, voidMask, fixed, forces, representatives, allowed, brickMasks: { solid, void: voidMask } }
 
   const tetSolid = new Uint8Array(5 * count), tetVoid = new Uint8Array(5 * count)

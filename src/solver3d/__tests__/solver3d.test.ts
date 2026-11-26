@@ -41,20 +41,21 @@ it.each([1, 1e-100])('recovers uniaxial tension and Poisson contraction at load 
   const grid = { nelx: 5, nely: 3, nelz: 2, widthMm: 20, heightMm: 6, depthMm: 8 }
   const problem = makePreset3D('cantilever3d', grid)
   const node = (x: number, y: number, z: number) => nodeIndex3D(grid, x, y, z)
-  const force = 480 * scale
+  const nominal = 480
   const forces = []
   const supports = []
   for (let y = 0; y <= grid.nely; y++) for (let z = 0; z <= grid.nelz; z++) {
     const weightY = y === 0 || y === grid.nely ? 0.5 : 1
     const weightZ = z === 0 || z === grid.nelz ? 0.5 : 1
-    forces.push({ node: node(grid.nelx, y, z), fx: force * weightY * weightZ / (grid.nely * grid.nelz), fy: 0, fz: 0 })
+    forces.push({ node: node(grid.nelx, y, z), fx: nominal * weightY * weightZ / (grid.nely * grid.nelz), fy: 0, fz: 0 })
     supports.push({ node: node(0, y, z), fixX: true, fixY: y === 0 && z === 0, fixZ: z === 0 })
   }
   const tension = { ...problem, supports, loadCases: [{ id: 'tension', forces }] }
   const setup = validateProblem3D(tension)
-  const analysis = new Analysis3D(tension, setup.fixed, setup.forces)
+  // Exercise numerical scaling directly on the assembled right-hand side.
+  const analysis = new Analysis3D(tension, setup.fixed, setup.forces.map(rhs => rhs.map(value => value * scale)))
   analysis.solve(new Float64Array(elementCount(grid)).fill(1), 3, 1e-9)
-  const stress = force / (grid.heightMm * grid.depthMm)
+  const stress = nominal * scale / (grid.heightMm * grid.depthMm)
   const strain = stress / problem.material.E0
   const [u] = analysis.displacements
   for (let d = 0; d < u.length; d += 3) {

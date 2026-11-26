@@ -4,7 +4,7 @@ import { materials } from '../solver/presets'
 import type { MaterialId } from '../solver/project'
 import {
   addCase3D, boundaryHistory3D, caseColor3D, caseNumber, changeBoundary3D, deleteCase3D, deleteForce3D, directionalForce3D,
-  directions3D, editCase3D, forceMagnitude3D, rigidRank3D, setForce3D, setSupport3D,
+  directions3D, editCase3D, forceMagnitude3D, maxForceMagnitude3D, minForceMagnitude3D, rigidRank3D, setForce3D, setSupport3D, validForceMagnitude3D,
   type Boundary3D, type BoundaryHistory3D, type EditTool3D, type ForceVector3D, type SupportKind3D,
 } from '../solver3d/design3d'
 import { exportObj3D, exportStl3D } from '../solver3d/export3d'
@@ -50,15 +50,14 @@ const supportKinds = {
 } as const
 
 function ForceInput3D({ label, value, setValue, magnitude = false }: {
-  label: string; value: number; setValue: (value: number) => void; magnitude?: boolean
+  label: string; value: number; setValue: (value: number) => boolean; magnitude?: boolean
 }) {
   return <Tooltip message={magnitude ? 'hint3dMagnitude' : 'hint3dComponent'}>
     <label className="force-input-3d">{label}
       <input key={value} className="field-input" type="number" step="any" min={magnitude ? 0 : undefined} defaultValue={value}
         onBlur={event => {
           const next = event.currentTarget.valueAsNumber
-          if (Number.isFinite(next) && (!magnitude || next >= 0)) setValue(next)
-          else event.currentTarget.value = String(value)
+          if (!setValue(next)) event.currentTarget.value = String(value)
         }}
         onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }} />
     </label>
@@ -113,7 +112,8 @@ function ExportDialog3D({ result, pending, elementType, settings, change, close 
     <p className="contour-summary" aria-live="polite">{pending ? t('computingSurface3d') : surface && t('meshSummary3d')
       .replace('{vertices}', number((surface?.vertices.length ?? 0) / 3)).replace('{triangles}', number(triangles))}</p>
     {surface && !triangles && <p className="hint">{t('noMaterial')} {t('helpThreshold')}</p>}
-    {(exportError || result?.type === 'error' || (triangles > 0 && (!valid?.obj || !valid?.stl))) && <p className="error" role="alert">{t('meshError3d')}</p>}
+    {(exportError || result?.type === 'error' || (triangles > 0 && (!valid?.obj || !valid?.stl))) &&
+      <p className="error" role="alert">{t(result?.type === 'error' && result.reason === 'triangle-budget' ? 'cadBudget3dError' : 'meshError3d')}</p>}
     <div className="action-row export-actions">
       <Tooltip message="hint3dStl"><button type="button" className="tool-button" disabled={!valid?.stl} onClick={() => save('stl')}>{t('download').replace('{format}', '.STL')}</button></Tooltip>
       <Tooltip message="hint3dObj"><button type="button" className="tool-button" disabled={!valid?.obj} onClick={() => save('obj')}>{t('download').replace('{format}', '.OBJ')}</button></Tooltip>
@@ -131,6 +131,7 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
   const [tool, setTool] = useState<EditTool3D>('orbit')
   const [supportKind, setSupportKind] = useState<SupportKind3D>('fixed')
   const [force, setForce] = useState<ForceVector3D>({ fx: 0, fy: -100, fz: 0 })
+  const [forceInputError, setForceInputError] = useState(false)
   const nextCase = useRef(2)
   const [size, setSize] = useState<Pick<Grid3D, Dimension>>({ widthMm: 120, heightMm: 60, depthMm: 40 })
   const [material, setMaterial] = useState<MaterialId>('steel')
@@ -301,7 +302,15 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
 
   const issue = !stable ? 'support3dError' : preview?.issue ?? error?.issue ?? (currentPreview?.failed ? 'workerError' : undefined)
   const canRun = !pendingPreview && !issue && (state === 'ready' || state === 'paused')
-  const issueText = issue && t(issue).replace('{limit}', number(maxCellAspectRatio3D))
+  const forceMagnitudeError = t('forceMagnitude3dError')
+    .replace('{min}', significant(minForceMagnitude3D)).replace('{max}', number(maxForceMagnitude3D))
+  const issueText = issue === 'forceMagnitude3dError' ? forceMagnitudeError : issue && t(issue).replace('{limit}', number(maxCellAspectRatio3D))
+  function acceptForce(magnitude: number, apply: () => void) {
+    const valid = magnitude === 0 || validForceMagnitude3D(magnitude)
+    setForceInputError(!valid)
+    if (valid) apply()
+    return valid
+  }
   const filterRadiusMm = params.rmin * Math.min(...cellSize(grid))
   const metrics = [
     ['elementCount3d', 'hint3dElementCount', number(elementCount(grid, elementType)), ''],
@@ -402,20 +411,28 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
           </div>
           <div className="segmented force-directions-3d" role="group" aria-label={t('forceDirections')}>
             {directions3D.map(([label, key, axis, sign]) => <Tooltip key={key} message="hint3dDirection">
-              <button type="button" aria-label={t(key)} onClick={() => setForce(directionalForce3D(axis, sign, magnitude || 100))}>
+              <button type="button" aria-label={t(key)} onClick={() => {
+                setForceInputError(false)
+                setForce(directionalForce3D(axis, sign, magnitude || 100))
+              }}>
                 {label}
               </button>
             </Tooltip>)}
           </div>
-          <ForceInput3D magnitude label={`${t('forceMagnitude')} (${t('N')})`} value={magnitude} setValue={value => {
-            if (value === magnitude) return
-            setForce(magnitude ? { fx: force.fx / magnitude * value, fy: force.fy / magnitude * value, fz: force.fz / magnitude * value }
-              : directionalForce3D('fy', -1, value))
-          }} />
+          <ForceInput3D magnitude label={`${t('forceMagnitude')} (${t('N')})`} value={magnitude} setValue={value =>
+            acceptForce(value, () => {
+              if (value === magnitude) return
+              setForce(magnitude ? { fx: force.fx / magnitude * value, fy: force.fy / magnitude * value, fz: force.fz / magnitude * value }
+                : directionalForce3D('fy', -1, value))
+            })} />
           <div className="force-components-3d">
             {forceComponents.map(axis => <ForceInput3D key={axis} label={`${labelComponent(axis)} (${t('N')})`}
-              value={force[axis]} setValue={value => setForce(prior => ({ ...prior, [axis]: value }))} />)}
+              value={force[axis]} setValue={value => {
+                const updated = { ...force, [axis]: value }
+                return acceptForce(forceMagnitude3D(updated), () => setForce(updated))
+              }} />)}
           </div>
+          {forceInputError && <p className="error" role="alert">{forceMagnitudeError}</p>}
           <h3>{t('nodalLoads')}</h3>
           {!activeCase.forces.length && <p className="hint">{t('noLoads')}</p>}
           <ul className="load-list-3d">
@@ -431,9 +448,10 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
                 </div>
                 <div className="force-components-3d">{forceComponents.map(axis => <ForceInput3D key={axis}
                   label={`${labelComponent(axis)} (${t('N')})`} value={load[axis]} setValue={value => {
-                    if (value === load[axis]) return
                     const updated = { ...load, [axis]: value }
-                    if (Number.isFinite(forceMagnitude3D(updated))) changeBoundary(setForce3D(design, activeCase.id, load.node, updated))
+                    return acceptForce(forceMagnitude3D(updated), () => {
+                      if (value !== load[axis]) changeBoundary(setForce3D(design, activeCase.id, load.node, updated))
+                    })
                   }} />)}</div>
               </li>
             })}
@@ -490,12 +508,14 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
         </div>
         {issueText && <p className="error" role="alert">{issueText}{error?.relativeResidual !== undefined &&
           ` ${t('solveResidual3d').replace('{residual}', significant(error.relativeResidual))}`} {error && t('resetError')}</p>}
+        {view !== 'voxels' && exported?.type === 'error' && exported.reason === 'triangle-budget' &&
+          <p className="error" role="alert">{t('cadBudget3dError')}</p>}
         <Viewport3D active={active} problem={problem} density={density} mode={mode} setMode={setMode}
           view={mode === 'auto' && !surface?.triangles.length ? 'voxels' : view} surface={surface} frame={view === 'stress' ? display?.frame : frame} renderData={renderData}
           editor={{ tool, setTool, force, caseId: activeCase.id,
             place: node => {
               if (tool === 'support') changeBoundary(setSupport3D(design, node, supportKind))
-              else if (magnitude > 0 && Number.isFinite(magnitude)) changeBoundary(setForce3D(design, activeCase.id, node, force))
+              else if (validForceMagnitude3D(magnitude)) changeBoundary(setForce3D(design, activeCase.id, node, force))
             },
             remove: node => changeBoundary(tool === 'support' ? setSupport3D(design, node)
               : setForce3D(design, activeCase.id, node)),

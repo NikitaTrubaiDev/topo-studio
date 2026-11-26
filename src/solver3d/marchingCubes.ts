@@ -10,6 +10,9 @@ export { signedTriangleVolume6, triangleNormal, type Surface3D } from './surface
 export { marchingTetrahedra } from './tetSurface3d'
 
 export const maxSmoothingPasses3D = 12
+const cadRefinementBudget = 20_000
+export const cadTriangleBudget = 250_000
+export class CadTriangleBudgetError extends RangeError {}
 
 const edges = [
   [0, 1], [1, 3], [3, 2], [2, 0], [4, 5], [5, 7], [7, 6], [6, 4], [0, 4], [1, 5], [3, 7], [2, 6],
@@ -30,25 +33,31 @@ const faces = [
  * remain at the specified dimensions regardless of the chosen threshold.
  */
 export function marchingCubes(density: ArrayLike<number>, grid: Grid3D, threshold = 0.5, passive?: PassiveMasks): Surface3D {
+  return marchCubes(density, grid, threshold, passive, Infinity)
+}
+
+function marchCubes(density: ArrayLike<number>, grid: Grid3D, threshold: number, passive: PassiveMasks | undefined,
+  triangleBudget: number): Surface3D {
   if (density.length !== elementCount(grid) || !(threshold > 0 && threshold < 1)) throw new RangeError('Invalid isosurface input')
   const { nelx, nely, nelz } = grid
   const [hx, hy, hz] = cellSize(grid)
   const nx = nelx + 2, ny = nely + 2, nz = nelz + 2
   const area = nx * ny
   const field = new Float64Array(area * nz)
-  const ghost = new Uint8Array(field.length)
+  const fixedCrossing = new Uint8Array(field.length)
   const prescribed = passive && new Uint8Array(field.length)
   for (let z = 0; z < nz; z++) for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) {
     const index = (z * ny + y) * nx + x
     if (x === 0 || y === 0 || z === 0 || x === nx - 1 || y === ny - 1 || z === nz - 1) {
-      ghost[index] = 1
+      fixedCrossing[index] = 1
       field[index] = -threshold
       continue
     }
     const e = elementIndex(grid, x - 1, y - 1, z - 1)
     if (prescribed) prescribed[index] = Number(!!(passive?.solid?.[e] || passive?.void?.[e]))
-    const value = density[e] - threshold
-    if (!Number.isFinite(value)) throw new RangeError('Non-finite density')
+    if (!Number.isFinite(density[e])) throw new RangeError('Non-finite density')
+    const value = (passive?.void?.[e] ? 0 : density[e]) - threshold
+    if (passive?.void?.[e]) fixedCrossing[index] = 1
     // Keep edge crossings separate even at a sample equal to the iso value.
     field[index] = (value < 0 ? -1 : 1) * Math.max(Math.abs(value), 1e-5)
   }
@@ -66,7 +75,8 @@ export function marchingCubes(density: ArrayLike<number>, grid: Grid3D, threshol
     if (vertexCache[key] >= 0) return vertexCache[key]
     const fraction = field[ids[a]] / (field[ids[a]] - field[ids[b]])
     // Keep crossings distinct after rounding to GPU/STL precision.
-    const t = ghost[lo] || ghost[hi] ? 0.5 : Math.max(1e-4, Math.min(1 - 1e-4, fraction))
+    // Prescribed void interfaces use the midpoint between cell centers.
+    const t = fixedCrossing[lo] || fixedCrossing[hi] ? 0.5 : Math.max(1e-4, Math.min(1 - 1e-4, fraction))
     const p = h8Corners[a], q = h8Corners[b]
     const index = vertices.length / 3
     const coordinate = (cell: number, max: number, side: number, d: number) => {
@@ -125,6 +135,9 @@ export function marchingCubes(density: ArrayLike<number>, grid: Grid3D, threshol
         next[current] = -1
         current = following
       } while (current !== edge)
+      if (triangles.length / 3 + (loop.length === 3 ? 1 : loop.length) > triangleBudget) {
+        throw new CadTriangleBudgetError('CAD surface exceeds the triangle budget')
+      }
       if (loop.length === 3) {
         triangles.push(loop[0], loop[1], loop[2])
       } else {
@@ -145,7 +158,7 @@ export function marchingCubes(density: ArrayLike<number>, grid: Grid3D, threshol
     ...(prescribed && { pinned: Uint8Array.from(pinned) }) }
 }
 
-/** Resample the continuous, cell-centered density field at twice the display resolution.
+/** Extract the cell-centered scalar field, with optional refinement on smaller grids.
  * Tet4 values are restricted by physical volume, independent of brick parity. */
 export function prepareCadSurface3D(density: ArrayLike<number>, grid: Grid3D, threshold: number, passes: number,
   passive?: PassiveMasks, elementType: ElementType3D = 'hex8') {
@@ -165,26 +178,44 @@ export function prepareCadSurface3D(density: ArrayLike<number>, grid: Grid3D, th
       peak[e] = Math.max(peak[e], value)
     }
   }
+  // Keep near-threshold isolated members at least one sample wide.
+  const floor = new Float64Array(count)
+  const eligible = new Uint8Array(count)
+  for (let e = 0; e < count; e++) {
+    if (!Number.isFinite(brick[e])) throw new RangeError('Non-finite density')
+    eligible[e] = Number(!passive?.void?.[e] && (peak[e] >= threshold || !!passive?.solid?.[e]))
+    if (passive?.void?.[e]) brick[e] = 0
+    else if (passive?.solid?.[e]) brick[e] = 1
+  }
+  const area = nelx * nely
+  for (let z = 0, e = 0; z < nelz; z++) for (let y = 0; y < nely; y++) for (let x = 0; x < nelx; x++, e++) {
+    if (!eligible[e] || passive?.solid?.[e]) continue
+    const alongX = (x > 0 && eligible[e - 1]) || (x + 1 < nelx && eligible[e + 1])
+    const alongY = (y > 0 && eligible[e - nelx]) || (y + 1 < nely && eligible[e + nelx])
+    const alongZ = (z > 0 && eligible[e - area]) || (z + 1 < nelz && eligible[e + area])
+    if (Number(!!alongX) + Number(!!alongY) + Number(!!alongZ) <= 1) {
+      floor[e] = threshold + Math.min((1 - threshold) * 0.5, 0.025 + 0.1 * (peak[e] - threshold))
+    }
+  }
+  if (count <= cadRefinementBudget) {
+    try {
+      const { refined, samples, masks } = refineCadField(brick, floor, grid, passive)
+      const surface = marchCubes(samples, refined, threshold, masks, cadTriangleBudget)
+      return smoothSurface(surface, refined, passes, 0.5, -0.53, 0.35)
+    } catch (error) {
+      if (!(error instanceof CadTriangleBudgetError)) throw error
+    }
+  }
+  for (let e = 0; e < count; e++) brick[e] = Math.max(brick[e], floor[e])
+  const surface = marchCubes(brick, grid, threshold, passive, cadTriangleBudget)
+  return smoothSurface(surface, grid, passes, 0.5, -0.53, 0.35)
+}
+
+function refineCadField(brick: Float64Array, floor: Float64Array, grid: Grid3D, passive?: PassiveMasks) {
+  const { nelx, nely, nelz } = grid
   const refined = { ...grid, nelx: 2 * nelx, nely: 2 * nely, nelz: 2 * nelz }
   const samples = new Float64Array(elementCount(refined))
-  const pins = new Uint8Array(samples.length)
-  // Keep near-threshold isolated members at least one sample wide. Protected
-  // geometry uses the unmodified field so bore crossings retain their diameter.
-  const floor = new Float64Array(count)
-  for (let z = 0, e = 0; z < nelz; z++) for (let y = 0; y < nely; y++) for (let x = 0; x < nelx; x++, e++) {
-    if (!Number.isFinite(brick[e])) throw new RangeError('Non-finite density')
-    if (peak[e] < threshold || passive?.void?.[e] || passive?.solid?.[e]) continue
-    const area = nelx * nely
-    const neighbors = [
-      x > 0 && peak[e - 1] >= threshold, x + 1 < nelx && peak[e + 1] >= threshold,
-      y > 0 && peak[e - nelx] >= threshold, y + 1 < nely && peak[e + nelx] >= threshold,
-      z > 0 && peak[e - area] >= threshold, z + 1 < nelz && peak[e + area] >= threshold,
-    ]
-    const narrow = !(neighbors[0] || neighbors[1]) && !(neighbors[2] || neighbors[3])
-      || !(neighbors[0] || neighbors[1]) && !(neighbors[4] || neighbors[5])
-      || !(neighbors[2] || neighbors[3]) && !(neighbors[4] || neighbors[5])
-    if (narrow) floor[e] = threshold + Math.min((1 - threshold) * 0.5, 0.025 + 0.1 * (peak[e] - threshold))
-  }
+  const masks = passive && { solid: new Uint8Array(samples.length), void: new Uint8Array(samples.length) }
   const stencils = [nelx, nely, nelz].map(n => Array.from({ length: 2 * n }, (_, i) => {
     const position = i / 2 - 0.25
     const low = Math.floor(position)
@@ -195,22 +226,20 @@ export function prepareCadSurface3D(density: ArrayLike<number>, grid: Grid3D, th
     for (let x = 0; x < refined.nelx; x++, i++) {
       const sx = stencils[0][x]
       const owner = elementIndex(grid, x >> 1, y >> 1, z >> 1)
-      let value = 0, protectedSample = false, voidNeighbor = false
+      if (masks && passive?.void?.[owner]) { masks.void[i] = 1; continue }
+      if (masks && passive?.solid?.[owner]) { masks.solid[i] = 1; samples[i] = 1; continue }
+      let value = 0, weightSum = 0
       for (let k = 0; k < 2; k++) for (let j = 0; j < 2; j++) for (let d = 0; d < 2; d++) {
         const e = elementIndex(grid, d ? sx.hi : sx.lo, j ? sy.hi : sy.lo, k ? sz.hi : sz.lo)
+        if (passive?.void?.[e]) continue
         const weight = (d ? sx.mix : 1 - sx.mix) * (j ? sy.mix : 1 - sy.mix) * (k ? sz.mix : 1 - sz.mix)
         value += brick[e] * weight
-        protectedSample ||= !!(passive?.void?.[e] || passive?.solid?.[e])
-        voidNeighbor ||= !!passive?.void?.[e]
+        weightSum += weight
       }
-      pins[i] = Number(protectedSample)
-      samples[i] = voidNeighbor ? value : Math.max(value, floor[owner])
+      samples[i] = Math.max(value / weightSum, floor[owner])
     }
   }
-  // Larger grids already have fine physical sampling. Keep the same 2? field
-  // and bound smoothing displacement by the refined cell size.
-  const surface = marchingCubes(samples, refined, threshold, { solid: pins })
-  return smoothSurface(surface, refined, passes, 0.5, -0.53, 0.35)
+  return { refined, samples, masks }
 }
 
 export function taubinSmooth(mesh: Surface3D, grid: Grid3D, passes: number, lambda = 0.5, mu = -0.53): Surface3D {
@@ -231,30 +260,37 @@ function smoothSurface(mesh: Surface3D, grid: Grid3D, passes: number, lambda = 0
   const limits = [grid.widthMm, grid.heightMm, grid.depthMm]
   const boundary = Uint8Array.from(vertices, (value, i) => Number(!!pinned?.[Math.floor(i / 3)] || value === 0 || value === limits[i % 3]))
   const maxOffset = Math.min(...cellSize(grid)) * offsetCells / Math.sqrt(3)
-  const adjacency = Array.from({ length: vertices.length / 3 }, () => new Set<number>())
+  // In a validated oriented manifold, each vertex has one outgoing half-edge
+  // to each neighbor. Store those edges in contiguous per-vertex ranges.
+  const offsets = new Uint32Array(vertices.length / 3 + 1)
+  for (const vertex of triangles) offsets[vertex + 1]++
+  for (let i = 1; i < offsets.length; i++) offsets[i] += offsets[i - 1]
+  const cursor = offsets.slice()
+  const adjacency = new Uint32Array(triangles.length)
   for (let i = 0; i < triangles.length; i += 3) {
     for (let j = 0; j < 3; j++) {
       const v = triangles[i + j], w = triangles[i + (j + 1) % 3]
-      adjacency[v].add(w)
-      adjacency[w].add(v)
+      adjacency[cursor[v]++] = w
     }
   }
-  const ranges = Float64Array.from(adjacency, (neighbors, vertex) => {
+  const ranges = new Float64Array(offsets.length - 1)
+  for (let vertex = 0; vertex < ranges.length; vertex++) {
     let limit = maxOffset
-    for (const neighbor of neighbors) {
-      const a = 3 * vertex, b = 3 * neighbor
+    for (let j = offsets[vertex]; j < offsets[vertex + 1]; j++) {
+      const a = 3 * vertex, b = 3 * adjacency[j]
       limit = Math.min(limit, 0.3 * Math.hypot(vertices[a] - vertices[b], vertices[a + 1] - vertices[b + 1], vertices[a + 2] - vertices[b + 2]))
     }
-    return limit
-  })
+    ranges[vertex] = limit
+  }
   function pass(input: Float64Array, output: Float64Array, weight: number) {
     for (let i = 0; i < input.length; i++) {
       const d = i % 3
-      const neighbors = adjacency[(i - d) / 3]
+      const vertex = (i - d) / 3
+      const start = offsets[vertex], end = offsets[vertex + 1]
       let delta = 0
-      for (const neighbor of neighbors) delta += input[3 * neighbor + d] - input[i]
-      const value = input[i] + weight * delta / (neighbors.size || 1)
-      const original = mesh.vertices[i], range = ranges[(i - d) / 3]
+      for (let j = start; j < end; j++) delta += input[3 * adjacency[j] + d] - input[i]
+      const value = input[i] + weight * delta / (end - start)
+      const original = mesh.vertices[i], range = ranges[vertex]
       output[i] = boundary[i] ? original : Math.min(limits[d], original + range, Math.max(0, original - range, value))
     }
     keepOrientations(input, output)

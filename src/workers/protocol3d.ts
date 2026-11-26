@@ -35,7 +35,8 @@ export type SurfaceInput3D = {
 
 export type SurfaceRequest3D = SurfaceInput3D & { requestId: number }
 export type SurfaceEvent3D = { requestId: number } & (
-  { type: 'surface'; surface: Surface3D; valid: SurfaceValidity3D; render?: ReturnType<typeof creaseGeometry3D> } | { type: 'error' }
+  { type: 'surface'; surface: Surface3D; valid: SurfaceValidity3D; render?: ReturnType<typeof creaseGeometry3D> }
+  | { type: 'error'; reason?: 'triangle-budget' }
 )
 
 

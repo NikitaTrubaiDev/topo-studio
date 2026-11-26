@@ -65,6 +65,22 @@ function button(label: string) {
   return Array.from(mount.querySelectorAll('button')).find(button => button.textContent?.includes(label))!
 }
 
+it.each(['1e155', '1e-200'])('rejects %s N in both the magnitude editor and an existing nodal load', value => {
+  const magnitude = mount.querySelector<HTMLInputElement>('label.force-input-3d input')!
+  const loadY = mount.querySelectorAll<HTMLInputElement>('.load-list-3d input')[1]
+  for (const field of [magnitude, loadY]) {
+    const original = field.value
+    act(() => {
+      field.focus()
+      field.value = value
+      field.blur()
+    })
+    expect(field.value).toBe(original)
+    expect(mount.querySelector('[role="alert"]')?.textContent).toContain('Enter a finite force magnitude')
+  }
+  expect(ManualWorker.instances).toHaveLength(1)
+})
+
 it('keeps controls responsive during high-resolution nonlinear Tet4 preview and rejects stale replies', () => {
   const first = ManualWorker.instances[0]
   expect(button('Play').disabled).toBe(true)

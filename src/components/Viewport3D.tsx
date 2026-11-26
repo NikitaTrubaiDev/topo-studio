@@ -1,15 +1,16 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ACESFilmicToneMapping, ArrowHelper, BackSide, Box3, BoxGeometry, BufferAttribute, BufferGeometry, Color, ConeGeometry, CylinderGeometry,
+  ACESFilmicToneMapping, ArrowHelper, BackSide, BoxGeometry, BufferAttribute, BufferGeometry, Color, ConeGeometry, CylinderGeometry,
   DirectionalLight, EdgesGeometry, FrontSide, GridHelper, Group, HemisphereLight, InstancedMesh, Line, LineBasicMaterial, LineSegments,
   MathUtils, Mesh, MeshBasicMaterial, MeshStandardMaterial, Object3D, PerspectiveCamera, Plane, Raycaster, Scene, SphereGeometry, Vector2, Vector3, WebGLRenderer,
 } from 'three'
 import { useTranslation } from '../i18n'
-import { caseColor3D, caseNumber, forceMagnitude3D, snapNode3D, type EditTool3D, type ForceVector3D } from '../solver3d/design3d'
+import { brickMasks3D, caseColor3D, caseNumber, forceMagnitude3D, validForceMagnitude3D, type EditTool3D, type ForceVector3D } from '../solver3d/design3d'
 import { nodalField3D } from '../solver3d/mesh3d'
 import { cellSize, nodeIndex3D, nodePosition, type Grid3D, type SimpProblem3D } from '../solver3d/types3d'
 import type { Surface3D, creaseGeometry3D } from '../solver3d/surface3d'
 import { createCamera3D, isFitShortcut, type CameraMode3D, type QuickView3D } from './camera3d'
+import { designDomainMesh3D, firstVisibleMeshHit3D, snapEditNode3D } from './viewportPicking3d'
 import { Tooltip } from './Tooltip'
 import type { FemEvent3D, FemRequest3D, TimedSnapshot3D } from '../workers/protocol3d'
 
@@ -42,17 +43,17 @@ function disposeGroup(group: Group | Scene) {
 
 function layoutForces(problem: SimpProblem3D) {
   const { grid, loadCases } = problem
-  const forces = loadCases.flatMap(load => load.forces.filter(force => forceMagnitude3D(force) > 0)
-    .map(force => ({ ...force, caseId: load.id })))
-  const max = forces.reduce((peak, force) => Math.max(peak, forceMagnitude3D(force)), 0)
+  const forces = loadCases.flatMap(load => load.forces.map(force => ({ ...force, caseId: load.id, magnitude: forceMagnitude3D(force) }))
+    .filter(force => validForceMagnitude3D(force.magnitude)))
+  const max = forces.reduce((peak, force) => Math.max(peak, force.magnitude), 0)
   const span = Math.max(grid.widthMm, grid.heightMm, grid.depthMm)
   const size = Math.min(...cellSize(grid))
   const counts = new Map<number, number>(), next = new Map<number, number>()
   for (const { node } of forces) counts.set(node, (counts.get(node) ?? 0) + 1)
   return forces.map(force => {
     const direction = new Vector3(force.fx, force.fy, force.fz)
-    const length = arrowLength(span, direction.length(), max)
-    direction.normalize()
+    const length = arrowLength(span, force.magnitude, max)
+    direction.divideScalar(force.magnitude)
     const point = new Vector3(...nodePosition(grid, force.node))
     const order = next.get(force.node) ?? 0
     next.set(force.node, order + 1)
@@ -67,10 +68,10 @@ function layoutForces(problem: SimpProblem3D) {
   })
 }
 
-function addBoundaryOverlays(problem: SimpProblem3D, supportLayer: Group, forceLayer: Group, caseId: string, editing: boolean) {
+function addBoundaryOverlays(problem: SimpProblem3D, supportLayer: Group, forceLayer: Group, caseId: string, editing: boolean, clippingPlanes: Plane[]) {
   const { grid, supports } = problem
   const size = Math.min(...cellSize(grid))
-  const marker = new InstancedMesh(new BoxGeometry(), new MeshBasicMaterial({ color: '#54dac8' }), supports.length)
+  const marker = new InstancedMesh(new BoxGeometry(), new MeshBasicMaterial({ color: '#54dac8', clippingPlanes }), supports.length)
   const matrix = new Object3D()
   supports.forEach((support, i) => {
     matrix.position.fromArray(nodePosition(grid, support.node))
@@ -82,9 +83,9 @@ function addBoundaryOverlays(problem: SimpProblem3D, supportLayer: Group, forceL
   const forces = layoutForces(problem)
   if (!forces.length) return
   const shaft = new InstancedMesh(new CylinderGeometry(1, 1, 1, 6),
-    new MeshBasicMaterial({ toneMapped: false, depthTest: !editing, depthWrite: !editing }), forces.length)
+    new MeshBasicMaterial({ toneMapped: false, depthTest: !editing, depthWrite: !editing, clippingPlanes }), forces.length)
   const head = new InstancedMesh(new ConeGeometry(1, 1, 8),
-    new MeshBasicMaterial({ toneMapped: false, depthTest: !editing, depthWrite: !editing }), forces.length)
+    new MeshBasicMaterial({ toneMapped: false, depthTest: !editing, depthWrite: !editing, clippingPlanes }), forces.length)
   shaft.renderOrder = head.renderOrder = editing ? 2 : 0
   const y = new Vector3(0, 1, 0)
   forces.forEach(({ point, direction, length, caseId: id }, i) => {
@@ -107,8 +108,10 @@ function addBoundaryOverlays(problem: SimpProblem3D, supportLayer: Group, forceL
   forceLayer.add(shaft, head)
 }
 
-function arrowLength(span: number, magnitude: number, max: number) {
-  return span * (0.045 + 0.13 * Math.sqrt(magnitude / max))
+export function arrowLength(span: number, magnitude: number, max: number) {
+  if (!validForceMagnitude3D(magnitude)) return 0
+  const scale = validForceMagnitude3D(max) ? Math.max(magnitude, max) : magnitude
+  return span * (0.045 + 0.13 * Math.sqrt(magnitude / scale))
 }
 
 function setupScene(canvas: HTMLCanvasElement, grid: Grid3D) {
@@ -149,11 +152,11 @@ function setupScene(canvas: HTMLCanvasElement, grid: Grid3D) {
   marker.renderOrder = 3
   marker.visible = arrow.visible = false
   scene.add(model, supports, loads, marker, arrow)
-  const bounds = new Box3(new Vector3(), new Vector3(x, y, z))
   const camera = new PerspectiveCamera(37, 1, span * 0.01, span * 25)
   const render = () => renderer.render(scene, camera)
   const controls = createCamera3D(canvas, camera, center, span, render)
-  const planes = [new Plane(new Vector3(-1, 0, 0), x), new Plane(new Vector3(0, -1, 0), y),
+  const planes: Plane[] = []
+  const sectionPlanes = [new Plane(new Vector3(-1, 0, 0), x), new Plane(new Vector3(0, -1, 0), y),
     new Plane(new Vector3(0, 0, -1), z)]
   const resize = () => {
     const { clientWidth: w, clientHeight: h } = canvas
@@ -165,7 +168,7 @@ function setupScene(canvas: HTMLCanvasElement, grid: Grid3D) {
   controls.fit('iso')
   const observer = new ResizeObserver(resize)
   observer.observe(canvas)
-  return { model, supports, loads, controls, planes, render, camera, bounds, marker, arrow, dispose() {
+  return { model, supports, loads, controls, planes, sectionPlanes, render, camera, marker, arrow, dispose() {
     observer.disconnect()
     controls.dispose()
     disposeGroup(scene)
@@ -258,13 +261,6 @@ const editTools = [
   ['support', 'placeSupport3d', 'hint3dPlaceSupport'],
 ] as const
 
-/** Distance from a screen position to a projected force shaft or node. */
-function pixelDistance(point: Vector2, a: Vector2, b: Vector2) {
-  const line = b.clone().sub(a)
-  const along = line.lengthSq() ? MathUtils.clamp(point.clone().sub(a).dot(line) / line.lengthSq(), 0, 1) : 0
-  return point.distanceTo(a.clone().addScaledVector(line, along))
-}
-
 export function Viewport3D({ active, problem, density, mode, setMode, view, surface, frame, threshold, setThreshold, renderData, editor }: {
   active: boolean
   problem: SimpProblem3D
@@ -293,7 +289,8 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
   const femThreshold = mode === 'auto' ? Math.min(0.12, threshold) : threshold
   const femType = problem.elementType ?? 'hex8'
   const hasDensity = !!density
-  const { grid } = problem
+  const { grid, params, passive } = problem
+  const { voidMask } = useMemo(() => brickMasks3D({ grid, params, passive }), [grid, params, passive])
   const tool = editor.tool
   const limits = [grid.widthMm, grid.heightMm, grid.depthMm]
 
@@ -323,10 +320,10 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
 
   useEffect(() => {
     if (!scene.current) return
-    const { supports, loads, render } = scene.current
+    const { supports, loads, planes, render } = scene.current
     disposeGroup(supports)
     disposeGroup(loads)
-    addBoundaryOverlays(problem, supports, loads, editor.caseId, tool === 'load')
+    addBoundaryOverlays(problem, supports, loads, editor.caseId, tool === 'load', planes)
     render()
   }, [active, problem, editor.caseId, tool])
 
@@ -352,7 +349,7 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
     const geometry = hasDensity && fem?.request.grid === grid && fem.request.elementType === femType && fem.request.wireframe === wireframe
       ? fem.geometry : undefined
     const solid = view === 'voxels'
-      ? geometry && femMesh(geometry, wireframe, clipping)
+      ? geometry?.triangles.length && femMesh(geometry, wireframe, clipping)
       : surface?.triangles.length ? surfaceMesh(problem, surface, clipping, view === 'stress' ? frame : undefined, renderData) : undefined
     if (solid) {
       model.add(solid)
@@ -368,9 +365,14 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
     const current = scene.current
     if (!current) return
     const dimensions = [grid.widthMm, grid.heightMm, grid.depthMm]
-    // Move inactive planes outside the part. Offset active planes by a small
-    // amount to keep them off exact element faces and aligned wireframe.
-    current.planes.forEach((plane, i) => { plane.constant = dimensions[i] * (sections[i] === 1 ? 1.01 : sections[i] - 1e-6) })
+    current.planes.length = 0
+    current.sectionPlanes.forEach((plane, i) => {
+      if (sections[i] === 1) return
+      // Keep the cut off exact element faces and aligned wireframe.
+      plane.constant = dimensions[i] * (sections[i] - 1e-6)
+      current.planes.push(plane)
+    })
+    current.marker.visible = current.arrow.visible = false
     current.render()
   }, [active, grid, sections])
 
@@ -386,22 +388,29 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
     const current = scene.current
     const element = canvas.current
     if (!current || !element) return
-    const { camera, bounds, marker, arrow, controls, render } = current
+    const { camera, model, planes, loads, supports, marker, arrow, controls, render } = current
     controls.setEditing(tool !== 'orbit')
     if (tool === 'orbit') { render(); return }
     const ray = new Raycaster()
-    const location = new Vector3(), direction = new Vector3()
+    const direction = new Vector3()
     const span = Math.max(grid.widthMm, grid.heightMm, grid.depthMm)
     const magnitude = forceMagnitude3D(editor.force)
-    const forces = layoutForces(problem).filter(force => force.caseId === editor.caseId)
-    const max = problem.loadCases.reduce((peak, load) =>
-      load.forces.reduce((value, force) => Math.max(value, forceMagnitude3D(force)), peak), 0)
-    function snap(event: MouseEvent) {
+    const forces = layoutForces(problem)
+    const max = forces.reduce((peak, force) => Math.max(peak, force.magnitude), 0)
+    let fallback: ReturnType<typeof designDomainMesh3D> | undefined
+    function aim(event: MouseEvent) {
       const rect = element!.getBoundingClientRect()
       ray.setFromCamera(new Vector2(2 * (event.clientX - rect.left) / rect.width - 1,
         1 - 2 * (event.clientY - rect.top) / rect.height), camera)
-      const hit = ray.ray.intersectBox(bounds, location)
-      return hit ? snapNode3D(grid, hit.toArray()) : undefined
+      const forward = ray.ray.direction.dot(camera.getWorldDirection(direction))
+      ray.near = camera.near / forward
+      ray.far = camera.far / forward
+    }
+    function snap(event: MouseEvent) {
+      aim(event)
+      const pickable = model.children.length ? model : (fallback ??= designDomainMesh3D(grid, voidMask, sectioned))
+      const hit = firstVisibleMeshHit3D(ray, pickable, planes)
+      return hit && snapEditNode3D(grid, hit.point, voidMask, planes)
     }
     function clear() {
       marker.visible = arrow.visible = false
@@ -409,14 +418,15 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
     }
     function hover(event: PointerEvent) {
       if (event.buttons || event.shiftKey) { if (marker.visible) clear(); return }
-      const node = snap(event)
-      if (node === undefined) { if (marker.visible) clear(); return }
-      marker.position.fromArray(nodePosition(grid, node))
+      const snapped = snap(event)
+      if (!snapped) { if (marker.visible) clear(); return }
+      marker.position.copy(snapped.point)
+      marker.material.color.set(snapped.valid ? '#e9feff' : '#81909d')
       marker.visible = true
-      arrow.visible = tool === 'load' && magnitude > 0 && Number.isFinite(magnitude)
+      const length = arrowLength(span, magnitude, max)
+      arrow.visible = tool === 'load' && snapped.valid && length > 0
       if (arrow.visible) {
         direction.set(editor.force.fx, editor.force.fy, editor.force.fz).normalize()
-        const length = arrowLength(span, magnitude, Math.max(magnitude, max))
         arrow.position.copy(marker.position).addScaledVector(direction, -length)
         arrow.setDirection(direction)
         arrow.setLength(length, length * 0.24, length * 0.13)
@@ -425,33 +435,22 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
       render()
     }
     function place(event: MouseEvent) {
-      if (event.button !== 0 || event.shiftKey || event.ctrlKey) return
-      const node = snap(event)
-      if (node !== undefined) editor.place(node)
+      if (event.button !== 0 || event.shiftKey || event.ctrlKey || controls.claimedEditEvent(event)) return
+      const snapped = snap(event)
+      if (snapped?.valid) editor.place(snapped.node)
     }
     function remove(event: MouseEvent) {
       event.preventDefault()
-      const rect = element!.getBoundingClientRect()
-      const cursor = new Vector2(event.clientX - rect.left, event.clientY - rect.top)
-      const project = (point: Vector3) => {
-        const { x, y } = point.clone().project(camera)
-        return new Vector2((1 + x) * rect.width / 2, (1 - y) * rect.height / 2)
-      }
-      let best = 14, node: number | undefined
-      const candidates = tool === 'load'
-        ? forces.map(force => ({ node: force.node, point: force.point, tail: force.point.clone().addScaledVector(force.direction, -force.length) }))
-        : problem.supports.map(support => {
-          const point = new Vector3(...nodePosition(grid, support.node))
-          return { node: support.node, point, tail: point }
-        })
-      for (const candidate of candidates) {
-        const a = project(candidate.point)
-        const b = project(candidate.tail)
-        const nodePoint = project(new Vector3(...nodePosition(grid, candidate.node)))
-        const distance = Math.min(pixelDistance(cursor, a, b), cursor.distanceTo(nodePoint))
-        if (distance < best) { best = distance; node = candidate.node }
-      }
-      if (node !== undefined) editor.remove(node)
+      if (event.button !== 2 || controls.claimedEditEvent(event)) return
+      const overlay = tool === 'load' ? loads : supports
+      if (!overlay.visible) return
+      aim(event)
+      const occlusion = tool === 'support' ? firstVisibleMeshHit3D(ray, model, planes)?.distance : undefined
+      const hit = firstVisibleMeshHit3D(ray, overlay, planes, occlusion)
+      if (hit?.instanceId === undefined) return
+      const force = forces[hit.instanceId]
+      if (tool === 'support') editor.remove(problem.supports[hit.instanceId].node)
+      else if (force?.caseId === editor.caseId) editor.remove(force.node)
     }
     element.addEventListener('pointermove', hover)
     element.addEventListener('pointerleave', clear)
@@ -463,8 +462,10 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
       element.removeEventListener('click', place)
       element.removeEventListener('contextmenu', remove)
       marker.visible = arrow.visible = false
+      fallback?.geometry.dispose()
+      fallback?.material.dispose()
     }
-  }, [active, editor, grid, problem, tool])
+  }, [active, editor, grid, problem, sectioned, tool, voidMask])
 
   function orient(value: QuickView3D) { scene.current?.controls.fit(value) }
 
