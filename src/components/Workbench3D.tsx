@@ -5,8 +5,8 @@ import type { MaterialId } from '../solver/project'
 import { exportObj3D, exportStl3D, isWatertight } from '../solver3d/export3d'
 import { extractSurface3D, maxSmoothingPasses3D, type Surface3D } from '../solver3d/marchingCubes'
 import { defaultParams3D, makePreset3D, presetGrid3D, presets3D, resolutions3D, type Preset3D } from '../solver3d/presets3d'
-import { Simp3D } from '../solver3d/simp3d'
-import { ProblemError3D, cellSize, elementCount, maxCellAspectRatio3D, type Grid3D, type ProblemIssue3D, type SimpParams3D, type Symmetry3D } from '../solver3d/types3d'
+import { Simp3D, validateProblem3D } from '../solver3d/simp3d'
+import { ProblemError3D, cellSize, elementCount, maxCellAspectRatio3D, type ElementType3D, type Grid3D, type ProblemIssue3D, type SimpParams3D, type Symmetry3D } from '../solver3d/types3d'
 import type { TimedSnapshot3D, WorkerCommand3D, WorkerEvent3D } from '../workers/protocol3d'
 import { ConvergenceChart, type Sample } from './ConvergenceChart'
 import { download } from './ExportDialog'
@@ -38,8 +38,9 @@ function LabeledControl({ id, name, tip, children }: { id: string; name: string;
   </div>
 }
 
-function SurfaceDialog({ surface, settings, change, close }: {
+function ExportDialog3D({ surface, elementType, settings, change, close }: {
   surface: Surface3D | undefined
+  elementType: ElementType3D
   settings: SurfaceSettings
   change: (next: SurfaceSettings) => void
   close: () => void
@@ -65,7 +66,7 @@ function SurfaceDialog({ surface, settings, change, close }: {
   }
   return <dialog ref={dialog} className="export-dialog panel" onClose={close} aria-labelledby="export-title-3d">
     <form method="dialog" className="export-header">
-      <h2 id="export-title-3d">{t('exportTitle3d')}</h2>
+      <h2 id="export-title-3d">{t('exportTitle3d')} · {t(elementType === 'tet4' ? 'tet4Elements3d' : 'hex8Elements3d')}</h2>
       <Tooltip message="hint3dClose"><button className="tool-button" autoFocus>{t('close')}</button></Tooltip>
     </form>
     <div className="parameter-label">
@@ -94,6 +95,7 @@ function SurfaceDialog({ surface, settings, change, close }: {
 export default function Workbench3D({ active, header }: { active: boolean; header: (transport: ReactNode) => ReactNode }) {
   const { t, number, fixed, significant } = useTranslation()
   const [preset, setPreset] = useState<Preset3D>('cantilever3d')
+  const [elementType, setElementType] = useState<ElementType3D>('hex8')
   const [resolution, setResolution] = useState(0)
   const [size, setSize] = useState<Pick<Grid3D, Dimension>>({ widthMm: 120, heightMm: 60, depthMm: 40 })
   const [material, setMaterial] = useState<MaterialId>('steel')
@@ -107,23 +109,31 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
   const [settings, setSettings] = useState<SurfaceSettings>({ threshold: 0.5, smoothing: 4 })
   const worker = useRef<Worker | null>(null)
   const grid = useMemo(() => ({ ...presetGrid3D(resolutions3D[resolution]), ...size }), [resolution, size])
-  const problem = useMemo(() => makePreset3D(preset, grid, params, materials[material]), [preset, grid, params, material])
+  const problem = useMemo(() => makePreset3D(preset, grid, params, materials[material], elementType), [preset, grid, params, material, elementType])
   const preview = useMemo(() => {
     try {
+      // With no prescribed solids the exact starting field is constant on the allowed elements.
+      if (!problem.passive?.solid?.some(Boolean)) {
+        const setup = validateProblem3D(problem)
+        const value = params.volFrac * elementCount(grid) / setup.allowed
+        return { density: Float64Array.from(setup.voidMask, mask => mask ? 0 : value), passive: setup.brickMasks }
+      }
       const solver = new Simp3D(problem)
       return { density: solver.initialDensity(), passive: solver.passiveMasks }
     } catch (cause) {
-      return { density: Float64Array.from({ length: elementCount(problem.grid) }, (_, e) =>
-        problem.passive?.void?.[e] ? 0 : problem.passive?.solid?.[e] ? 1 : problem.params.volFrac),
+      return { density: Float64Array.from({ length: elementCount(grid, elementType) }, (_, e) => {
+        const brick = elementType === 'tet4' ? Math.floor(e / 5) : e
+        return problem.passive?.void?.[brick] ? 0 : problem.passive?.solid?.[brick] ? 1 : params.volFrac
+      }),
       passive: problem.passive, issue: cause instanceof ProblemError3D ? cause.code : 'workerError' as const }
     }
-  }, [problem])
+  }, [problem, grid, params, elementType])
   const density = frame?.density ?? preview.density
   const view = mode === 'auto' ? frame && (state === 'paused' || state === 'complete') ? 'cad' : 'voxels' : mode
   const buildSurface = active && (view !== 'voxels' || exportOpen)
   const surface = useMemo(() => buildSurface
-    ? extractSurface3D(density, problem.grid, settings.threshold, settings.smoothing, preview.passive)
-    : undefined, [density, problem.grid, settings, buildSurface, preview.passive])
+    ? extractSurface3D(density, problem.grid, settings.threshold, settings.smoothing, preview.passive, elementType)
+    : undefined, [density, problem.grid, settings, buildSurface, preview.passive, elementType])
 
   useEffect(() => () => {
     worker.current?.terminate()
@@ -208,6 +218,7 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
   const issueText = issue && t(issue).replace('{limit}', number(maxCellAspectRatio3D))
   const filterRadiusMm = params.rmin * Math.min(...cellSize(grid))
   const metrics = [
+    ['elementCount3d', 'hint3dElementCount', number(elementCount(grid, elementType)), ''],
     ['iteration', 'tipIteration', number(frame?.iteration), ''],
     ['compliance', 'tipCompliance', significant(frame?.compliance), `${t('N')}·${t('mm')}`],
     ['volume', 'tipVolume', fixed(frame && frame.volFrac * 100, 1), '%'],
@@ -234,6 +245,12 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
             </select>
           </LabeledControl>
           <p className="hint">{t(`${preset}Detail`)}</p>
+          <LabeledControl id="element-type-3d" name={t('elementType3d')} tip="hint3dElementType">
+            <select id="element-type-3d" value={elementType} onChange={event => { reset(); setElementType(event.target.value as ElementType3D) }}>
+              <option value="hex8">{t('hex8Elements3d')}</option>
+              <option value="tet4">{t('tet4Elements3d')}</option>
+            </select>
+          </LabeledControl>
           <LabeledControl id="resolution-3d" name={t('resolution')} tip="hint3dResolution">
             <select id="resolution-3d" value={resolution} onChange={event => { reset(); setResolution(Number(event.target.value)) }}>
               {resolutions3D.map((value, i) => <option key={i} value={i}>{value.join(' × ')}</option>)}
@@ -301,8 +318,9 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
         {issueText && <p className="error" role="alert">{issueText}{error?.relativeResidual !== undefined &&
           ` ${t('solveResidual3d').replace('{residual}', significant(error.relativeResidual))}`} {error && t('resetError')}</p>}
         <Viewport3D active={active} problem={problem} density={density} mode={mode} setMode={setMode}
-          view={mode === 'auto' && !surface?.triangles.length ? 'voxels' : view} surface={surface} frame={frame} />
-        {exportOpen && <SurfaceDialog surface={surface} settings={settings} change={setSettings} close={() => setExportOpen(false)} />}
+          view={mode === 'auto' && !surface?.triangles.length ? 'voxels' : view} surface={surface} frame={frame}
+          threshold={settings.threshold} setThreshold={threshold => setSettings(current => ({ ...current, threshold }))} />
+        {exportOpen && <ExportDialog3D surface={surface} elementType={elementType} settings={settings} change={setSettings} close={() => setExportOpen(false)} />}
         <section className="panel telemetry" aria-label={t('telemetry')}>
           <dl>{metrics.map(([label, tip, value, unit]) => (
             <div key={label}><dt><Tooltip message={tip} info={t(label)}>{t(label)}</Tooltip></dt><dd>{value}{unit && <span>{unit}</span>}</dd></div>

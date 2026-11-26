@@ -1,5 +1,7 @@
 import { h8Corners } from './elementH8'
-import { cellSize, elementCount, elementIndex, type Grid3D } from './types3d'
+import { tetCorners } from './elementT4'
+import { nodalField3D } from './mesh3d'
+import { cellSize, elementCount, elementIndex, nodeIndex3D, type ElementType3D, type Grid3D } from './types3d'
 import type { PassiveMasks } from '../solver/types'
 
 export interface Surface3D {
@@ -145,6 +147,104 @@ export function marchingCubes(density: ArrayLike<number>, grid: Grid3D, threshol
     ...(prescribed && { pinned: Uint8Array.from(pinned) }) }
 }
 
+// Build the cut polygon of each sign case on a positively oriented reference tet.
+const tetIsoCases = Array.from({ length: 16 }, (_, mask) => {
+  const inside = [0, 1, 2, 3].filter(i => mask & (1 << i))
+  const outside = [0, 1, 2, 3].filter(i => !(mask & (1 << i)))
+  if (!inside.length || !outside.length) return []
+  const polygon = inside.length === 1 ? outside.map(j => [inside[0], j])
+    : outside.length === 1 ? inside.map(i => [i, outside[0]])
+      : [[inside[0], outside[0]], [inside[0], outside[1]], [inside[1], outside[1]], [inside[1], outside[0]]]
+  const points = [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]]
+  const cuts = polygon.flatMap(([i, j]) => points[i].map((v, axis) => (v + points[j][axis]) / 2))
+  const normal = triangleNormal(cuts, 0, 1, 2)
+  if (normal.reduce((sum, v, axis) => sum + v * (points[outside[0]][axis] - points[inside[0]][axis]), 0) < 0) {
+    polygon.reverse()
+  }
+  return polygon
+})
+
+/** March a continuous nodal field on the same parity subdivision used by Tet4 FEA.
+ * Pad with exterior nodes so solids reaching the domain boundary still close. */
+export function marchingTetrahedra(density: ArrayLike<number>, grid: Grid3D, threshold = 0.5, passive?: PassiveMasks): Surface3D {
+  if (density.length !== elementCount(grid, 'tet4') || !(threshold > 0 && threshold < 1)) {
+    throw new RangeError('Invalid Tet4 isosurface input')
+  }
+  for (let e = 0; e < density.length; e++) if (!Number.isFinite(density[e])) throw new RangeError('Non-finite density')
+  const nodal = nodalField3D(grid, 'tet4', density)
+  const { nelx, nely, nelz, widthMm, heightMm, depthMm } = grid
+  const nx = nelx + 3, ny = nely + 3, nz = nelz + 3, area = nx * ny
+  const field = new Float64Array(area * nz).fill(-threshold)
+  const ghost = new Uint8Array(field.length).fill(1)
+  const prescribed = passive && new Uint8Array(field.length)
+  const index = (x: number, y: number, z: number) => (z * ny + y) * nx + x
+  for (let z = 0; z <= nelz; z++) for (let y = 0; y <= nely; y++) for (let x = 0; x <= nelx; x++) {
+    const i = index(x + 1, y + 1, z + 1)
+    ghost[i] = 0
+    const value = nodal[nodeIndex3D(grid, x, y, z)] - threshold
+    field[i] = (value < 0 ? -1 : 1) * Math.max(Math.abs(value), 1e-5)
+  }
+  if (prescribed) for (let z = 0; z < nelz; z++) for (let y = 0; y < nely; y++) for (let x = 0; x < nelx; x++) {
+    const e = elementIndex(grid, x, y, z)
+    if (passive?.solid?.[e] || passive?.void?.[e]) {
+      for (const [dx, dy, dz] of h8Corners) prescribed[index(x + dx + 1, y + dy + 1, z + dz + 1)] = 1
+    }
+  }
+  const dimensions = [widthMm, heightMm, depthMm]
+  // Keep paired ghost/inner samples on either side of the precise mounting plane.
+  const coordinates = [nelx, nely, nelz].map((n, axis) => Float64Array.from({ length: n + 3 }, (_, i) => {
+    const h = dimensions[axis] / n
+    if (i <= 1) return (i ? 0.25 : -0.25) * h
+    if (i >= n + 1) return dimensions[axis] + (i === n + 1 ? -0.25 : 0.25) * h
+    return (i - 1) * h
+  }))
+  const cache = new Map<number, number>()
+  const vertices: number[] = [], triangles: number[] = [], pins: number[] = []
+  const ids = new Int32Array(8), cuts = new Uint32Array(4)
+  for (let z = 0; z < nz - 1; z++) for (let y = 0; y < ny - 1; y++) for (let x = 0; x < nx - 1; x++) {
+    let cubeMask = 0
+    for (let i = 0; i < 8; i++) {
+      const [dx, dy, dz] = h8Corners[i]
+      ids[i] = index(x + dx, y + dy, z + dz)
+      if (field[ids[i]] > 0) cubeMask |= 1 << i
+    }
+    if (!cubeMask || cubeMask === 255) continue
+    // Subtract the ghost cell from each axis to match the FEM parity.
+    for (const tet of tetCorners[(x + y + z + 1) & 1]) {
+      let mask = 0
+      for (let i = 0; i < 4; i++) if (cubeMask & (1 << tet[i])) mask |= 1 << i
+      const polygon = tetIsoCases[mask]
+      if (!polygon.length) continue
+      for (let i = 0; i < polygon.length; i++) {
+        const [j, k] = polygon[i]
+        const a = ids[tet[j]], b = ids[tet[k]]
+        const key = Math.min(a, b) * field.length + Math.max(a, b)
+        let v = cache.get(key)
+        if (v === undefined) {
+          const t = ghost[a] || ghost[b] ? 0.5 : field[a] / (field[a] - field[b])
+          const p = h8Corners[tet[j]], q = h8Corners[tet[k]]
+          const cell = [x, y, z]
+          v = vertices.length / 3
+          for (let axis = 0; axis < 3; axis++) {
+            const [start, end] = [cell[axis] + p[axis], cell[axis] + q[axis]]
+            const last = coordinates[axis].length - 1
+            const lo = Math.min(start, end), hi = Math.max(start, end)
+            const u = coordinates[axis][start], w = coordinates[axis][end]
+            vertices.push(lo === 0 && hi === 1 ? 0 : lo === last - 1 && hi === last ? dimensions[axis] : u + t * (w - u))
+          }
+          if (prescribed) pins[v] = prescribed[a] || prescribed[b]
+          cache.set(key, v)
+        }
+        cuts[i] = v
+      }
+      triangles.push(cuts[0], cuts[1], cuts[2])
+      if (polygon.length === 4) triangles.push(cuts[0], cuts[2], cuts[3])
+    }
+  }
+  return { vertices: Float64Array.from(vertices), triangles: Uint32Array.from(triangles),
+    ...(prescribed && { pinned: Uint8Array.from(pins) }) }
+}
+
 export function triangleNormal(vertices: ArrayLike<number>, a: number, b: number, c: number): [number, number, number] {
   a *= 3; b *= 3; c *= 3
   const ux = vertices[b] - vertices[a], uy = vertices[b + 1] - vertices[a + 1], uz = vertices[b + 2] - vertices[a + 2]
@@ -220,8 +320,10 @@ export function taubinSmooth(mesh: Surface3D, grid: Grid3D, passes: number, lamb
   return { ...mesh, vertices }
 }
 
-export function extractSurface3D(density: ArrayLike<number>, grid: Grid3D, threshold = 0.5, passes = 4, passive?: PassiveMasks) {
-  return taubinSmooth(marchingCubes(density, grid, threshold, passive), grid, passes)
+export function extractSurface3D(density: ArrayLike<number>, grid: Grid3D, threshold = 0.5, passes = 4, passive?: PassiveMasks,
+  elementType: ElementType3D = 'hex8') {
+  const march = elementType === 'tet4' ? marchingTetrahedra : marchingCubes
+  return taubinSmooth(march(density, grid, threshold, passive), grid, passes)
 }
 
 export function vertexNormals({ vertices, triangles }: Surface3D) {

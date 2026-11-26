@@ -1,4 +1,5 @@
 import { elasticity3D, h8Corners, h8Stiffness, strainDisplacementH8, vonMises3D } from './elementH8'
+import { tet4Templates, tetCorners, tetVolumeFraction } from './elementT4'
 import { DensityFilter3D, projectDensity3D } from './filter3d'
 import { fixedDofs3D, Pcg3D } from './pcg3d'
 import {
@@ -8,7 +9,11 @@ import {
 
 const positive = (value: number) => Number.isFinite(value) && value > 0
 const clamp = (x: number, low: number, high: number) => Math.min(high, Math.max(low, x))
-const sum = (values: Float64Array) => values.reduce((total, value) => total + value, 0)
+function dot(a: Float64Array, b: Float64Array) {
+  let value = 0
+  for (let i = 0; i < a.length; i++) value += a[i] * b[i]
+  return value
+}
 
 function rigidRank(grid: Grid3D, fixed: Uint8Array) {
   const scale = Math.max(grid.widthMm, grid.heightMm, grid.depthMm)
@@ -31,10 +36,10 @@ function rigidRank(grid: Grid3D, fixed: Uint8Array) {
 }
 
 export function validateProblem3D(problem: SimpProblem3D) {
-  const { grid, params, material, passive, supports, loadCases } = problem
+  const { grid, params, material, passive, supports, loadCases, elementType = 'hex8' } = problem
   const { nelx, nely, nelz } = grid
   const count = elementCount(grid)
-  if (![nelx, nely, nelz, params.maxIter].every(value => Number.isSafeInteger(value) && value > 0)
+  if ((elementType !== 'hex8' && elementType !== 'tet4') || ![nelx, nely, nelz, params.maxIter].every(value => Number.isSafeInteger(value) && value > 0)
     || ![grid.widthMm, grid.heightMm, grid.depthMm, material.E0, material.Emin, material.yieldMPa,
       material.densityKgM3, params.rmin, params.volFrac, params.moveLimit].every(positive)
     || !(material.nu > -1 && material.nu < 0.5) || material.Emin > material.E0
@@ -96,13 +101,35 @@ export function validateProblem3D(problem: SimpProblem3D) {
     return rhs
   })
   if (!forces.some(rhs => rhs.some(value => value !== 0))) throw new ProblemError3D('load3dError')
-  return { solid, voidMask, fixed, forces, representatives, allowed }
+  if (elementType === 'hex8') return { solid, voidMask, fixed, forces, representatives, allowed, brickMasks: { solid, void: voidMask } }
+
+  const tetSolid = new Uint8Array(5 * count), tetVoid = new Uint8Array(5 * count)
+  const tetRepresentatives = new Int32Array(5 * count)
+  // Across an odd number of cells the mirrored brick has the opposite subdivision
+  // from the reflected one. Its overlapping tetrahedra must share a single value.
+  const tieBrick = (mirrorY && nely % 2 === 1) || (mirrorZ && nelz % 2 === 1)
+  for (let z = 0, brick = 0; z < nelz; z++) for (let y = 0; y < nely; y++) for (let x = 0; x < nelx; x++, brick++) {
+    const ry = mirrorY ? Math.min(y, nely - 1 - y) : y, rz = mirrorZ ? Math.min(z, nelz - 1 - z) : z
+    const reflection = (y === ry ? 0 : 2) | (z === rz ? 0 : 4)
+    const side = tetCorners[(x + y + z) & 1]
+    const reflectedSide = tetCorners[(x + ry + rz) & 1]
+    for (let t = 0; t < 5; t++) {
+      const e = 5 * brick + t
+      const corner = t && !tieBrick ? side[t][0] ^ reflection : -1
+      const mirrored = corner < 0 ? 0 : reflectedSide.findIndex((nodes, i) => i > 0 && nodes[0] === corner)
+      tetRepresentatives[e] = 5 * representatives[brick] + mirrored
+      tetSolid[e] = solid[brick]
+      tetVoid[e] = voidMask[brick]
+    }
+  }
+  return { solid: tetSolid, voidMask: tetVoid, fixed, forces, representatives: tetRepresentatives, allowed,
+    brickMasks: { solid, void: voidMask } }
 }
 
 /** Same-grid engineering analysis. The PCG work vectors and displacements remain warm between calls. */
 export class Analysis3D {
   private readonly pcg: Pcg3D
-  private readonly B: Float64Array
+  private readonly B: readonly Float64Array[]
   private readonly D: Float64Array
   private readonly stress = new Float64Array(6)
   private readonly strain = new Float64Array(6)
@@ -114,8 +141,12 @@ export class Analysis3D {
 
   constructor(readonly problem: SimpProblem3D, fixed: Uint8Array, readonly forces: Float64Array[]) {
     const size = cellSize(problem.grid)
-    this.pcg = new Pcg3D(problem.grid, h8Stiffness(1, problem.material.nu, ...size), fixed)
-    this.B = strainDisplacementH8(...size)
+    const { elementType = 'hex8' } = problem
+    const { nu } = problem.material
+    const templates = elementType === 'tet4' ? tet4Templates(1, nu, ...size)
+      : [{ Ke: h8Stiffness(1, nu, ...size), B: strainDisplacementH8(...size) }]
+    this.pcg = new Pcg3D(problem.grid, templates[0].Ke, fixed, { nu, elementType, matrices: templates.map(t => t.Ke) })
+    this.B = templates.map(t => t.B)
     this.D = elasticity3D(1, problem.material.nu)
     this.displacements = forces.map(force => new Float64Array(force.length))
     this.loadedNodes = new Uint8Array(fixed.length / 3)
@@ -123,18 +154,19 @@ export class Analysis3D {
       if (force[d] || force[d + 1] || force[d + 2]) this.loadedNodes[d / 3] = 1
     }
     this.displacementNodes = this.loadedNodes.slice()
-    this.vonMises = new Float64Array(elementCount(problem.grid))
+    this.vonMises = new Float64Array(this.pcg.modulus.length)
     this.gradient = new Float64Array(this.vonMises.length)
   }
 
   solve(density: Float64Array, penal: number, tolerance: number) {
     const { pcg, B, D, stress, strain, vonMises, gradient, displacementNodes } = this
     const { E0, Emin } = this.problem.material
+    const { width, matrices, templateIndex, dofs } = pcg.stiffness
     pcg.prepare(density, E0, Emin, penal)
     displacementNodes.set(this.loadedNodes)
-    for (let e = 0, offset = 0; e < density.length; e++, offset += 24) {
+    for (let e = 0, offset = 0; e < density.length; e++, offset += width) {
       if (density[e] < 0.25) continue
-      for (let j = 0; j < 24; j += 3) displacementNodes[pcg.dofs[offset + j] / 3] = 1
+      for (let j = 0; j < width; j += 3) displacementNodes[dofs[offset + j] / 3] = 1
     }
     let compliance = 0, maxDeflection = 0
     gradient.fill(0)
@@ -147,15 +179,16 @@ export class Analysis3D {
         compliance += force[d] * u[d] + force[d + 1] * u[d + 1] + force[d + 2] * u[d + 2]
         if (displacementNodes[d / 3]) maxDeflection = Math.max(maxDeflection, Math.hypot(u[d], u[d + 1], u[d + 2]))
       }
-      for (let e = 0, offset = 0; e < density.length; e++, offset += 24) {
+      for (let e = 0, offset = 0; e < density.length; e++, offset += width) {
+        const template = templateIndex[e], Ke = matrices[template], Be = B[template]
         let energy = 0
         strain.fill(0)
-        for (let j = 0; j < 24; j++) {
-          const q = u[pcg.dofs[offset + j]]
+        for (let j = 0; j < width; j++) {
+          const q = u[dofs[offset + j]]
           let Ku = 0
-          for (let k = 0; k < 24; k++) Ku += pcg.Ke[j * 24 + k] * u[pcg.dofs[offset + k]]
+          for (let k = 0; k < width; k++) Ku += Ke[j * width + k] * u[dofs[offset + k]]
           energy += q * Ku
-          for (let k = 0; k < 6; k++) strain[k] += B[k * 24 + j] * q
+          for (let k = 0; k < 6; k++) strain[k] += Be[k * width + j] * q
         }
         gradient[e] -= penal * (E0 - Emin) * density[e] ** (penal - 1) * Math.max(0, energy)
         for (let j = 0; j < 6; j++) {
@@ -184,14 +217,20 @@ export class Simp3D {
   private readonly derivative: Float64Array
   private readonly dc: Float64Array
   private readonly dv: Float64Array
+  private readonly volumes: Float64Array
+  private readonly volumeWeights: Float64Array
+  private readonly totalVolume: number
+  private readonly orbitVolume?: Float64Array
+  private readonly orbitValues?: Float64Array
   private beta: number
   private iteration = 0
 
   constructor(readonly problem: SimpProblem3D) {
     const { grid, params } = problem
-    const count = elementCount(grid)
+    const { elementType = 'hex8' } = problem
+    const count = elementCount(grid, elementType)
     this.setup = validateProblem3D(problem)
-    this.filter = new DensityFilter3D(grid, params.rmin, this.setup.voidMask)
+    this.filter = new DensityFilter3D(grid, params.rmin, this.setup.voidMask, elementType)
     this.design = new Float64Array(count)
     this.candidate = new Float64Array(count)
     this.physical = new Float64Array(count)
@@ -199,30 +238,60 @@ export class Simp3D {
     this.derivative = new Float64Array(count)
     this.dc = new Float64Array(count)
     this.dv = new Float64Array(count)
+    this.totalVolume = elementCount(grid)
+    this.volumes = Float64Array.from({ length: count }, (_, i) => elementType === 'tet4' ? tetVolumeFraction(i % 5) : 1)
+    this.volumeWeights = new Float64Array(count)
+    for (let e = 0; e < count; e++) {
+      this.scratch[e] = this.setup.solid[e] || this.setup.voidMask[e] ? 0 : this.volumes[e]
+    }
+    this.filter.transpose(this.scratch, this.volumeWeights)
+    const { representatives } = this.setup
+    if (representatives.some((rep, e) => rep !== e)) {
+      this.orbitVolume = new Float64Array(count)
+      this.orbitValues = new Float64Array(count)
+      for (let e = 0; e < count; e++) this.orbitVolume[representatives[e]] += this.volumes[e]
+    }
     this.beta = params.heaviside ? 1 : 0
-    this.matchVolume()
+    if (this.setup.solid.some(Boolean)) this.matchVolume()
+    else {
+      const physical = params.volFrac * this.totalVolume / this.setup.allowed
+      const value = this.beta ? 0.5 + Math.atanh((2 * physical - 1) * Math.tanh(this.beta / 2)) / this.beta : physical
+      for (let e = 0; e < count; e++) this.design[e] = this.setup.voidMask[e] ? 0 : value
+    }
   }
 
   private density(input: Float64Array, output: Float64Array) {
     this.filter.apply(input, output)
+    const { orbitVolume, orbitValues, volumes } = this
+    if (orbitVolume && orbitValues) {
+      const { representatives } = this.setup
+      orbitValues.fill(0)
+      for (let e = 0; e < output.length; e++) orbitValues[representatives[e]] += output[e] * volumes[e]
+      for (let e = 0; e < output.length; e++) {
+        const rep = representatives[e]
+        output[e] = orbitValues[rep] / orbitVolume[rep]
+      }
+    }
     projectDensity3D(output, this.derivative, this.beta, this.setup.solid, this.setup.voidMask)
-    return sum(output)
+    return dot(output, volumes)
   }
 
   private matchVolume() {
     const { solid, voidMask } = this.setup
-    const target = this.problem.params.volFrac * this.design.length
+    const target = this.problem.params.volFrac * this.totalVolume
     // Prescribed solid cells also contribute to their free neighbors through H.
     this.candidate.set(solid)
     const minimum = this.density(this.candidate, this.scratch)
-    if (target < minimum - 1e-9) throw new ProblemError3D('volume3dError')
+    const linearOffset = this.beta ? 0 : minimum - dot(this.candidate, this.volumeWeights)
+    if (target < minimum - 1e-10 * this.totalVolume) throw new ProblemError3D('volume3dError')
     let low = -1, high = 1
     for (let i = 0; i < 40; i++) {
       const shift = (low + high) * 0.5
       for (let e = 0; e < this.design.length; e++) {
         this.candidate[e] = solid[e] ? 1 : voidMask[e] ? 0 : clamp(this.design[e] + shift, 0, 1)
       }
-      if (this.density(this.candidate, this.scratch) > target) high = shift
+      const volume = this.beta ? this.density(this.candidate, this.scratch) : linearOffset + dot(this.candidate, this.volumeWeights)
+      if (volume > target) high = shift
       else low = shift
     }
     this.design.set(this.candidate)
@@ -234,22 +303,41 @@ export class Simp3D {
   }
 
   get passiveMasks() {
-    return { solid: this.setup.solid, void: this.setup.voidMask }
+    return this.setup.brickMasks
   }
 
-  private update(gradient: Float64Array) {
-    const { representatives, solid, voidMask } = this.setup
-    const { moveLimit, volFrac } = this.problem.params
+  private transposeDensity(input: Float64Array, output: Float64Array) {
+    const { orbitVolume, orbitValues, volumes } = this
+    if (orbitVolume && orbitValues) {
+      const { representatives } = this.setup
+      orbitValues.fill(0)
+      for (let e = 0; e < input.length; e++) orbitValues[representatives[e]] += input[e]
+      for (let e = 0; e < input.length; e++) {
+        const rep = representatives[e]
+        input[e] = volumes[e] * orbitValues[rep] / orbitVolume[rep]
+      }
+    }
+    this.filter.transpose(input, output)
+  }
+
+  private sensitivities(gradient: Float64Array) {
+    const { representatives } = this.setup
     for (let e = 0; e < gradient.length; e++) this.scratch[e] = gradient[e] * this.derivative[e]
-    this.filter.transpose(this.scratch, this.dc)
-    this.filter.transpose(this.derivative, this.dv)
+    this.transposeDensity(this.scratch, this.dc)
+    for (let e = 0; e < gradient.length; e++) this.scratch[e] = this.volumes[e] * this.derivative[e]
+    this.transposeDensity(this.scratch, this.dv)
     for (let e = 0; e < representatives.length; e++) {
       const rep = representatives[e]
       if (rep === e) continue
       this.dc[rep] += this.dc[e]
       this.dv[rep] += this.dv[e]
     }
+  }
 
+  private update(gradient: Float64Array) {
+    this.sensitivities(gradient)
+    const { representatives, solid, voidMask } = this.setup
+    const { moveLimit, volFrac } = this.problem.params
     // Normalize the gradient ratio before bisection so the update is load-scale invariant.
     let scale = 0
     for (let e = 0; e < this.dc.length; e++) {
@@ -260,7 +348,8 @@ export class Simp3D {
     for (let e = 0; e < this.dc.length; e++) {
       if (representatives[e] === e) this.dc[e] = this.dv[e] > 0 ? (-this.dc[e] / this.dv[e]) / scale : 0
     }
-    const target = volFrac * this.design.length
+    const target = volFrac * this.totalVolume
+    const linearOffset = this.beta ? 0 : dot(this.physical, this.volumes) - dot(this.design, this.volumeWeights)
     let low = 0, high = 1e5
     for (let i = 0; i < 64; i++) {
       const multiplier = (low + high) * 0.5
@@ -274,8 +363,9 @@ export class Simp3D {
         this.candidate[e] = clamp(Math.max(x, 1e-9) * Math.sqrt(ratio / multiplier),
           Math.max(0, x - moveLimit), Math.min(1, x + moveLimit))
       }
-      const error = this.density(this.candidate, this.scratch) - target
-      if (Math.abs(error) <= this.design.length * 1e-8) break
+      const volume = this.beta ? this.density(this.candidate, this.scratch) : linearOffset + dot(this.candidate, this.volumeWeights)
+      const error = volume - target
+      if (Math.abs(error) <= this.totalVolume * 1e-8) break
       if (error > 0) low = multiplier
       else high = multiplier
     }
@@ -312,7 +402,7 @@ export class Simp3D {
     const change = this.update(analysis.gradient)
     const done = this.iteration >= params.maxIter || (change <= params.changeTol && (!params.heaviside || this.beta === 8))
     return { iteration: this.iteration, density: this.physical.slice(), vonMises: vonMises.slice(),
-      displacements: displacements.map(u => u.slice()), compliance, volFrac: volume / vonMises.length, change,
+      displacements: displacements.map(u => u.slice()), compliance, volFrac: volume / this.totalVolume, change,
       maxVonMises, p95VonMises, metrics: { mass, initialMass, saved: 100 * (1 - mass / initialMass), maxDeflection,
         safetyFactor: maxVonMises > 0 ? material.yieldMPa / maxVonMises : undefined,
         p95SafetyFactor: p95VonMises > 0 ? material.yieldMPa / p95VonMises : undefined },

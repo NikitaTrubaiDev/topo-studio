@@ -9,6 +9,8 @@ export interface Grid3D {
   depthMm: number
 }
 
+export type ElementType3D = 'hex8' | 'tet4'
+
 export type Symmetry3D = 'none' | 'z' | 'y' | 'yz'
 
 export interface SimpParams3D {
@@ -47,11 +49,13 @@ export interface LoadCase3D {
 }
 
 export interface SimpProblem3D {
+  elementType?: ElementType3D
   grid: Grid3D
   material: Material
   params: SimpParams3D
   supports: readonly Support3D[]
   loadCases: readonly LoadCase3D[]
+  /** One mask entry per brick. In Tet4 mode all five tetrahedra inherit it. */
   passive?: PassiveMasks
 }
 
@@ -90,8 +94,8 @@ export class ProblemError3D extends Error {
   }
 }
 
-export function elementCount(grid: Grid3D) {
-  return grid.nelx * grid.nely * grid.nelz
+export function elementCount(grid: Grid3D, elementType: ElementType3D = 'hex8') {
+  return grid.nelx * grid.nely * grid.nelz * (elementType === 'tet4' ? 5 : 1)
 }
 
 export function nodeCount(grid: Grid3D) {

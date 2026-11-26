@@ -62,7 +62,7 @@ export function Tooltip({ message, children, info }: {
   }, [portal, description])
 
   const content = !info && isValidElement<{ 'aria-describedby'?: string }>(children) && open
-    ? cloneElement(children, { 'aria-describedby': id }) : children
+    ? cloneElement(children, { 'aria-describedby': [children.props['aria-describedby'], id].filter(Boolean).join(' ') }) : children
   return <span ref={trigger} className="tooltip-trigger"
     onPointerEnter={event => { if (event.pointerType !== 'touch') schedule(true, 700) }}
     onPointerLeave={() => schedule(false, 120)}

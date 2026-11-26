@@ -110,3 +110,26 @@ it('renders finite clamped colors with non-finite stress, density, or scale inpu
   mesh.geometry.dispose()
   mesh.material.dispose()
 })
+
+it.each(languages)('shows both element modes, the high resolution, and mesh controls in %s', language => {
+  act(() => root.render(<LanguageContext.Provider value={language}>
+    <Workbench3D active={false} header={transport => transport} />
+  </LanguageContext.Provider>))
+  const dictionary = dictionaries[language]
+  const type = mount.querySelector<HTMLSelectElement>('#element-type-3d')!
+  const resolution = mount.querySelector<HTMLSelectElement>('#resolution-3d')!
+  expect(Array.from(type.options, option => option.textContent)).toEqual([dictionary.hex8Elements3d, dictionary.tet4Elements3d])
+  expect(Array.from(resolution.options, option => option.textContent)).toContain('64 × 32 × 20')
+  choose(resolution, '3')
+  const count = () => mount.querySelector('.telemetry dd')?.textContent?.replace(/[^\d]/g, '')
+  expect(count()).toBe('40960')
+  choose(type, 'tet4')
+  expect(count()).toBe('204800')
+  const labels = Array.from(mount.querySelectorAll('label, button'), element => element.textContent)
+  expect(labels).toContain(dictionary.meshWireframe3d)
+  expect(labels).toContain(dictionary.femMesh3d)
+  for (const key of ['hint3dElementType', 'hint3dMeshWireframe', 'hint3dMeshThreshold', 'hint3dFemMesh', 'hint3dElementCount'] as const) {
+    expect(dictionary[key].length).toBeGreaterThan(20)
+    if (language !== 'en') expect(dictionary[key]).not.toBe(dictionaries.en[key])
+  }
+})

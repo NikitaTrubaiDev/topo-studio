@@ -5,7 +5,8 @@ import {
   MathUtils, Mesh, MeshBasicMaterial, MeshStandardMaterial, Object3D, PerspectiveCamera, Plane, Scene, Vector3, WebGLRenderer,
 } from 'three'
 import { useTranslation } from '../i18n'
-import { cellSize, nodePosition, type Grid3D, type SimpProblem3D } from '../solver3d/types3d'
+import { elementSurface3D, nodalField3D } from '../solver3d/mesh3d'
+import { cellSize, nodeIndex3D, nodePosition, type Grid3D, type SimpProblem3D } from '../solver3d/types3d'
 import type { Surface3D } from '../solver3d/marchingCubes'
 import { createCamera3D, isFitShortcut, type CameraMode3D, type QuickView3D } from './camera3d'
 import { Tooltip } from './Tooltip'
@@ -17,7 +18,7 @@ const views = [
 ] as const
 const choices = [
   ['auto', 'auto3d', 'hint3dAuto'], ['cad', 'smoothCad3d', 'hint3dCAD'],
-  ['stress', 'stress', 'hint3dStress'], ['voxels', 'voxels3d', 'hint3dVoxels'],
+  ['stress', 'stress', 'hint3dStress'], ['voxels', 'femMesh3d', 'hint3dFemMesh'],
 ] as const
 export type ViewMode3D = typeof choices[number][0]
 
@@ -124,27 +125,24 @@ function setupScene(canvas: HTMLCanvasElement, grid: Grid3D) {
   } }
 }
 
-function voxelMesh(problem: SimpProblem3D, density: Float64Array, planes: Plane[]) {
-  const { grid } = problem
-  const { nelx, nely } = grid
-  const [hx, hy, hz] = cellSize(grid)
-  const mesh = new InstancedMesh(new BoxGeometry(hx, hy, hz), new MeshStandardMaterial({
-    metalness: 0.28, roughness: 0.56, clippingPlanes: planes,
-  }), density.length)
-  const transform = new Object3D()
-  const low = new Color('#31485d'), high = new Color('#b6f4ec'), color = new Color()
-  let index = 0
-  for (let e = 0; e < density.length; e++) {
-    const value = density[e]
-    if (value < 0.12) continue
-    transform.position.set((e % nelx + 0.5) * hx, (Math.floor(e / nelx) % nely + 0.5) * hy, (Math.floor(e / (nelx * nely)) + 0.5) * hz)
-    transform.scale.setScalar(0.34 + 0.63 * Math.sqrt(value))
-    transform.updateMatrix()
-    mesh.setMatrixAt(index, transform.matrix)
-    mesh.setColorAt(index++, color.copy(low).lerp(high, value))
+function femMesh(problem: SimpProblem3D, density: Float64Array, threshold: number, wireframe: boolean, planes: Plane[]) {
+  const data = elementSurface3D(problem.grid, problem.elementType ?? 'hex8', density, threshold, wireframe)
+  const position = new BufferAttribute(data.positions, 3)
+  const geometry = new BufferGeometry()
+  geometry.setAttribute('position', position)
+  geometry.setIndex(new BufferAttribute(data.triangles, 1))
+  const group = new Group()
+  group.add(new Mesh(geometry, new MeshStandardMaterial({
+    color: '#afc3d7', metalness: 0.28, roughness: 0.54, flatShading: true, clippingPlanes: planes,
+    polygonOffset: wireframe, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
+  })))
+  if (wireframe) {
+    const edges = new BufferGeometry()
+    edges.setAttribute('position', new BufferAttribute(data.positions, 3))
+    edges.setIndex(new BufferAttribute(data.edges, 1))
+    group.add(new LineSegments(edges, new LineBasicMaterial({ color: '#34475d', clippingPlanes: planes })))
   }
-  mesh.count = index
-  return mesh
+  return group
 }
 
 export function surfaceMesh(problem: SimpProblem3D, surface: Surface3D, planes: Plane[], frame?: TimedSnapshot3D) {
@@ -156,21 +154,25 @@ export function surfaceMesh(problem: SimpProblem3D, surface: Surface3D, planes: 
     const { grid } = problem
     const { nelx, nely, nelz } = grid
     const size = cellSize(grid)
+    const nodal = problem.elementType === 'tet4' ? nodalField3D(grid, 'tet4', frame.vonMises, frame.density) : undefined
+    const offset = nodal ? 0 : 0.5
+    const maxX = nelx - 2 * offset, maxY = nely - 2 * offset, maxZ = nelz - 2 * offset
     const { vertices } = surface
     const colors = new Float32Array(vertices.length)
     const peak = [frame.p95VonMises, frame.maxVonMises].find(value => Number.isFinite(value) && value > 0) ?? 1
     const color = new Color()
     for (let j = 0; j < vertices.length; j += 3) {
-      const cx = MathUtils.clamp(vertices[j] / size[0] - 0.5, 0, nelx - 1)
-      const cy = MathUtils.clamp(vertices[j + 1] / size[1] - 0.5, 0, nely - 1)
-      const cz = MathUtils.clamp(vertices[j + 2] / size[2] - 0.5, 0, nelz - 1)
+      const cx = MathUtils.clamp(vertices[j] / size[0] - offset, 0, maxX)
+      const cy = MathUtils.clamp(vertices[j + 1] / size[1] - offset, 0, maxY)
+      const cz = MathUtils.clamp(vertices[j + 2] / size[2] - offset, 0, maxZ)
       const x = Math.floor(cx), y = Math.floor(cy), z = Math.floor(cz)
       let value = 0, weightSum = 0
       for (let k = 0; k <= 1; k++) for (let l = 0; l <= 1; l++) for (let m = 0; m <= 1; m++) {
         const e = ((Math.min(z + k, nelz - 1) * nely + Math.min(y + l, nely - 1)) * nelx + Math.min(x + m, nelx - 1))
         const w = (k ? cz - z : 1 - cz + z) * (l ? cy - y : 1 - cy + y) * (m ? cx - x : 1 - cx + x)
-        const weighted = w * frame.density[e]
-        const stress = frame.vonMises[e]
+        const weighted = nodal ? w : w * frame.density[e]
+        const stress = nodal ? nodal[nodeIndex3D(grid, Math.min(x + m, nelx), Math.min(y + l, nely), Math.min(z + k, nelz))]
+          : frame.vonMises[e]
         if (!(weighted > 0 && Number.isFinite(weighted) && Number.isFinite(stress))) continue
         value += weighted * stress
         weightSum += weighted
@@ -188,7 +190,7 @@ export function surfaceMesh(problem: SimpProblem3D, surface: Surface3D, planes: 
   }))
 }
 
-export function Viewport3D({ active, problem, density, mode, setMode, view, surface, frame }: {
+export function Viewport3D({ active, problem, density, mode, setMode, view, surface, frame, threshold, setThreshold }: {
   active: boolean
   problem: SimpProblem3D
   density: Float64Array
@@ -197,6 +199,8 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
   view: 'cad' | 'voxels' | 'stress'
   surface?: Surface3D
   frame?: TimedSnapshot3D
+  threshold: number
+  setThreshold: (value: number) => void
 }) {
   const { t, significant, fixed } = useTranslation()
   const canvas = useRef<HTMLCanvasElement>(null)
@@ -204,6 +208,7 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
   const [failed, setFailed] = useState(false)
   const [cameraMode, setCameraMode] = useState<CameraMode3D>('nx')
   const [showSupports, setShowSupports] = useState(true)
+  const [wireframe, setWireframe] = useState(false)
   const [showLoads, setShowLoads] = useState(true)
   const [sections, setSections] = useState([1, 1, 1])
   const { grid } = problem
@@ -247,10 +252,10 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
     if (!current) return
     const { model, planes, render } = current
     disposeGroup(model)
-    if (view === 'voxels') model.add(voxelMesh(problem, density, planes))
+    if (view === 'voxels') model.add(femMesh(problem, density, mode === 'auto' ? Math.min(0.12, threshold) : threshold, wireframe, planes))
     else if (surface?.triangles.length) model.add(surfaceMesh(problem, surface, planes, view === 'stress' ? frame : undefined))
     render()
-  }, [active, problem, density, view, surface, frame])
+  }, [active, problem, density, view, surface, frame, threshold, wireframe, mode])
 
   useEffect(() => {
     if (!scene.current) return
@@ -291,7 +296,8 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
         </div>
         <p id="camera-hint-3d" className="camera-hint-3d">{t(cameraMode === 'nx' ? 'nxHint3d' : 'standardHint3d')}</p>
         {failed && <p role="alert" className="viewport-notice-3d">{t('webglError3d')}</p>}
-        {!failed && view !== 'voxels' && !surface?.triangles.length &&
+        {!failed && (view === 'voxels' ? mode === 'voxels' && !density.some(value => value >= threshold)
+          : !surface?.triangles.length) &&
           <p className="viewport-notice-3d">{t('noMaterial')} {t('helpThreshold')}</p>}
         {view === 'stress' && frame && <div className="scale stress-legend-3d">
           <div>{t('stress')} · {t('MPa')}</div>
@@ -310,7 +316,16 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
             <output>{fixed(value * limits[i], 1)} {t('mm')}</output>
           </div>)}
         </div>
+        {mode === 'voxels' && <div className="mesh-threshold-3d">
+          <Tooltip message="hint3dMeshThreshold"><label htmlFor="mesh-threshold-3d">{t('threshold')}</label></Tooltip>
+          <input id="mesh-threshold-3d" type="range" min={0.01} max={0.99} step={0.01} value={threshold}
+            aria-valuetext={fixed(threshold, 2)} onChange={event => setThreshold(event.target.valueAsNumber)} />
+        </div>}
         <div className="overlay-controls" role="group" aria-label={t('overlays')}>
+          <Tooltip message="hint3dMeshWireframe"><label><input type="checkbox" checked={wireframe} onChange={event => {
+            setWireframe(event.target.checked)
+            if (event.target.checked && view !== 'voxels') setMode('voxels')
+          }} />{t('meshWireframe3d')}</label></Tooltip>
           <Tooltip message="hint3dSupports"><label><input type="checkbox" checked={showSupports} onChange={event => setShowSupports(event.target.checked)} />{t('supports')}</label></Tooltip>
           <Tooltip message="hint3dForces"><label><input type="checkbox" checked={showLoads} onChange={event => setShowLoads(event.target.checked)} />{t('forces')}</label></Tooltip>
         </div>

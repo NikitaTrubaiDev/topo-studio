@@ -348,6 +348,8 @@ output { color: var(--accent); font: 11px var(--mono); white-space: nowrap; }
 .viewport-notice-3d { position: absolute; top: 43%; left: 50%; transform: translateX(-50%); width: max-content; max-width: 80%; font-size: 13px; }
 .stress-legend-3d { width: 121px; }
 .inspection-3d { border-top: 1px solid var(--border); border-bottom: 0; }
+.mesh-threshold-3d { display: flex; align-items: center; gap: 8px; }
+.mesh-threshold-3d input { width: 92px; }
 .section-planes-3d { display: flex; align-items: center; gap: 8px 16px; flex-wrap: wrap; }
 .section-axis-3d { display: grid; grid-template-columns: auto minmax(44px, 92px) 64px; gap: 6px; align-items: center; }
 .section-axis-3d label { font: 12px var(--mono); color: var(--muted); }

@@ -2,10 +2,10 @@ import { materials } from '../solver/presets'
 import type { Material } from '../solver/types'
 import {
   elementCount, elementIndex, nodeIndex3D, type Force3D, type Grid3D,
-  type SimpParams3D, type SimpProblem3D, type Support3D,
+  type ElementType3D, type SimpParams3D, type SimpProblem3D, type Support3D,
 } from './types3d'
 
-export const resolutions3D = [[24, 12, 8], [36, 18, 12], [48, 24, 16]] as const
+export const resolutions3D = [[24, 12, 8], [36, 18, 12], [48, 24, 16], [64, 32, 20]] as const
 export const presets3D = ['cantilever3d', 'boltBracket3d', 'archBridge3d', 'lBracket3d'] as const
 export type Preset3D = typeof presets3D[number]
 export const defaultParams3D: SimpParams3D = {
@@ -18,7 +18,7 @@ export function presetGrid3D(resolution: readonly [number, number, number]): Gri
 }
 
 export function makePreset3D(
-  id: Preset3D, grid: Grid3D, params = defaultParams3D, material: Material = materials.steel,
+  id: Preset3D, grid: Grid3D, params = defaultParams3D, material: Material = materials.steel, elementType: ElementType3D = 'hex8',
 ): SimpProblem3D {
   const { nelx: nx, nely: ny, nelz: nz } = grid
   const supports: Support3D[] = []
@@ -85,5 +85,5 @@ export function makePreset3D(
       solid[e] = 1
     }
   }
-  return { grid, material, params, supports, loadCases: [{ id, forces }], passive: { solid, void: voidMask } }
+  return { grid, elementType, material, params, supports, loadCases: [{ id, forces }], passive: { solid, void: voidMask } }
 }
