@@ -33,6 +33,19 @@ describe('Jacobi PCG', () => {
     expect([warm.u[0], warm.u[1], warm.u[6]]).toEqual([0, 0, 0])
   })
 
+  it.each([1e-158, 1e-200])('solves and warm-starts a tiny %s RHS in PCG', magnitude => {
+    const multiply = (u: Float64Array, result: Float64Array) => { result[0] = 2 * u[0] }
+    const force = Float64Array.of(magnitude)
+    const diagonal = Float64Array.of(2)
+    const fixed = Uint8Array.of(0)
+    const result = pcg(multiply, diagonal, force, fixed)
+    expect(result.converged).toBe(true)
+    expect(result.u[0]).toBe(magnitude / 2)
+    const warm = pcg(multiply, diagonal, force, fixed, { initial: result.u, output: result.u })
+    expect(warm.iterations).toBe(0)
+    expect(warm.u[0]).toBe(magnitude / 2)
+  })
+
   it('solves the exact discrete bending response of a one-cell clamped cantilever', () => {
     const E = 200
     const force = 10

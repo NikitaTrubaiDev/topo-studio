@@ -1,5 +1,6 @@
 /// <reference lib="webworker" />
 
+import { getDiagnostic } from '../solver/diagnostics'
 import { Simp2D } from '../solver/simp2d'
 import type { WorkerCommand, WorkerEvent } from './protocol'
 
@@ -22,7 +23,7 @@ function stop() {
 function reportError(error: unknown) {
   stop()
   solver = undefined
-  send({ type: 'error', message: error instanceof Error ? error.message : String(error) })
+  send({ type: 'error', diagnostic: getDiagnostic(error) })
 }
 
 function iterate() {

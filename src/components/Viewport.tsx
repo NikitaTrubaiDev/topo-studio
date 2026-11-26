@@ -1,4 +1,5 @@
 import { useLayoutEffect, useMemo, useRef, useState, type PointerEvent } from 'react'
+import type { Diagnostic } from '../solver/diagnostics'
 import type { ContourLoop } from '../solver/contour'
 import { useTranslation } from '../i18n'
 import { buildLabels } from './Controls'
@@ -83,6 +84,7 @@ function paint(
   canvas: HTMLCanvasElement, raster: Raster, problem: SimpProblem, density: Float32Array,
   mode: ViewMode, overlays: Overlays, positions: Float64Array | undefined, stressLimit: number,
   stress: Float32Array | undefined, loops: ContourLoop[], activeCase: number, resultCase: number,
+  attachmentIssue?: Extract<Diagnostic, { code: 'detachedNodes' }>, blockedCells?: readonly number[],
 ) {
   const { clientWidth: width, clientHeight: height } = canvas
   const ratio = window.devicePixelRatio || 1
@@ -272,6 +274,29 @@ function paint(
     ctx.globalAlpha = 1
   }
 
+  if (blockedCells?.length) {
+    ctx.fillStyle = '#ff5151ad'
+    ctx.strokeStyle = '#ff9b8f'
+    ctx.lineWidth = 1.2
+    for (const e of blockedCells) {
+      const [x, y] = point(e % nelx, Math.floor(e / nelx) + 1)
+      ctx.fillRect(x, y, cell, cell)
+      ctx.strokeRect(x, y, cell, cell)
+    }
+  }
+  if (attachmentIssue) {
+    for (const { x, y } of attachmentIssue.params.nodes) {
+      ctx.beginPath()
+      ctx.arc(...point(x, y), 8, 0, 2 * Math.PI)
+      ctx.strokeStyle = '#141d25'
+      ctx.lineWidth = 5
+      ctx.stroke()
+      ctx.strokeStyle = '#ff7769'
+      ctx.lineWidth = 2.5
+      ctx.stroke()
+    }
+  }
+
   ctx.strokeStyle = '#8aa0ad'
   ctx.fillStyle = '#8aa0ad'
   ctx.beginPath()
@@ -303,7 +328,7 @@ function gridPoint(event: PointerEvent<HTMLCanvasElement>, grid: Grid): Point {
 function ForceEditor({ node, problem, activeCase, onChange }: {
   node: number; problem: SimpProblem; activeCase: LoadCase; onChange: (problem: SimpProblem) => void
 }) {
-  const { t, caseName } = useTranslation()
+  const { t, caseName, significant } = useTranslation()
   const [invalid, setInvalid] = useState(false)
   const force = activeCase.forces.find(force => force.node === node)
   const width = problem.grid.nelx + 1
@@ -324,13 +349,14 @@ function ForceEditor({ node, problem, activeCase, onChange }: {
       <label>Fy ({t('N')}) <input type="number" className="field-input" required name="fy" step="any" defaultValue={force?.fy ?? -100} /></label>
       <button className="tool-button" type="submit">{t('applyForce')}</button>
       <button className="tool-button" type="button" disabled={!force} onClick={() => change(null)}>{t('removeForce')}</button>
-      {invalid && <span role="alert">{t('forceLimit').replace('{limit}', MAX_NODAL_FORCE.toExponential())}</span>}
+      {invalid && <span role="alert">{t('forceLimit').replace('{limit}', significant(MAX_NODAL_FORCE))}</span>}
     </form>
   )
 }
 
 export function Viewport({
-  problem, frame, initialDensity, loops, threshold, effectivePassive, mode, setMode, activeCase, onChange,
+  problem, frame, initialDensity, loops, threshold, effectivePassive, attachmentIssue, blockedCells,
+  mode, setMode, activeCase, onChange,
 }: {
   problem: SimpProblem
   frame: TimedSnapshot | undefined
@@ -338,12 +364,14 @@ export function Viewport({
   loops: ContourLoop[]
   threshold: number
   effectivePassive?: PassiveMasks
+  attachmentIssue?: Extract<Diagnostic, { code: 'detachedNodes' }>
+  blockedCells?: readonly number[]
   mode: ViewMode
   setMode: (mode: ViewMode) => void
   activeCase: LoadCase
   onChange: (problem: SimpProblem) => void
 }) {
-  const { t, caseName } = useTranslation()
+  const { t, caseName, number, significant, fixed } = useTranslation()
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const rasterRef = useRef<Raster | null>(null)
   const stroke = useRef<{ problem: SimpProblem; original: SimpProblem; last: Point; nodes: Set<number> } | null>(null)
@@ -402,6 +430,10 @@ export function Viewport({
   const stressMode = mode === 'stress' || mode === 'deformed'
   const { stressLimit, maxStress } = useMemo(() => {
     if (!stressMode || !stress || !previewFrame) return { stressLimit: 0, maxStress: 0 }
+    if (caseIndex < 0) {
+      const { maxVonMises: maxStress, p95VonMises } = previewFrame
+      return { stressLimit: p95VonMises || maxStress, maxStress }
+    }
     const sample: number[] = []
     let maxStress = 0
     for (let e = 0; e < stress.length; e++) {
@@ -411,7 +443,7 @@ export function Viewport({
     }
     sample.sort((a, b) => a - b)
     return { stressLimit: sample[Math.ceil(0.95 * sample.length) - 1] || maxStress, maxStress }
-  }, [stress, previewFrame, stressMode])
+  }, [stress, previewFrame, stressMode, caseIndex])
 
   useLayoutEffect(() => {
     const canvas = canvasRef.current!
@@ -427,9 +459,10 @@ export function Viewport({
     if (canvasRef.current && size.width && size.height) {
       rasterRef.current ??= { canvas: document.createElement('canvas') }
       paint(canvasRef.current, rasterRef.current, preview, previewDensity, mode, overlays, positions,
-        stressLimit, stressMode ? stress : undefined, loops, activeCaseIndex, caseIndex)
+        stressLimit, stressMode ? stress : undefined, loops, activeCaseIndex, caseIndex,
+        draft ? undefined : attachmentIssue, draft ? undefined : blockedCells)
     }
-  }, [preview, previewDensity, mode, overlays, positions, stressLimit, size, stressMode, stress, loops, activeCaseIndex, caseIndex])
+  }, [preview, previewDensity, mode, overlays, positions, stressLimit, size, stressMode, stress, loops, activeCaseIndex, caseIndex, draft, attachmentIssue, blockedCells])
 
   const toggle = (key: keyof Overlays) => setOverlays(current => ({ ...current, [key]: !current[key] }))
   const isBrush = tool === 'void' || tool === 'solid' || tool === 'erase' || tool === 'bolt'
@@ -569,7 +602,7 @@ export function Viewport({
             finish(true)
           }}
           onPointerCancel={() => finish(false)} onLostPointerCapture={() => finish(false)} />
-        <div className="field-caption">{nelx} × {nely} {t('elements')} · {Number((nelx * (grid.cellSizeMm ?? 1)).toPrecision(5))} × {Number((nely * (grid.cellSizeMm ?? 1)).toPrecision(5))} {t('mm')}</div>
+        <div className="field-caption">{number(nelx)} × {number(nely)} {t('elements')} · {significant(nelx * (grid.cellSizeMm ?? 1), 5)} × {significant(nely * (grid.cellSizeMm ?? 1), 5)} {t('mm')}</div>
         {isBrush && hover && inside(hover) && (tool === 'bolt' ? [brushExtent('bolt', radius), radius] : [radius])
           .map((ring, index) => <div key={index} className={`brush-cursor brush-${tool}`} style={{
             left: hoverLayout.left + hover[0] * hoverLayout.cell, top: hoverLayout.bottom - hover[1] * hoverLayout.cell,
@@ -585,22 +618,22 @@ export function Viewport({
           borderColor: caseColor(activeCaseIndex),
         }} />}
         {tool === 'inspect' && hoverDensity !== undefined && (
-          <div className="inspect-readout">ρ {hoverDensity.toFixed(3)} · σ<sub>VM</sub> {hoverStress !== undefined && Number.isFinite(hoverStress) ? `${hoverStress.toPrecision(4)} ${t('MPa')}` : '—'}</div>
+          <div className="inspect-readout">ρ {fixed(hoverDensity, 3)} · σ<sub>VM</sub> {hoverStress !== undefined && Number.isFinite(hoverStress) ? `${significant(hoverStress)} ${t('MPa')}` : '—'}</div>
         )}
         {mode === 'deformed' && (
           <div className="magnification">
             <label htmlFor="deformation-percent">{t('deformation')}</label>
             <input id="deformation-percent" type="range" min="0" max="200" value={deformationPercent}
               aria-valuetext={`${deformationPercent}% ${t('autoScale')}`} onChange={event => setDeformationPercent(event.target.valueAsNumber)} />
-            <output>{displacement ? `${Number(magnification.toPrecision(3))}×` : '—'}</output>
+            <output>{displacement ? `${significant(magnification, 3)}×` : '—'}</output>
             {caseIndex < 0 && deformation && <span>{t('shape')} · {caseName(problem.loadCases[deformation.index])}</span>}
           </div>
         )}
         {mode !== 'cad' && <div className="scale" aria-label={stressMode ? t('stressScale') : t('densityScale')}>
           <span>{stressMode ? t('MPa') : t('density')}</span>
           <div className={`scale-ramp ${stressMode ? 'stress-ramp' : 'density-ramp'}`} />
-          <div className="scale-labels"><span>0</span><span>{stressMode ? (frame ? stressLimit.toPrecision(3) : '—') : '1'}</span></div>
-          {stressMode && frame && <div className="scale-peak">{t('max')} {maxStress.toPrecision(4)} {t('MPa')}</div>}
+          <div className="scale-labels"><span>0</span><span>{stressMode ? (frame ? significant(stressLimit, 3) : '—') : '1'}</span></div>
+          {stressMode && frame && <div className="scale-peak">{t('max')} {significant(maxStress)} {t('MPa')}</div>}
         </div>}
         {mode === 'cad' && !loops.length && <div className="inspect-readout">{t('noMaterial')}</div>}
       </div>

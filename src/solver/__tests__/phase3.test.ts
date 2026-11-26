@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { dictionaries } from '../../i18n/dictionaries'
+import { getDiagnostic } from '../diagnostics'
 import { hasFreeLoad, supportError } from '../design'
 import { engineeringMetrics } from '../engineering'
-import { ManufacturingDensity } from '../manufacturing'
+import { densitySum, ManufacturingDensity } from '../manufacturing'
 import { OverhangFilter } from '../overhang'
-import { defaultParams, makePreset } from '../presets'
+import { defaultParams, makePreset, printableBellcrankPivot } from '../presets'
 import { loadProject, projectGrid, ProjectError, saveProject, type Settings } from '../project'
 import { Simp2D } from '../simp2d'
 import type { BuildDirection, Grid, SimpParams } from '../types'
@@ -118,7 +119,9 @@ describe('manufacturing constraints', () => {
     solid[grid.nelx + 1] = 1
     expect(() => new ManufacturingDensity({
       grid, params: { ...defaultParams, overhang: '+Y' }, passive: { solid, void: voidMask },
-    })).toThrow(/no path to the build plate/)
+    })).toThrow(expect.objectContaining({
+      diagnostic: { code: 'amConflict', params: { cells: [grid.nelx + 1] } },
+    }))
   })
 
   it('rejects contradictory fixed masks in a mirror orbit', () => {
@@ -127,8 +130,85 @@ describe('manufacturing constraints', () => {
     solid[0] = voidMask[grid.nelx - 1] = 1
     expect(() => new ManufacturingDensity({
       grid, params: { ...defaultParams, symmetry: 'x' }, passive: { solid, void: voidMask },
-    })).toThrow(/conflicts/)
+    })).toThrow(/maskConflict/)
   })
+})
+
+describe('Phase 3 audit regressions', () => {
+  it('reports yield failure when peak stress exceeds yield even with a safe P95', () => {
+    const problem = makePreset('cantilever', grid)
+    const metrics = engineeringMetrics(problem, new Float32Array(grid.nelx * grid.nely).fill(1), {
+      displacements: [], maxVonMises: 390.5, p95VonMises: 170,
+    })
+    expect(metrics.status).toBe('fail')
+    expect(metrics.safetyFactor).toBeCloseTo(355 / 390.5, 12)
+    expect(metrics.p95SafetyFactor).toBeCloseTo(355 / 170, 12)
+  })
+
+  it.each([1e-46, 1e-120, 1e-158])('preserves Float64 stress KPIs and displacement for a %s N load', magnitude => {
+    const problem = makePreset('cantilever', { nelx: 12, nely: 4, thicknessMm: 10 },
+      { ...defaultParams, volFrac: 1, maxIter: 1 })
+    const solve = (fy: number) => new Simp2D({ ...problem, loadCases: problem.loadCases.map(load =>
+      ({ ...load, forces: load.forces.map(force => ({ ...force, fy })) })) }).step()
+    const reference = solve(-1)
+    const tiny = solve(-magnitude)
+    const metrics = engineeringMetrics(problem, tiny.density, tiny)
+    const referenceMetrics = engineeringMetrics(problem, reference.density, reference)
+    expect(tiny.vonMises.every(stress => stress === 0)).toBe(true)
+    expect(tiny.maxVonMises / magnitude).toBeCloseTo(reference.maxVonMises, 8)
+    expect(tiny.p95VonMises! / magnitude).toBeCloseTo(reference.p95VonMises!, 8)
+    expect(metrics.maxDeflection! / magnitude).toBeCloseTo(referenceMetrics.maxDeflection!, 10)
+    expect(metrics.p95SafetyFactor! * magnitude).toBeCloseTo(referenceMetrics.p95SafetyFactor!, 6)
+  })
+
+  it('shares nonlinear seeding with the solver and rejects volume targets outside the physical range', () => {
+    const bracket = makePreset('bracket', { nelx: 30, nely: 10 }, {
+      ...defaultParams, symmetry: 'x', heaviside: true, overhang: '+Y',
+    })
+    const problem = { ...bracket, passive: { solid: Uint8Array.from({ length: 300 }, (_, e) => +(e === 135)) } }
+    const manufacturing = new ManufacturingDensity(problem)
+    const preview = manufacturing.initialState()
+    const solver = new Simp2D(problem)
+    const extremes = [0, 1].map(fill => {
+      const { design, mask } = manufacturing.setup
+      const input = design.map((rho, e) => mask[e] ? rho : fill)
+      return densitySum(manufacturing.apply(input, new Float64Array(input.length), 1, false)) / input.length
+    })
+    expect(solver.volumeRange).toEqual(extremes)
+    expect(solver.volumeRange).not.toEqual(manufacturing.setup.volumeRange)
+    expect(preview.diagnostic).toBeUndefined()
+    expect(solver['physicalDensity']()).toEqual(preview.density)
+    expect(densitySum(preview.density) / preview.density.length).toBeCloseTo(problem.params.volFrac, 7)
+
+    const infeasible = { ...bracket, params: { ...defaultParams, heaviside: true, volFrac: 0 } }
+    const diagnostic = new ManufacturingDensity(infeasible).initialState().diagnostic
+    expect(diagnostic).toMatchObject({ code: 'volumeError', params: { target: 0, min: expect.any(Number) } })
+    expect(() => new Simp2D(infeasible)).toThrow(expect.objectContaining({ diagnostic }))
+  })
+
+  it.each([
+    [150, '+Y'], [150, '-Y'], [150, '+X'], [150, '-X'], [180, '+Y'], [240, '+Y'], [300, '+Y'],
+  ] as const)('prints the bellcrank at %d columns after correcting the pivot for %s', (nelx, overhang) => {
+    const grid = { nelx, nely: nelx / 3, cellSizeMm: 120 / nelx, thicknessMm: 10 }
+    const problem = makePreset('bellcrank', grid, { ...defaultParams, overhang, maxIter: 1 })
+    let blocked: number[] = []
+    try {
+      new Simp2D(problem)
+    } catch (cause) {
+      const issue = getDiagnostic(cause)
+      expect(issue.code).toBe('amConflict')
+      if (issue.code === 'amConflict') blocked = issue.params.cells
+    }
+    expect(blocked.length).toBeGreaterThan(0)
+    expect(blocked.every(cell => problem.passive?.solid?.[cell] === 1)).toBe(true)
+
+    const passive = printableBellcrankPivot(problem, blocked)
+    expect(passive?.void?.some(Boolean)).toBe(true)
+    const frame = new Simp2D({ ...problem, passive }).step()
+    expect(frame.volFrac).toBeCloseTo(problem.params.volFrac, 6)
+    expect(frame.compliance).toBeGreaterThan(0)
+    expect(new OverhangFilter(grid, overhang).unsupported(frame.density, 0.5)).toBe(0)
+  }, 20_000)
 })
 
 describe('engineering analysis', () => {

@@ -73,6 +73,13 @@ function verifyStl(contours: ContourLoop[], expectedVolume: number, thickness = 
   expect(signedVolume).toBeCloseTo(expectedVolume, 2)
 }
 
+it('defaults STL thickness to the part and honors explicit overrides and the legacy fallback', () => {
+  const part = { ...grid, thicknessMm: 17 }
+  expect(exportStl(loops, part).data).toEqual(exportStl(loops, grid, 17).data)
+  expect(exportStl(loops, part, 4).data).toEqual(exportStl(loops, grid, 4).data)
+  expect(exportStl(loops, grid).data).toEqual(exportStl(loops, grid, 10).data)
+})
+
 it('extrudes a smoothed plate with a hole into an exactly watertight STL with outward normals', () => {
   const area = loops.reduce((sum, { points }) => sum + points.reduce((area, [x, y], i) => {
     const [nx, ny] = points[(i + 1) % points.length]

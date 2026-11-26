@@ -1,3 +1,4 @@
+import { DiagnosticError } from './diagnostics'
 import { isValidForce } from './design'
 import { materials, presets, type PresetId } from './presets'
 import type { Grid, LoadCase, PassiveMasks, SimpParams, SimpProblem, Support } from './types'
@@ -43,9 +44,9 @@ export function saveProject(settings: Settings, design: Design) {
   }, null, 2)
 }
 
-export class ProjectError extends Error {
+export class ProjectError extends DiagnosticError {
   constructor(readonly field: string) {
-    super(`Invalid project field: ${field}`)
+    super({ code: 'projectError', params: { field } })
   }
 }
 

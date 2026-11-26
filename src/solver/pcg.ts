@@ -1,3 +1,5 @@
+import { DiagnosticError } from './diagnostics'
+
 export interface PcgOptions {
   /** Relative tolerance against the norm of the force on the free DOFs. */
   tolerance?: number
@@ -51,24 +53,31 @@ export function pcg(
   if (!initial) u.fill(0)
   else if (initial !== u) u.set(initial)
   const { residual, direction, product, inverse, conditioned } = workspace
-  let forceSquared = 0
+  let forceScale = 0
   for (let i = 0; i < size; i++) {
     if (fixed[i]) {
       u[i] = 0
       inverse[i] = 0
     } else {
       if (!(diagonal[i] > 0) || !Number.isFinite(diagonal[i])) {
-        throw new Error('The free stiffness diagonal must be finite and positive.')
+        throw new DiagnosticError({ code: 'stiffnessDiagonal' })
       }
       inverse[i] = 1 / diagonal[i]
-      forceSquared += force[i] * force[i]
+      forceScale = Math.max(forceScale, Math.abs(force[i]))
     }
   }
-  if (forceSquared === 0) {
+  if (forceScale === 0) {
     u.fill(0)
     return { u, iterations: 0, relativeResidual: 0, converged: true }
   }
 
+  // Keep the RHS order one for residual norms, including for subnormal loads.
+  let forceSquared = 0
+  for (let i = 0; i < size; i++) {
+    if (fixed[i]) continue
+    u[i] /= forceScale
+    forceSquared += (force[i] / forceScale) ** 2
+  }
   const target = forceSquared * tolerance ** 2
   let squared = 0
   let preconditioned = 0
@@ -77,7 +86,7 @@ export function pcg(
     squared = 0
     preconditioned = 0
     for (let i = 0; i < size; i++) {
-      const r = fixed[i] ? 0 : force[i] - product[i]
+      const r = fixed[i] ? 0 : force[i] / forceScale - product[i]
       residual[i] = r
       squared += r * r
     }
@@ -128,6 +137,7 @@ export function pcg(
   }
 
   if (squared > target) restartResidual()
+  for (let i = 0; i < size; i++) if (!fixed[i]) u[i] *= forceScale
   const relativeResidual = Math.sqrt(squared / forceSquared)
   return { u, iterations, relativeResidual, converged: relativeResidual <= tolerance }
 }

@@ -1,4 +1,5 @@
-import { isValidForce, MAX_NODAL_FORCE, supportError } from './design'
+import { DiagnosticError } from './diagnostics'
+import { attachmentError, isValidForce, MAX_NODAL_FORCE, supportError } from './design'
 import { densitySum, ManufacturingDensity } from './manufacturing'
 import { Multigrid2D } from './multigrid'
 import { elementDofs, Stiffness2D } from './stiffness'
@@ -18,6 +19,7 @@ function dotElement(matrix: Float64Array, row: number, vector: Float64Array, dof
 }
 
 export class Simp2D {
+  /** Attainable physical volume fractions at the initial projection beta. */
   readonly volumeRange: readonly [number, number]
   private readonly manufacturing: ManufacturingDensity
   private readonly multigrid?: Multigrid2D
@@ -36,7 +38,7 @@ export class Simp2D {
   private readonly stiffness: Stiffness2D
   private readonly pcgWorkspace: PcgWorkspace
   private readonly displacements: Float64Array[]
-  private readonly vonMises: Float32Array
+  private readonly vonMises: Float64Array
   private readonly caseVonMises: Float32Array[]
   private readonly physicalGradient: Float64Array
   private readonly gradient: Float64Array
@@ -54,73 +56,70 @@ export class Simp2D {
     const { grid, params, material, supports, loadCases } = problem
     const { nelx, nely } = grid
     if (!Number.isSafeInteger(nelx) || !Number.isSafeInteger(nely) || nelx < 1 || nely < 1) {
-      throw new Error('Grid dimensions must be positive integers.')
+      throw new DiagnosticError({ code: 'gridSize' })
     }
     const cellSize = grid.cellSizeMm ?? 1
-    if (!Number.isFinite(cellSize) || cellSize <= 0) throw new Error('Element size must be finite and positive.')
+    if (!Number.isFinite(cellSize) || cellSize <= 0) throw new DiagnosticError({ code: 'elementSize' })
     if (!Number.isFinite(material.E0) || !(material.E0 > material.Emin && material.Emin > 0)
       || !(material.nu > -1 && material.nu < 0.5)) {
-      throw new Error('Material requires E0 > Emin > 0 and −1 < ν < 0.5.')
+      throw new DiagnosticError({ code: 'invalidMaterial' })
     }
     if (!Number.isFinite(params.penal) || params.penal < 1
       || !(params.volFrac >= 0 && params.volFrac <= 1)
       || !(params.moveLimit > 0 && params.moveLimit <= 1)
       || !Number.isSafeInteger(params.maxIter) || params.maxIter < 1
       || !Number.isFinite(params.changeTol) || params.changeTol < 0) {
-      throw new Error('Invalid SIMP parameters.')
+      throw new DiagnosticError({ code: 'simpParams' })
     }
     const elements = nelx * nely
     const nodes = (nelx + 1) * (nely + 1)
     const thickness = grid.thicknessMm ?? 1
-    if (!Number.isFinite(thickness) || thickness <= 0) throw new Error('Part thickness must be finite and positive.')
+    if (!Number.isFinite(thickness) || thickness <= 0) throw new DiagnosticError({ code: 'partThickness' })
     this.ke = elementStiffness(thickness, material.nu)
     // Square element stiffness is invariant to side length. Strain scales as 1 / side length.
     this.stressD = planeStressD(1 / cellSize, material.nu)
     this.dofs = elementDofs(grid)
     this.fixed = new Uint8Array(nodes * 2)
     const issue = supportError(grid, supports)
-    if (issue) throw new Error(issue)
+    if (issue) throw new DiagnosticError(issue)
     for (const { node, fixedX, fixedY } of supports) {
       if (fixedX) this.fixed[2 * node] = 1
       if (fixedY) this.fixed[2 * node + 1] = 1
     }
-    if (!loadCases.length) throw new Error('At least one load case is required.')
+    if (!loadCases.length) throw new DiagnosticError({ code: 'missingLoadCases' })
     this.forces = loadCases.map(({ forces }, caseIndex) => {
       const vector = new Float64Array(nodes * 2)
       for (const { node, fx, fy } of forces) {
         if (!Number.isInteger(node) || node < 0 || node >= nodes) {
-          throw new Error('Invalid nodal load.')
+          throw new DiagnosticError({ code: 'invalidNodalLoad' })
         }
         if (!isValidForce(fx, fy)) {
-          throw new Error(`Load case ${caseIndex + 1}: nodal forces must be finite and at most ${MAX_NODAL_FORCE.toExponential()} N.`)
+          throw new DiagnosticError({ code: 'nodalForceLimit', params: { case: caseIndex + 1, limit: MAX_NODAL_FORCE } })
         }
         vector[2 * node] += fx
         vector[2 * node + 1] += fy
       }
       for (const { node } of forces) {
         if (!isValidForce(vector[2 * node], vector[2 * node + 1])) {
-          throw new Error(`Load case ${caseIndex + 1}: net force at a node must be at most ${MAX_NODAL_FORCE.toExponential()} N.`)
+          throw new DiagnosticError({ code: 'netForceLimit', params: { case: caseIndex + 1, limit: MAX_NODAL_FORCE } })
         }
       }
       return vector
     })
 
-    this.density = new Float64Array(elements)
     this.manufacturing = new ManufacturingDensity(problem)
-    const { mask, design, volumeGradient, fixedVolume, volumeRange } = this.manufacturing.setup
-    const range = this.manufacturing.nonlinear
-      ? this.manufacturing.seed(this.beta, params.volFrac, this.density) : volumeRange
-    const [min, max] = range
-    if (params.volFrac < min - 1e-12 || params.volFrac > max + 1e-12) {
-      throw new Error('The target volume fraction is infeasible with the passive masks and filter radius.')
-    }
+    const detached = attachmentError(problem, this.manufacturing.passive?.void)
+    if (detached) throw new DiagnosticError(detached)
+    const { mask, design, volumeGradient, fixedVolume } = this.manufacturing.setup
+    const { density, volumeRange, diagnostic } = this.manufacturing.initialState()
+    if (diagnostic) throw new DiagnosticError(diagnostic)
     this.volumeAtOutput = new Float64Array(elements).fill(1)
     this.mask = mask
     this.design = design
     this.volumeGradient = volumeGradient
     this.fixedVolume = fixedVolume
     this.volumeRange = volumeRange
-    this.density = new Float64Array(elements)
+    this.density = density
     this.modulus = new Float64Array(elements)
     this.stiffness = new Stiffness2D(grid, this.fixed, this.dofs)
     if (params.preconditioner !== 'jacobi' && Math.min(nelx, nely) >= 2 && nodes > 40) {
@@ -128,7 +127,7 @@ export class Simp2D {
     }
     this.pcgWorkspace = new PcgWorkspace(this.fixed.length)
     this.displacements = this.forces.map(force => new Float64Array(force.length))
-    this.vonMises = new Float32Array(elements)
+    this.vonMises = new Float64Array(elements)
     this.caseVonMises = this.forces.map(() => new Float32Array(elements))
     this.physicalGradient = new Float64Array(elements)
     this.gradient = new Float64Array(elements)
@@ -167,7 +166,7 @@ export class Simp2D {
         maxIterations: Math.max(1000, fixed.length * 4),
       })
       if (!result.converged) {
-        throw new Error(`PCG failed for load case ${caseIndex + 1} (relative residual ${result.relativeResidual.toExponential(2)}).`)
+        throw new DiagnosticError({ code: 'pcgFailure', params: { case: caseIndex + 1, residual: result.relativeResidual } })
       }
       for (let i = 0; i < force.length; i++) compliance += force[i] * u[i]
       for (let e = 0; e < density.length; e++) {
@@ -186,13 +185,14 @@ export class Simp2D {
         const sx = modulus[e] * (stressD[0] * ex + stressD[1] * ey)
         const sy = modulus[e] * (stressD[3] * ex + stressD[4] * ey)
         const shear = modulus[e] * stressD[8] * gamma
-        const stress = Math.sqrt(sx * sx - sx * sy + sy * sy + 3 * shear * shear)
+        // This form of von Mises avoids explicitly squaring tiny stress components.
+        const stress = Math.hypot((sx + sy) / 2, Math.sqrt(3) * (sx - sy) / 2, Math.sqrt(3) * shear)
         const storedStress = Math.fround(stress)
         if (!Number.isFinite(storedStress)) {
-          throw new Error(`Stress exceeds the representable range for load case ${caseIndex + 1}.`)
+          throw new DiagnosticError({ code: 'stressOverflow', params: { case: caseIndex + 1 } })
         }
         caseStress[e] = storedStress
-        vonMises[e] = Math.max(vonMises[e], caseStress[e])
+        vonMises[e] = Math.max(vonMises[e], stress)
         maxVonMises = Math.max(maxVonMises, stress)
       }
     }
@@ -279,7 +279,7 @@ export class Simp2D {
   }
 
   step(): IterationSnapshot {
-    if (this.done) throw new Error('This optimization has already finished.')
+    if (this.done) throw new DiagnosticError({ code: 'alreadyFinished' })
     const { params } = this.problem
     const attempted = this.advanceBeta
     const continued = attempted && this.betaFeasible(2 * this.beta)
@@ -289,6 +289,9 @@ export class Simp2D {
     const change = this.update(this.gradient)
     const physical = this.physicalDensity()
     const analysis = this.analyze(physical)
+    const stressSample = this.vonMises.filter((_, e) => physical[e] > 0.2)
+    stressSample.sort()
+    const p95VonMises = stressSample[Math.ceil(0.95 * stressSample.length) - 1]
     this.iteration++
     this.advanceBeta = !!params.heaviside && this.beta < 16
       && (this.iteration - this.betaSince >= 20 || (change <= params.changeTol && (!attempted || continued)))
@@ -296,7 +299,8 @@ export class Simp2D {
     return {
       iteration: this.iteration,
       density: Float32Array.from(physical),
-      vonMises: this.vonMises.slice(),
+      vonMises: Float32Array.from(this.vonMises),
+      p95VonMises,
       caseVonMises: this.caseVonMises.map(stress => stress.slice()),
       displacements: this.displacements.map(u => u.slice()),
       compliance: analysis.compliance,

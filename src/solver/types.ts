@@ -94,6 +94,8 @@ export interface IterationSnapshot {
   volFrac: number
   change: number
   maxVonMises: number
+  /** 95th percentile of peak element stress among elements with density above 0.2. */
+  p95VonMises: number | undefined
   beta?: number
   done: boolean
 }

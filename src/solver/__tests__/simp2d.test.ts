@@ -88,11 +88,11 @@ describe('2D SIMP optimization', () => {
     const [{ node }] = load.forces
     const solve = (forces: typeof load.forces) => new Simp2D({ ...problem, loadCases: [{ ...load, forces }] })
     for (const fy of [Infinity, -Infinity, NaN, MAX_NODAL_FORCE * 2]) {
-      expect(() => solve([{ node, fx: 0, fy }])).toThrow(/nodal forces must be finite and at most/)
+      expect(() => solve([{ node, fx: 0, fy }])).toThrow(/nodalForceLimit/)
     }
-    expect(() => solve([{ node, fx: MAX_NODAL_FORCE, fy: MAX_NODAL_FORCE }])).toThrow(/nodal forces/)
+    expect(() => solve([{ node, fx: MAX_NODAL_FORCE, fy: MAX_NODAL_FORCE }])).toThrow(/nodalForceLimit/)
     const partial = { node, fx: 0, fy: -0.75 * MAX_NODAL_FORCE }
-    expect(() => solve([partial, partial])).toThrow(/net force at a node/)
+    expect(() => solve([partial, partial])).toThrow(/netForceLimit/)
     const { vonMises } = solve([{ node, fx: 0, fy: -MAX_NODAL_FORCE }]).step()
     expect(vonMises.every(Number.isFinite)).toBe(true)
     expect(vonMises.some(stress => stress > 0)).toBe(true)
@@ -100,7 +100,7 @@ describe('2D SIMP optimization', () => {
 
   it('rejects computed stress that would overflow a Float32 result field', () => {
     const problem = makePreset('cantilever', { nelx: 12, nely: 4, cellSizeMm: 1e-40 })
-    expect(() => new Simp2D(problem).step()).toThrow(/Stress exceeds the representable range/)
+    expect(() => new Simp2D(problem).step()).toThrow(/stressOverflow/)
   })
 
   it('matches compliance and volume finite differences around the L-bracket cutout', () => {

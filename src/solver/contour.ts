@@ -1,3 +1,4 @@
+import { DiagnosticError } from './diagnostics'
 import type { Grid } from './types'
 
 export type Point2 = [number, number]
@@ -52,7 +53,7 @@ export function extractContours(
 ): ContourLoop[] {
   const { nelx, nely } = grid
   if (density.length !== nelx * nely || !(threshold > 0 && threshold < 1)) {
-    throw new Error('Contours require one density per element and a threshold between 0 and 1.')
+    throw new DiagnosticError({ code: 'contourInput' })
   }
   const nx = nelx + 4
   const ny = nely + 4
@@ -62,7 +63,7 @@ export function extractContours(
     for (let x = 1; x < nx - 1; x++) {
       const e = Math.min(nely - 1, Math.max(0, y - 2)) * nelx + Math.min(nelx - 1, Math.max(0, x - 2))
       const value = density[e] - threshold
-      if (!Number.isFinite(value)) throw new Error('Contour densities must be finite.')
+      if (!Number.isFinite(value)) throw new DiagnosticError({ code: 'contourDensity' })
       // Keep intersections away from sample vertices, including threshold plateaus.
       field[y * nx + x] = value >= 0 ? Math.max(1e-5, value) : Math.min(-1e-5, value)
     }

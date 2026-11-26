@@ -208,6 +208,7 @@ output { color: var(--accent); font: 11px var(--mono); white-space: nowrap; }
 .case-row span { overflow-wrap: anywhere; }
 .case-row small { font: 10px var(--mono); color: var(--muted); }
 .constraint-warning, .hint { color: var(--muted); font-size: 12px; }
+.constraint-warning .action-row { margin-top: 8px; }
 .constraint-warning { padding: 8px 12px; border: 1px solid #866440; border-radius: 5px; color: #ffd3a0; }
 .designer-tools { background: #141c23; }
 .compact-input, .force-editor label { display: flex; align-items: center; gap: 7px; color: #bfccd5; font-size: 11px; }
@@ -277,8 +278,9 @@ output { color: var(--accent); font: 11px var(--mono); white-space: nowrap; }
 .engineering { padding: 12px; }
 .engineering h2 { font-size: 14px; font-weight: 650; }
 .engineering dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 10px 18px; margin-top: 8px; }
+.engineering small { display: block; }
 .engineering dt, .engineering small { font-size: 11px; color: var(--muted); }
 .engineering dd { margin-top: 4px; font: 15px var(--mono); }
 .engineering .safe { color: #91ecc1; }
 .engineering .caution { color: #ffc478; }
-.engineering .critical { color: #ff8f89; }
+.engineering .fail { color: #ff8f89; }

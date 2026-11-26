@@ -125,7 +125,7 @@ export class OverhangFilter {
   /** Trace a minimum-added-material path from each prescribed solid to the plate. */
   anchor(passive: PassiveMasks, solid: Uint8Array) {
     const original = passive.solid
-    if (!original?.some(Boolean)) return
+    if (!original?.some(Boolean)) return []
     const { order, neighbors, width } = this
     const cost = new Float64Array(order.length).fill(Infinity)
     const predecessor = new Int32Array(order.length).fill(-1)
@@ -147,15 +147,20 @@ export class OverhangFilter {
       cost[e] = added + cost[best]
       predecessor[e] = best
     }
+    const blocked: number[] = []
     const connected = new Uint8Array(order.length)
     for (let e = 0; e < order.length; e++) {
       if (!original[e]) continue
-      if (!Number.isFinite(cost[e])) throw new Error('A passive solid has no path to the build plate.')
+      if (!Number.isFinite(cost[e])) {
+        blocked.push(e)
+        continue
+      }
       for (let i = e; i !== -1 && !connected[i]; i = predecessor[i]) {
         solid[i] = 1
         connected[i] = 1
       }
     }
+    return blocked
   }
 
   unsupported(density: Float32Array | Float64Array, threshold: number) {

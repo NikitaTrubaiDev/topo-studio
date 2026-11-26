@@ -1,3 +1,4 @@
+import type { Diagnostic } from '../solver/diagnostics'
 import type { IterationSnapshot, SimpProblem } from '../solver/types'
 
 export type WorkerCommand =
@@ -12,4 +13,4 @@ export type WorkerEvent =
   | { type: 'frame'; snapshot: TimedSnapshot }
   | { type: 'paused' }
   | { type: 'done' }
-  | { type: 'error'; message: string }
+  | { type: 'error'; diagnostic: Diagnostic }

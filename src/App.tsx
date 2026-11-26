@@ -9,9 +9,10 @@ import { LoadCases } from './components/LoadCases'
 import { download, ExportDialog, type ContourSettings } from './components/ExportDialog'
 import { extractContours } from './solver/contour'
 import { initialPhysicalDensity } from './solver/density'
-import { addLoadCase, hasFreeLoad, loadCaseIndex, supportError } from './solver/design'
-import { defaultParams, makePreset, materials } from './solver/presets'
-import { loadProject, projectGrid, ProjectError, saveProject, type Design, type Settings } from './solver/project'
+import { addLoadCase, attachmentError, hasFreeLoad, loadCaseIndex, supportError } from './solver/design'
+import { defaultParams, makePreset, materials, printableBellcrankPivot } from './solver/presets'
+import { getDiagnostic, type Diagnostic } from './solver/diagnostics'
+import { loadProject, projectGrid, saveProject, type Design, type Settings } from './solver/project'
 import { ManufacturingDensity } from './solver/manufacturing'
 import type { TimedSnapshot, WorkerCommand, WorkerEvent } from './workers/protocol'
 
@@ -28,10 +29,6 @@ const initialSettings: Settings = {
   preset: 'mbb', resolution: '48 × 16', material: 'steel', widthMm: 120, thicknessMm: 10, params: defaultParams,
 }
 const languageKey = 'topostudio-language'
-
-function display(value: number | undefined, digits: number) {
-  return value === undefined ? '—' : value.toPrecision(digits)
-}
 
 export default function App() {
   const [language, setLanguage] = useState<Language>(() => {
@@ -53,8 +50,8 @@ export default function App() {
 }
 
 function Workbench({ language, setLanguage }: { language: Language; setLanguage: (value: Language) => void }) {
-  const { t, diagnostic } = useTranslation()
-  const [projectError, setProjectError] = useState<string>()
+  const { t, diagnostic, number, significant, fixed } = useTranslation()
+  const [projectError, setProjectError] = useState<Diagnostic>()
   const [projectRevision, setProjectRevision] = useState(0)
   const loadRequest = useRef(0)
   const projectFile = useRef<HTMLInputElement>(null)
@@ -62,13 +59,13 @@ function Workbench({ language, setLanguage }: { language: Language; setLanguage:
   const [runState, setRunState] = useState<RunState>('ready')
   const [frame, setFrame] = useState<TimedSnapshot>()
   const [samples, setSamples] = useState<Sample[]>([])
-  const [error, setError] = useState('')
+  const [error, setError] = useState<Diagnostic>()
   const [history, setHistory] = useState(initialHistory)
   // Preserve the requested case when it is absent from the current history entry.
   const [selectedCaseId, setSelectedCaseId] = useState<string>()
   const [mode, setMode] = useState<ViewMode>('density')
   const [exportOpen, setExportOpen] = useState(false)
-  const [contour, setContour] = useState<ContourSettings>({ threshold: 0.5, smoothing: 3, thickness: 10 })
+  const [contour, setContour] = useState<ContourSettings>({ threshold: 0.5, smoothing: 3 })
   const workerRef = useRef<Worker | null>(null)
   const paintRequest = useRef<number | undefined>(undefined)
   const queued = useRef<TimedSnapshot | undefined>(undefined)
@@ -85,17 +82,38 @@ function Workbench({ language, setLanguage }: { language: Language; setLanguage:
   const preview = useMemo(() => {
     try {
       const manufacturing = new ManufacturingDensity({ grid, params, passive })
-      const output = new Float64Array(grid.nelx * grid.nely)
-      const density = manufacturing.apply(manufacturing.setup.design, output, 1, false)
-      return { density: Float32Array.from(density), passive: manufacturing.passive, anchors: manufacturing.addedAnchors }
+      const { density, diagnostic: volumeIssue } = manufacturing.initialState()
+      return { density: Float32Array.from(density), passive: manufacturing.passive,
+        volumeIssue, anchors: manufacturing.addedAnchors }
     } catch (cause) {
-      const conflict = cause instanceof Error ? cause.message : String(cause)
-      return { density: initialPhysicalDensity({ grid, params, passive }), passive, conflict, anchors: 0 }
+      const conflict = getDiagnostic(cause)
+      if (conflict.code === 'amConflict') {
+        const fallback = new ManufacturingDensity({ grid, params: { ...params, overhang: undefined }, passive })
+        return { density: Float32Array.from(fallback.initialState().density),
+          passive: fallback.passive, conflict, anchors: 0 }
+      }
+      const density = conflict.code === 'maskConflict'
+        ? initialPhysicalDensity({ grid, params, passive }) : new Float32Array(grid.nelx * grid.nely)
+      return { density, passive, conflict, anchors: 0 }
     }
   }, [grid, params, passive])
   const initialDensity = preview.density
-  const constraint = preview.conflict ? diagnostic(preview.conflict)
-    : supportIssue ? t('unsupportedSupports') : loadIssue ? t('freeLoad') : undefined
+  const attachmentIssue = useMemo(() => attachmentError(problem, preview.passive?.void), [problem, preview.passive])
+  const constraint: Diagnostic | undefined = preview.conflict ?? attachmentIssue ?? supportIssue
+    ?? (loadIssue ? { code: 'freeLoad' } : preview.volumeIssue)
+  const printablePivot = useMemo(() => {
+    if (settings.preset !== 'bellcrank' || preview.conflict?.code !== 'amConflict') return
+    const passive = printableBellcrankPivot(problem, preview.conflict.params.cells)
+    if (!passive || supportIssue || loadIssue) return
+    try {
+      const candidate = { ...problem, passive }
+      const manufacturing = new ManufacturingDensity(candidate)
+      if (!attachmentError(candidate, manufacturing.passive?.void) &&
+          !manufacturing.initialState().diagnostic) return passive
+    } catch {
+      // A separate mask conflict can still block the corrected pivot.
+    }
+  }, [settings.preset, preview.conflict, problem, supportIssue, loadIssue])
   const density = frame?.density ?? initialDensity
   const loops = useMemo(() => showContours
     ? extractContours(density, grid, contour.threshold, contour.smoothing) : [],
@@ -117,7 +135,7 @@ function Workbench({ language, setLanguage }: { language: Language; setLanguage:
     queued.current = undefined
     setFrame(undefined)
     setSamples([])
-    setError('')
+    setError(undefined)
     setRunState('ready')
   }
 
@@ -127,7 +145,6 @@ function Workbench({ language, setLanguage }: { language: Language; setLanguage:
       setHistory(initialHistory)
       setSelectedCaseId(undefined)
     }
-    if (value.thicknessMm !== settings.thicknessMm) setContour(current => ({ ...current, thickness: value.thicknessMm }))
     setSettings(value)
   }
 
@@ -142,10 +159,10 @@ function Workbench({ language, setLanguage }: { language: Language; setLanguage:
       setHistory({ ...initialHistory, present: loaded.design })
       setSelectedCaseId(undefined)
       setMode('density')
-      setContour(current => ({ ...current, thickness: loaded.settings.thicknessMm }))
       setProjectError(undefined)
     } catch (cause) {
-      if (request === loadRequest.current) setProjectError(cause instanceof ProjectError ? cause.field : '')
+      const issue = getDiagnostic(cause)
+      if (request === loadRequest.current) setProjectError(issue.code === 'projectError' ? issue : { code: 'projectError', params: {} })
     }
   }
 
@@ -212,14 +229,14 @@ function Workbench({ language, setLanguage }: { language: Language; setLanguage:
               setRunState('complete')
               break
             case 'error':
-              setError(data.message)
+              setError(data.diagnostic)
               setRunState('error')
               break
           }
         }
-        instance.onerror = event => {
+        instance.onerror = () => {
           if (workerRef.current !== instance) return
-          setError(event.message || 'The optimization worker could not start.')
+          setError({ code: 'workerError' })
           setRunState('error')
         }
         instance.postMessage({ type: 'init', problem } satisfies WorkerCommand)
@@ -228,21 +245,21 @@ function Workbench({ language, setLanguage }: { language: Language; setLanguage:
       setRunState(type === 'start' ? 'running' : type === 'pause' ? 'pausing' : 'stepping')
       worker.postMessage({ type } satisfies WorkerCommand)
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
+      setError(getDiagnostic(cause))
       setRunState('error')
     }
   }
 
   const canRun = !constraint && (runState === 'ready' || runState === 'paused')
   const metrics = [
-    { label: t('iteration'), value: frame?.iteration ?? '—', unit: '' },
-    { label: t('compliance'), value: display(frame?.compliance, 4), unit: `${t('N')}·${t('mm')}` },
-    { label: t('volume'), value: frame ? (frame.volFrac * 100).toFixed(1) : '—', unit: '%' },
-    { label: t('change'), value: frame ? frame.change.toFixed(4) : '—', unit: '' },
-    { label: t('time'), value: frame ? frame.iterMs.toFixed(1) : '—', unit: t('ms') },
-    { label: t('peakStress'), value: display(frame?.maxVonMises, 4), unit: t('MPa') },
+    { label: t('iteration'), value: number(frame?.iteration), unit: '' },
+    { label: t('compliance'), value: significant(frame?.compliance), unit: `${t('N')}·${t('mm')}` },
+    { label: t('volume'), value: fixed(frame && frame.volFrac * 100, 1), unit: '%' },
+    { label: t('change'), value: fixed(frame?.change, 4), unit: '' },
+    { label: t('time'), value: fixed(frame?.iterMs, 1), unit: t('ms') },
+    { label: t('peakStress'), value: significant(frame?.maxVonMises), unit: t('MPa') },
   ]
-  if (params.heaviside) metrics.push({ label: 'β', value: frame?.beta ?? 1, unit: '' })
+  if (params.heaviside) metrics.push({ label: 'β', value: number(frame?.beta ?? 1), unit: '' })
 
   return (
     <div className="min-h-screen antialiased">
@@ -304,12 +321,23 @@ function Workbench({ language, setLanguage }: { language: Language; setLanguage:
               }}>{t('export')}</button>
             </div>
           </div>
-          {projectError !== undefined && <p role="alert" className="error">
-            {t('projectError')}{projectError && <> ({projectError})</>}</p>}
-          {error && <p role="alert" className="error" title={error}>{diagnostic(error)} {t('resetError')}</p>}
-          {constraint && <p className="constraint-warning" role="alert">{constraint}</p>}
-          {preview.anchors > 0 && <p className="anchor-status">{t('amAnchors')} · {preview.anchors}</p>}
-          <Viewport effectivePassive={preview.passive} key={`${projectRevision}/${settings.preset}/${settings.resolution}`} problem={problem} frame={frame} initialDensity={initialDensity} loops={loops} threshold={contour.threshold}
+          {projectError && <p role="alert" className="error">{diagnostic(projectError)}</p>}
+          {error && <p role="alert" className="error">{diagnostic(error)} {t('resetError')}</p>}
+          {constraint && <div className="constraint-warning">
+            <p role="alert">{diagnostic(constraint)}</p>
+            {constraint.code === 'amConflict' && <div className="action-row">
+              <button type="button" className="tool-button" onClick={() =>
+                changeSettings({ ...settings, params: { ...settings.params, overhang: undefined } })}>{t('disableOverhang')}</button>
+              {printablePivot && <button type="button" className="tool-button" title={t('teardropPivotHelp')} onClick={() =>
+                edit({ ...problem, passive: printablePivot })}>{t('teardropPivot')}</button>}
+            </div>}
+            {attachmentIssue && constraint !== attachmentIssue && <p role="alert">{diagnostic(attachmentIssue)}</p>}
+          </div>}
+          {preview.anchors > 0 && <p className="anchor-status">{t('amAnchors')} · {number(preview.anchors)}</p>}
+          <Viewport key={`${projectRevision}/${settings.preset}/${settings.resolution}`}
+            problem={problem} frame={frame} initialDensity={initialDensity} loops={loops} threshold={contour.threshold}
+            effectivePassive={preview.passive} attachmentIssue={attachmentIssue}
+            blockedCells={preview.conflict?.code === 'amConflict' ? preview.conflict.params.cells : undefined}
             mode={mode} setMode={setMode} activeCase={activeCase} onChange={edit} />
           {exportOpen && <ExportDialog loops={loops} grid={problem.grid} settings={contour}
             setSettings={setContour} onClose={() => setExportOpen(false)} />}

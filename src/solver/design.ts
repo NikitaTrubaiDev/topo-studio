@@ -1,3 +1,4 @@
+import type { Diagnostic } from './diagnostics'
 import type { Grid, LoadCase, NodalForce, PassiveMasks, SimpProblem, Support } from './types'
 
 export type MaskTool = 'void' | 'solid' | 'erase' | 'bolt'
@@ -15,19 +16,57 @@ export function supportKind(support: Support): SupportKind {
   return support.kind ?? (support.fixedX ? support.fixedY ? 'fixed' : 'roller-y' : 'roller-x')
 }
 
-export function supportError(grid: Grid, supports: readonly Support[]): string | undefined {
+export function supportError(grid: Grid, supports: readonly Support[]): Diagnostic | undefined {
   const width = grid.nelx + 1
   const rows = new Set<number>()
   const columns = new Set<number>()
   for (const { node, fixedX, fixedY } of supports) {
-    if (!Number.isInteger(node) || node < 0 || node >= width * (grid.nely + 1)) return 'Support node is outside the grid.'
+    if (!Number.isInteger(node) || node < 0 || node >= width * (grid.nely + 1)) return { code: 'supportOutsideGrid' }
     if (fixedX) rows.add(Math.floor(node / width))
     if (fixedY) columns.add(node % width)
   }
   // A rigid motion has Ux = Tx − rotation*y and Uy = Ty + rotation*x.
   if (!rows.size || !columns.size || rows.size + columns.size < 3) {
-    return 'Supports must restrain both rigid translations and rotation.'
+    return { code: 'unsupportedSupports' }
   }
+}
+
+export function attachmentError(
+  { grid, supports, loadCases }: SimpProblem, voidMask?: Uint8Array,
+): Extract<Diagnostic, { code: 'detachedNodes' }> | undefined {
+  if (!voidMask) return
+  const { nelx, nely } = grid
+  const width = nelx + 1
+  const detached = (node: number) => {
+    if (!Number.isInteger(node) || node < 0 || node >= width * (nely + 1)) return false
+    const x = node % width
+    const y = Math.floor(node / width)
+    for (let row = Math.max(0, y - 1); row <= Math.min(y, nely - 1); row++) {
+      for (let col = Math.max(0, x - 1); col <= Math.min(x, nelx - 1); col++) {
+        if (!voidMask[row * nelx + col]) return false
+      }
+    }
+    return true
+  }
+
+  const loads = new Set<number>()
+  for (const { forces } of loadCases) {
+    const net = new Map<number, [number, number]>()
+    for (const { node, fx, fy } of forces) {
+      const [x, y] = net.get(node) ?? [0, 0]
+      net.set(node, [x + fx, y + fy])
+    }
+    for (const [node, [fx, fy]] of net) if (fx || fy) loads.add(node)
+  }
+  const nodes: Extract<Diagnostic, { code: 'detachedNodes' }>['params']['nodes'] = []
+  for (const [kind, candidates] of [
+    ['load', loads], ['support', new Set(supports.map(support => support.node))],
+  ] as const) {
+    for (const node of candidates) {
+      if (detached(node)) nodes.push({ x: node % width, y: Math.floor(node / width), kind })
+    }
+  }
+  if (nodes.length) return { code: 'detachedNodes', params: { nodes } }
 }
 
 export function editSupport(supports: readonly Support[], node: number, action: SupportAction): readonly Support[] {

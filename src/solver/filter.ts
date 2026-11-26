@@ -1,3 +1,4 @@
+import { DiagnosticError } from './diagnostics'
 import type { Grid } from './types'
 
 /** Sparse row-normalized cone filter, in compressed sparse row format. */
@@ -7,9 +8,9 @@ export class DensityFilter {
   readonly weights: Float64Array
 
   constructor({ nelx, nely }: Grid, radius: number, passiveVoid?: Uint8Array) {
-    if (!(radius > 0) || !Number.isFinite(radius)) throw new Error('The filter radius must be positive.')
+    if (!(radius > 0) || !Number.isFinite(radius)) throw new DiagnosticError({ code: 'filterRadius' })
     if (passiveVoid && passiveVoid.length !== nelx * nely) {
-      throw new Error('The filter mask must contain one entry per element.')
+      throw new DiagnosticError({ code: 'maskSize' })
     }
     const offsets = new Uint32Array(nelx * nely + 1)
     const columns: number[] = []

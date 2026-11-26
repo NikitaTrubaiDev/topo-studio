@@ -7,7 +7,7 @@ export interface Sample {
 }
 
 export function ConvergenceChart({ samples, target }: { samples: Sample[]; target: number }) {
-  const { t } = useTranslation()
+  const { t, number, significant } = useTranslation()
   const width = 700
   const height = 120
   const left = 63
@@ -43,7 +43,7 @@ export function ConvergenceChart({ samples, target }: { samples: Sample[]; targe
             <g key={fraction}>
               <line x1={left} x2={right} y1={yVolume(fraction)} y2={yVolume(fraction)} className="chart-grid" />
               <text x={left - 8} y={yVolume(fraction) + 3} textAnchor="end">
-                {(cMin + fraction * (cMax - cMin)).toPrecision(3)}
+                {significant(cMin + fraction * (cMax - cMin), 3)}
               </text>
               <text x={right + 8} y={yVolume(fraction) + 3}>{Math.round(fraction * 100)}%</text>
             </g>
@@ -55,7 +55,7 @@ export function ConvergenceChart({ samples, target }: { samples: Sample[]; targe
           <circle cx={x(samples.length - 1)} cy={yVolume(last.volFrac)} r="3" className="volume-dot" />
           <text x={left} y={height - 5}>1</text>
           <text x={width / 2} y={height - 5} textAnchor="middle">{t('iteration')}</text>
-          {last.iteration > 1 && <text x={right} y={height - 5} textAnchor="end">{last.iteration}</text>}
+          {last.iteration > 1 && <text x={right} y={height - 5} textAnchor="end">{number(last.iteration)}</text>}
         </svg>
       ) : (
         <div className="chart-empty">{t('chartEmpty')}</div>

@@ -1,4 +1,4 @@
-import { nodeIndex, type Grid, type Material, type NodalForce, type SimpParams, type SimpProblem, type Support } from './types'
+import { nodeIndex, type Grid, type PassiveMasks, type Material, type NodalForce, type SimpParams, type SimpProblem, type Support } from './types'
 
 // Nominal isotropic inputs for the plane-stress model. Polymers use dry PA12
 // (Arkema Rilsamid AESNO MED) and horizontal print coupon data (Prusament PLA and PETG).
@@ -29,6 +29,43 @@ export const presets = {
 }
 
 export type PresetId = keyof typeof presets
+
+function bellcrankPivot({ nelx, nely }: Grid) {
+  const inner = Math.max(1, nely * 0.11)
+  return { x: Math.round(nelx * 0.49), y: Math.round(nely * 0.45),
+    inner, outer: inner + Math.max(1.3, nely * 0.065) }
+}
+
+/** Fill the upper shoulders of the stock pivot opening to make an inscribed 45° roof. */
+export function printableBellcrankPivot(problem: SimpProblem, blocked: readonly number[]): PassiveMasks | undefined {
+  const { grid, passive, params } = problem
+  if (!params.overhang || !passive?.void) return
+  const { nelx, nely } = grid
+  const { x, y, inner, outer } = bellcrankPivot(grid)
+  const offset = (e: number) => [e % nelx + 0.5 - x, Math.floor(e / nelx) + 0.5 - y]
+  const radius = (e: number) => Math.hypot(...offset(e))
+  if (!blocked.some(e => {
+    const r = radius(e)
+    return r > inner && r <= outer && passive.solid?.[e]
+  })) return
+
+  const axis = params.overhang[1]
+  const vertical = axis === 'Y'
+  const sign = params.overhang[0] === '+' ? 1 : -1
+  const bothEnds = params.symmetry?.includes(axis.toLowerCase())
+  const voidMask = passive.void.slice()
+  for (let e = 0; e < nelx * nely; e++) {
+    const [dx, dy] = offset(e)
+    if (Math.hypot(dx, dy) > inner) continue
+    // Offer the action only while the original circular void is still intact.
+    if (!voidMask[e]) return
+    const alongBuild = sign * (vertical ? dy : dx)
+    const height = bothEnds ? Math.abs(alongBuild) : alongBuild
+    const acrossBuild = Math.abs(vertical ? dx : dy)
+    if (height > 0 && acrossBuild + height > inner) voidMask[e] = 0
+  }
+  return { ...passive, void: voidMask }
+}
 
 export function makePreset(
   id: PresetId,
@@ -68,18 +105,16 @@ export function makePreset(
         }],
       }
     case 'bellcrank': {
-      const pivot = [Math.round(nelx * 0.49), Math.round(nely * 0.45)]
+      const { x: pivotX, y: pivotY, inner, outer } = bellcrankPivot(grid)
       const pushrod = [Math.round(nelx * 0.15), Math.round(nely * 0.24)]
       const damper = [Math.round(nelx * 0.82), Math.round(nely * 0.72)]
-      const inner = Math.max(1, nely * 0.11)
-      const outer = inner + Math.max(1.3, nely * 0.065)
       const pad = Math.max(1.5, nely * 0.095)
       const solid = new Uint8Array(nelx * nely)
       const voidMask = new Uint8Array(solid.length)
       for (let y = 0; y < nely; y++) {
         for (let x = 0; x < nelx; x++) {
           const e = y * nelx + x
-          const radius = Math.hypot(x + 0.5 - pivot[0], y + 0.5 - pivot[1])
+          const radius = Math.hypot(x + 0.5 - pivotX, y + 0.5 - pivotY)
           if (radius <= inner) voidMask[e] = 1
           else if (radius <= outer || [pushrod, damper].some(([px, py]) =>
             Math.hypot(x + 0.5 - px, y + 0.5 - py) <= pad)) solid[e] = 1
@@ -89,8 +124,8 @@ export function makePreset(
       const radius = inner + 0.65
       for (let i = 0; i < 24; i++) {
         const angle = i * Math.PI / 12
-        const pin = support(Math.round(pivot[0] + radius * Math.cos(angle)),
-          Math.round(pivot[1] + radius * Math.sin(angle)), 'pin')
+        const pin = support(Math.round(pivotX + radius * Math.cos(angle)),
+          Math.round(pivotY + radius * Math.sin(angle)), 'pin')
         if (!pivotSupports.some(item => item.node === pin.node)) pivotSupports.push(pin)
       }
       // Spread each resultant across a physical pad so refinement preserves the load.

@@ -1,3 +1,4 @@
+import { DiagnosticError } from './diagnostics'
 import earcut from 'earcut'
 import { signedArea, type ContourLoop, type Point2 } from './contour'
 import type { Grid } from './types'
@@ -152,8 +153,10 @@ function triangulate(rings: Point2[][]): Indices[] {
     const repairedOpen = openCapEdges(repaired, points)
     if (repairedOpen && matchesBoundary(repairedOpen)) return repaired
   }
-  throw new Error('Could not triangulate a watertight STL from these contours.')
+  throw new DiagnosticError({ code: 'stlTriangulation' })
 }
+
+export const DEFAULT_STL_THICKNESS_MM = 10
 
 export interface StlMesh {
   triangleCount: number
@@ -161,9 +164,9 @@ export interface StlMesh {
 }
 
 /** Extrude each outer ring and its immediate holes. Nested material islands are separate shells. */
-export function exportStl(loops: readonly ContourLoop[], grid: Grid, thicknessMm = 10): StlMesh {
+export function exportStl(loops: readonly ContourLoop[], grid: Grid, thicknessMm = grid.thicknessMm ?? DEFAULT_STL_THICKNESS_MM): StlMesh {
   const thickness = Math.fround(thicknessMm)
-  if (!(thickness > 0) || !Number.isFinite(thickness)) throw new Error('Extrusion thickness must be finite and positive.')
+  if (!(thickness > 0) || !Number.isFinite(thickness)) throw new DiagnosticError({ code: 'stlThickness' })
   const scale = scaleOf(grid)
   const triangles: Triangle[] = []
   loops.forEach((outer, index) => {
@@ -173,7 +176,7 @@ export function exportStl(loops: readonly ContourLoop[], grid: Grid, thicknessMm
         const ring = removeRedundant(loop.points, scale)
         const area = signedArea(ring)
         if (ring.length < 3 || area === 0 || !Number.isFinite(area)) {
-          throw new Error('A contour is too small for the precision of binary STL.')
+          throw new DiagnosticError({ code: 'stlPrecision' })
         }
         if ((area < 0) !== loop.hole) ring.reverse()
         return ring

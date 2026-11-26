@@ -1,3 +1,4 @@
+import { DiagnosticError } from './diagnostics'
 import type { Grid, PassiveMasks, Symmetry } from './types'
 
 /** Projection onto mirror orbits. Its transpose is the same averaging operation. */
@@ -30,7 +31,7 @@ export class MirrorSymmetry {
       const i = representatives[e]
       solid[i] |= passive.solid?.[e] ?? 0
       voidMask[i] |= passive.void?.[e] ?? 0
-      if (solid[i] && voidMask[i]) throw new Error('Mirror symmetry conflicts with the passive masks.')
+      if (solid[i] && voidMask[i]) throw new DiagnosticError({ code: 'maskConflict' })
     }
     for (let e = 0; e < representatives.length; e++) {
       solid[e] = solid[representatives[e]]

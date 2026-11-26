@@ -8,6 +8,22 @@ afterEach(() => {
   vi.resetModules()
 })
 
+it('sends localized diagnostic data for a rejected volume without a solver frame', async () => {
+  const postMessage = vi.fn<(event: WorkerEvent) => void>()
+  const scope = {
+    onmessage: undefined as ((event: { data: WorkerCommand }) => void) | undefined,
+    postMessage,
+  }
+  vi.stubGlobal('self', scope)
+  await import('../simpWorker')
+  const problem = makePreset('bracket', { nelx: 30, nely: 10 })
+  problem.params = { ...problem.params, volFrac: 0 }
+  scope.onmessage!({ data: { type: 'init', problem } })
+  expect(postMessage).toHaveBeenCalledExactlyOnceWith({
+    type: 'error', diagnostic: { code: 'volumeError', params: { target: 0, min: expect.any(Number), max: expect.any(Number) } },
+  }, [])
+})
+
 it('reports completion when asked to step after the final frame', async () => {
   const postMessage = vi.fn<(event: WorkerEvent) => void>()
   const scope = {

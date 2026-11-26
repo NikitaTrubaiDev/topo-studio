@@ -1,3 +1,4 @@
+import { DiagnosticError } from './diagnostics'
 import { DensityFilter } from './filter'
 import type { SimpProblem } from './types'
 
@@ -6,7 +7,7 @@ type DensityProblem = Pick<SimpProblem, 'grid' | 'params' | 'passive'>
 export function initializeDensity({ grid, params, passive }: DensityProblem) {
   const elements = grid.nelx * grid.nely
   if ([passive?.solid, passive?.void].some(mask => mask && mask.length !== elements)) {
-    throw new Error('Passive masks must contain one entry per element.')
+    throw new DiagnosticError({ code: 'maskSize' })
   }
   const filter = new DensityFilter(grid, params.rmin, passive?.void)
   const mask = new Int8Array(elements)
@@ -14,7 +15,7 @@ export function initializeDensity({ grid, params, passive }: DensityProblem) {
   const volumeAtOutput = new Float64Array(elements)
   let solidCount = 0
   for (let e = 0; e < elements; e++) {
-    if (passive?.solid?.[e] && passive?.void?.[e]) throw new Error('Passive solid and void masks overlap.')
+    if (passive?.solid?.[e] && passive?.void?.[e]) throw new DiagnosticError({ code: 'maskOverlap' })
     if (passive?.solid?.[e]) {
       mask[e] = 1
       design[e] = 1

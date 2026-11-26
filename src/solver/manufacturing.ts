@@ -1,3 +1,4 @@
+import { DiagnosticError, type Diagnostic } from './diagnostics'
 import { initializeDensity, filterPhysicalDensity } from './density'
 import { projectHeaviside } from './filter'
 import { BidirectionalOverhang, OverhangFilter } from './overhang'
@@ -14,13 +15,18 @@ export class ManufacturingDensity {
   readonly passive?: PassiveMasks
   readonly addedAnchors: number
   readonly nonlinear: boolean
+  private readonly targetVolume: number
 
   constructor({ grid, params, passive }: Pick<SimpProblem, 'grid' | 'params' | 'passive'>) {
+    this.targetVolume = params.volFrac
     const size = grid.nelx * grid.nely
     if ([passive?.solid, passive?.void].some(mask => mask && mask.length !== size)) {
-      throw new Error('Passive masks must contain one entry per element.')
+      throw new DiagnosticError({ code: 'maskSize' })
     }
     if (params.symmetry && params.symmetry !== 'none') this.symmetry = new MirrorSymmetry(grid, params.symmetry)
+    if (!this.symmetry && passive?.solid?.some((bit, e) => bit && passive.void?.[e])) {
+      throw new DiagnosticError({ code: 'maskOverlap' })
+    }
     const mirrored = this.symmetry?.masks(passive) ?? passive
     let manufactured = mirrored
     if (params.overhang) {
@@ -29,12 +35,10 @@ export class ManufacturingDensity {
         ? new BidirectionalOverhang(grid, params.overhang) : new OverhangFilter(grid, params.overhang)
       if (mirrored?.solid?.some(Boolean)) {
         const solid = mirrored.solid.slice()
-        if (this.overhang instanceof BidirectionalOverhang) {
-          this.overhang.forward.anchor(mirrored, solid)
-          this.overhang.reverse.anchor(mirrored, solid)
-        } else {
-          this.overhang.anchor(mirrored, solid)
-        }
+        const blocked = this.overhang instanceof BidirectionalOverhang
+          ? [...this.overhang.forward.anchor(mirrored, solid), ...this.overhang.reverse.anchor(mirrored, solid)]
+          : this.overhang.anchor(mirrored, solid)
+        if (blocked.length) throw new DiagnosticError({ code: 'amConflict', params: { cells: [...new Set(blocked)] } })
         manufactured = { solid, void: mirrored.void }
         manufactured = this.symmetry?.masks(manufactured) ?? manufactured
       }
@@ -74,8 +78,21 @@ export class ManufacturingDensity {
     return this.symmetry?.apply(output) ?? output
   }
 
+  initialState() {
+    const target = this.targetVolume
+    const density = new Float64Array(this.setup.design.length)
+    const volumeRange = this.nonlinear
+      ? this.seed(1, target, density)
+      : this.setup.volumeRange
+    if (!this.nonlinear) this.apply(this.setup.design, density, 1, false)
+    const [min, max] = volumeRange
+    const diagnostic: Diagnostic | undefined = target < min - 1e-12 || target > max + 1e-12
+      ? { code: 'volumeError', params: { target, min, max } } : undefined
+    return { density, volumeRange, diagnostic }
+  }
+
   /** Monotone uniform seed that meets the physical volume at the current beta. */
-  seed(beta: number, target: number, output: Float64Array) {
+  private seed(beta: number, target: number, output: Float64Array) {
     const { design, mask } = this.setup
     const evaluate = (value: number) => {
       for (let e = 0; e < design.length; e++) if (!mask[e]) design[e] = value

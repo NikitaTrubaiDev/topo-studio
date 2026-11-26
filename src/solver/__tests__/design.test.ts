@@ -1,5 +1,6 @@
 import { expect, it } from 'vitest'
-import { addLoadCase, editSupport, hasFreeLoad, loadCaseIndex, paintMask, setForce, supportError } from '../design'
+import { addLoadCase, attachmentError, editSupport, hasFreeLoad, loadCaseIndex, paintMask, setForce, supportError } from '../design'
+import { ManufacturingDensity } from '../manufacturing'
 import { makePreset } from '../presets'
 import { Simp2D } from '../simp2d'
 import { nodeIndex } from '../types'
@@ -20,11 +21,38 @@ for (const nelx of [120, 180]) {
   }
 }
 
+it('rejects a cantilever tip load detached by painting void and accepts a restored neighboring cell', () => {
+  const grid = { nelx: 12, nely: 4 }
+  const problem = makePreset('cantilever', grid)
+  const passive = paintMask(grid, problem.passive, 'void', 12, 2, 1)
+  const detached = { ...problem, passive }
+  const diagnostic = { code: 'detachedNodes', params: { nodes: [{ x: 12, y: 2, kind: 'load' }] } }
+  expect(attachmentError(detached, passive?.void)).toEqual(diagnostic)
+  expect(() => new Simp2D(detached)).toThrow(expect.objectContaining({ diagnostic }))
+
+  const restored = paintMask(grid, passive, 'erase', 11.5, 2.5, 0.25)
+  expect(attachmentError({ ...problem, passive: restored }, restored?.void)).toBeUndefined()
+  expect(() => new Simp2D({ ...problem, passive: restored })).not.toThrow()
+})
+
+it('finds detached supports and loads after mirroring the passive void mask', () => {
+  const grid = { nelx: 12, nely: 4 }
+  const problem = makePreset('cantilever', grid)
+  const passive = paintMask(grid, problem.passive, 'void', 0, 2, 1)
+  const mirrored = { ...problem, passive, params: { ...problem.params, symmetry: 'x' as const } }
+  const effective = new ManufacturingDensity(mirrored).passive
+  const diagnostic = attachmentError(mirrored, effective?.void)
+  expect(diagnostic).toEqual({ code: 'detachedNodes', params: { nodes: [
+    { x: 12, y: 2, kind: 'load' }, { x: 0, y: 2, kind: 'support' },
+  ] } })
+  expect(() => new Simp2D(mirrored)).toThrow(expect.objectContaining({ diagnostic }))
+})
+
 it('cycles support kinds and reports a rigid-body mode after the roller is removed', () => {
   const grid = { nelx: 20, nely: 10 }
   const { supports } = makePreset('bridge', grid)
   const pinAlone = editSupport(supports, supports[1].node, 'remove')
-  expect(supportError(grid, pinAlone)).toMatch(/rotation/)
+  expect(supportError(grid, pinAlone)).toEqual({ code: 'unsupportedSupports' })
   const node = nodeIndex(grid, 20, 0)
   const fixed = editSupport(pinAlone, node, 'cycle')
   expect(fixed.at(-1)).toMatchObject({ kind: 'fixed', fixedX: true, fixedY: true })
