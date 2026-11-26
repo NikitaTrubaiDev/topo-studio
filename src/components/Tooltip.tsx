@@ -16,11 +16,14 @@ export function Tooltip({ message, children, info }: {
   const trigger = useRef<HTMLSpanElement>(null)
   const bubble = useRef<HTMLSpanElement>(null)
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
-  const [open, setOpen] = useState(false)
+  const [portal, setPortal] = useState<Element | null>(null)
+  const open = portal !== null
 
   function schedule(next: boolean, delay: number) {
     clearTimeout(timer.current)
-    timer.current = setTimeout(() => setOpen(next), delay)
+    timer.current = setTimeout(() => {
+      setPortal(next ? trigger.current?.closest('dialog[open]') ?? document.body : null)
+    }, delay)
   }
 
   useEffect(() => () => clearTimeout(timer.current), [])
@@ -45,7 +48,7 @@ export function Tooltip({ message, children, info }: {
     function dismiss(event: KeyboardEvent) {
       if (event.key !== 'Escape') return
       clearTimeout(timer.current)
-      setOpen(false)
+      setPortal(null)
     }
     place()
     window.addEventListener('resize', place)
@@ -56,7 +59,7 @@ export function Tooltip({ message, children, info }: {
       window.removeEventListener('scroll', place, true)
       window.removeEventListener('keydown', dismiss)
     }
-  }, [open, description])
+  }, [portal, description])
 
   const content = !info && isValidElement<{ 'aria-describedby'?: string }>(children) && open
     ? cloneElement(children, { 'aria-describedby': id }) : children
@@ -68,7 +71,7 @@ export function Tooltip({ message, children, info }: {
     {content}
     {info && <button className="tooltip-info" type="button" aria-label={t('helpFor').replace('{label}', info)} aria-describedby={open ? id : undefined}
       onPointerEnter={() => schedule(true, 150)} onClick={() => schedule(true, 0)}>?</button>}
-    {open && createPortal(<span id={id} ref={bubble} role="tooltip" className="tooltip-popup"
-      onPointerEnter={() => clearTimeout(timer.current)} onPointerLeave={() => schedule(false, 120)}>{description}</span>, document.body)}
+    {portal && createPortal(<span id={id} ref={bubble} role="tooltip" className="tooltip-popup"
+      onPointerEnter={() => clearTimeout(timer.current)} onPointerLeave={() => schedule(false, 120)}>{description}</span>, portal)}
   </span>
 }

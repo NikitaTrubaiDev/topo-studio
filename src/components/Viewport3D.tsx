@@ -7,7 +7,7 @@ import {
 import { useTranslation } from '../i18n'
 import { cellSize, nodePosition, type Grid3D, type SimpProblem3D } from '../solver3d/types3d'
 import type { Surface3D } from '../solver3d/marchingCubes'
-import { createCamera3D, type CameraMode3D, type QuickView3D } from './camera3d'
+import { createCamera3D, isFitShortcut, type CameraMode3D, type QuickView3D } from './camera3d'
 import { Tooltip } from './Tooltip'
 import type { TimedSnapshot3D } from '../workers/protocol3d'
 
@@ -109,10 +109,8 @@ function setupScene(canvas: HTMLCanvasElement, grid: Grid3D) {
   const resize = () => {
     const { clientWidth: w, clientHeight: h } = canvas
     if (!w || !h) return
-    camera.aspect = w / h
-    camera.updateProjectionMatrix()
     renderer.setSize(w, h, false)
-    render()
+    controls.resize(w / h)
   }
   resize()
   controls.fit('iso')
@@ -149,7 +147,7 @@ function voxelMesh(problem: SimpProblem3D, density: Float64Array, planes: Plane[
   return mesh
 }
 
-function surfaceMesh(problem: SimpProblem3D, surface: Surface3D, planes: Plane[], frame?: TimedSnapshot3D) {
+export function surfaceMesh(problem: SimpProblem3D, surface: Surface3D, planes: Plane[], frame?: TimedSnapshot3D) {
   const geometry = new BufferGeometry()
   geometry.setAttribute('position', new BufferAttribute(Float32Array.from(surface.vertices), 3))
   geometry.setIndex(new BufferAttribute(surface.triangles, 1))
@@ -160,7 +158,7 @@ function surfaceMesh(problem: SimpProblem3D, surface: Surface3D, planes: Plane[]
     const size = cellSize(grid)
     const { vertices } = surface
     const colors = new Float32Array(vertices.length)
-    const peak = frame.p95VonMises || frame.maxVonMises || 1
+    const peak = [frame.p95VonMises, frame.maxVonMises].find(value => Number.isFinite(value) && value > 0) ?? 1
     const color = new Color()
     for (let j = 0; j < vertices.length; j += 3) {
       const cx = MathUtils.clamp(vertices[j] / size[0] - 0.5, 0, nelx - 1)
@@ -172,10 +170,13 @@ function surfaceMesh(problem: SimpProblem3D, surface: Surface3D, planes: Plane[]
         const e = ((Math.min(z + k, nelz - 1) * nely + Math.min(y + l, nely - 1)) * nelx + Math.min(x + m, nelx - 1))
         const w = (k ? cz - z : 1 - cz + z) * (l ? cy - y : 1 - cy + y) * (m ? cx - x : 1 - cx + x)
         const weighted = w * frame.density[e]
-        value += weighted * frame.vonMises[e]
+        const stress = frame.vonMises[e]
+        if (!(weighted > 0 && Number.isFinite(weighted) && Number.isFinite(stress))) continue
+        value += weighted * stress
         weightSum += weighted
       }
-      const scaled = Math.min(1, value / ((weightSum || 1) * peak)) * (stressPalette.length - 1)
+      const ratio = value / (weightSum || 1) / peak
+      const scaled = MathUtils.clamp(Number.isNaN(ratio) ? 0 : ratio, 0, 1) * (stressPalette.length - 1)
       const index = Math.min(stressPalette.length - 2, Math.floor(scaled))
       color.copy(stressPalette[index]).lerp(stressPalette[index + 1], scaled - index).toArray(colors, j)
     }
@@ -220,10 +221,7 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
       return
     }
     function shortcut(event: KeyboardEvent) {
-      const target = event.target
-      if (event.key.toLowerCase() !== 'f' || event.ctrlKey || event.metaKey || event.altKey ||
-        (target instanceof HTMLElement && target.closest('input, select, textarea, [contenteditable], dialog'))) return
-      current.controls.fit()
+      if (isFitShortcut(event)) current.controls.fit()
     }
     window.addEventListener('keydown', shortcut)
     return () => {

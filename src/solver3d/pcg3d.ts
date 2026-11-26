@@ -1,6 +1,9 @@
 import { h8Corners } from './elementH8'
 import { elementCount, nodeCount, nodeIndex3D, type Grid3D, type Support3D } from './types3d'
 
+const maxRestarts = 4
+const stallIterations = 256
+
 export function fixedDofs3D(grid: Grid3D, supports: readonly Support3D[]) {
   const fixed = new Uint8Array(3 * nodeCount(grid))
   for (const { node, fixX, fixY, fixZ } of supports) {
@@ -26,6 +29,7 @@ export class Pcg3D {
   private readonly residual: Float64Array
   private readonly direction: Float64Array
   private readonly product: Float64Array
+  private readonly trial: Float64Array
   private readonly elementVector = new Float64Array(24)
 
   constructor(grid: Grid3D, readonly Ke: Float64Array, readonly fixed: Uint8Array) {
@@ -37,6 +41,7 @@ export class Pcg3D {
     this.residual = new Float64Array(fixed.length)
     this.direction = new Float64Array(fixed.length)
     this.product = new Float64Array(fixed.length)
+    this.trial = new Float64Array(fixed.length)
     let e = 0
     for (let z = 0; z < grid.nelz; z++) for (let y = 0; y < grid.nely; y++) for (let x = 0; x < grid.nelx; x++, e++) {
       h8Corners.forEach(([dx, dy, dz], k) => {
@@ -82,7 +87,7 @@ export class Pcg3D {
 
   /** u holds the previous solution on entry and the solution in mm on exit. */
   solve(force: Float64Array, u: Float64Array, tolerance = 1e-6, maxIterations = 4000) {
-    const { fixed, rhs, residual, direction, product, inverseDiagonal } = this
+    const { fixed, rhs, residual, direction, product, inverseDiagonal, trial } = this
     let scale = 0
     for (let j = 0; j < fixed.length; j++) if (!fixed[j]) scale = Math.max(scale, Math.abs(force[j]))
     if (scale === 0) {
@@ -93,44 +98,65 @@ export class Pcg3D {
       rhs[j] = fixed[j] ? 0 : force[j] / scale
       u[j] = fixed[j] ? 0 : u[j] / scale
     }
-    this.apply(u, product)
+    if (u.some(value => !Number.isFinite(value))) u.fill(0)
     let energy = 0
-    for (let j = 0; j < u.length; j++) {
-      residual[j] = rhs[j] - product[j]
-      direction[j] = inverseDiagonal[j] * residual[j]
-      energy += residual[j] * direction[j]
+    const refresh = () => {
+      this.apply(u, product)
+      energy = 0
+      for (let j = 0; j < u.length; j++) {
+        residual[j] = rhs[j] - product[j]
+        direction[j] = inverseDiagonal[j] * residual[j]
+        energy += residual[j] * direction[j]
+      }
+      return dot(residual, residual)
     }
     const normSquared = dot(rhs, rhs)
-    let errorSquared = dot(residual, residual)
+    let errorSquared = refresh(), bestError = errorSquared
     let iterations = 0
+    let lastProgress = 0, restarts = 0
     const target = normSquared * tolerance ** 2
-    while (errorSquared > target && iterations < maxIterations) {
+    while (Number.isFinite(errorSquared) && errorSquared > target && iterations < maxIterations) {
       this.apply(direction, product)
-      const curvature = dot(direction, product)
-      if (!(curvature > 0) || !Number.isFinite(energy)) break
-      const alpha = energy / curvature
-      let nextEnergy = 0
-      errorSquared = 0
-      for (let j = 0; j < u.length; j++) {
-        u[j] += alpha * direction[j]
-        const r = residual[j] - alpha * product[j]
-        residual[j] = r
-        errorSquared += r * r
-        nextEnergy += r * r * inverseDiagonal[j]
-      }
       iterations++
-      if (errorSquared <= target) break
-      const beta = nextEnergy / energy
-      for (let j = 0; j < u.length; j++) direction[j] = inverseDiagonal[j] * residual[j] + beta * direction[j]
-      energy = nextEnergy
+      const curvature = dot(direction, product)
+      const alpha = energy / curvature
+      let breakdown = !(alpha > 0 && Number.isFinite(alpha) && curvature > 0)
+      if (!breakdown) {
+        let nextEnergy = 0
+        errorSquared = 0
+        for (let j = 0; j < u.length; j++) {
+          trial[j] = u[j] + alpha * direction[j]
+          const r = residual[j] - alpha * product[j]
+          residual[j] = r
+          errorSquared += r * r
+          nextEnergy += r * r * inverseDiagonal[j]
+          if (!Number.isFinite(trial[j])) breakdown = true
+        }
+        breakdown ||= !Number.isFinite(errorSquared) || !Number.isFinite(nextEnergy)
+        if (!breakdown) {
+          u.set(trial)
+          const beta = nextEnergy / energy
+          for (let j = 0; j < u.length; j++) direction[j] = inverseDiagonal[j] * residual[j] + beta * direction[j]
+          energy = nextEnergy
+        }
+      }
+      if (errorSquared < 0.99 * bestError) {
+        bestError = errorSquared
+        lastProgress = iterations
+      }
+      const stalled = iterations - lastProgress >= stallIterations
+      // An apparently converged recurrence can drift from the true equilibrium residual.
+      if (breakdown || errorSquared <= target || (stalled && restarts < maxRestarts)) {
+        if (restarts >= maxRestarts || iterations >= maxIterations) break
+        bestError = errorSquared = refresh()
+        lastProgress = iterations
+        restarts++
+      }
     }
     // Check the true residual before returning a warm start to subsequent iterations.
-    this.apply(u, product)
-    errorSquared = 0
-    for (let j = 0; j < u.length; j++) {
-      errorSquared += (rhs[j] - product[j]) ** 2
-      u[j] = fixed[j] ? 0 : u[j] * scale
-    }
-    return { converged: errorSquared <= target, iterations, relativeResidual: Math.sqrt(errorSquared / normSquared) }
+    errorSquared = refresh()
+    for (let j = 0; j < u.length; j++) u[j] = fixed[j] ? 0 : u[j] * scale
+    const finite = u.every(Number.isFinite)
+    return { converged: finite && errorSquared <= target, iterations, relativeResidual: Math.sqrt(errorSquared / normSquared) }
   }
 }

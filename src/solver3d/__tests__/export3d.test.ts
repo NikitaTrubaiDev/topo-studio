@@ -1,6 +1,8 @@
 import { expect, it } from 'vitest'
 import { exportObj3D, exportStl3D, isWatertight } from '../export3d'
-import { marchingCubes, taubinSmooth, triangleNormal } from '../marchingCubes'
+import { extractSurface3D, marchingCubes, taubinSmooth, triangleNormal, vertexNormals, type Surface3D } from '../marchingCubes'
+import { makePreset3D, presetGrid3D, resolutions3D } from '../presets3d'
+import { Simp3D } from '../simp3d'
 import { elementCount, elementIndex, type Grid3D } from '../types3d'
 
 const grid: Grid3D = { nelx: 12, nely: 12, nelz: 12, widthMm: 30, heightMm: 30, depthMm: 30 }
@@ -41,7 +43,9 @@ it.each(['block', 'sphere'] as const)('closes a padded %s and exports valid STL 
   }
   const obj = exportObj3D(surface)
   expect(obj.match(/^v /gm)).toHaveLength(surface.vertices.length / 3)
-  expect(obj.match(/^vn /gm)).toHaveLength(surface.vertices.length / 3)
+  const normals = obj.match(/^vn .*$/gm)!
+  expect(normals).toHaveLength(surface.vertices.length / 3)
+  for (const normal of normals) expect(Math.hypot(...normal.slice(3).split(' ').map(Number))).toBeCloseTo(1, 10)
   expect(obj.match(/^f \d+\/\/\d+ \d+\/\/\d+ \d+\/\/\d+$/gm)).toHaveLength(count)
 })
 
@@ -61,4 +65,87 @@ it('refuses open surfaces and empty exports', () => {
   expect(mesh.triangles).toHaveLength(0)
   expect(() => exportStl3D(mesh)).toThrow(/watertight/)
   expect(() => exportObj3D(mesh)).toThrow(/watertight/)
+})
+
+function reverse({ vertices, triangles }: Surface3D) {
+  return { vertices, triangles: triangles.map((index, i) => i % 3 === 0 ? index : triangles[i + (i % 3 === 1 ? 1 : -1)]) }
+}
+
+it('rejects an inverted outer shell even beside a larger outward shell', () => {
+  const outer = marchingCubes(new Float64Array(elementCount(grid)).fill(1), grid)
+  expect(() => exportStl3D(reverse(outer))).toThrow(/watertight/)
+  const smallGrid = { nelx: 1, nely: 1, nelz: 1, widthMm: 1, heightMm: 1, depthMm: 1 }
+  const flipped = reverse(marchingCubes(Float64Array.of(1), smallGrid))
+  const vertices = Float64Array.from([...outer.vertices, ...flipped.vertices.map(value => value + 40)])
+  const triangles = Uint32Array.from([...outer.triangles, ...flipped.triangles.map(value => value + outer.vertices.length / 3)])
+  expect(isWatertight({ vertices, triangles }, true)).toBe(false)
+})
+
+it('accepts inward cavity walls and outward material islands nested inside them', () => {
+  const density = new Float64Array(elementCount(grid)).fill(1)
+  for (let z = 3; z < 9; z++) for (let y = 3; y < 9; y++) for (let x = 3; x < 9; x++) {
+    density[elementIndex(grid, x, y, z)] = Number([x, y, z].every(value => value >= 5 && value <= 6))
+  }
+  const surface = extractSurface3D(density, grid)
+  expect(isWatertight(surface, true)).toBe(true)
+  expect(() => exportStl3D(reverse(surface))).toThrow(/watertight/)
+})
+
+it('uses an incident facet normal when the area-weighted vertex normals cancel', () => {
+  const mesh = { vertices: Float64Array.of(0, 0, 0, 1, 0, 0, 0, 1, 0, -2, 0, 0, 0, 0.5, 0, 0, 0, 1),
+    triangles: Uint32Array.of(0, 1, 2, 0, 3, 4) }
+  const normals = vertexNormals(mesh)
+  expect(Array.from(normals.slice(0, 3))).toEqual([0, 0, 1])
+  expect(Array.from(normals.slice(-3))).toEqual([0, 0, 1])
+})
+
+it('preserves more than 95% of a one-cell strut volume and caps smoothing at 12 passes', () => {
+  const strutGrid = { nelx: 14, nely: 3, nelz: 3, widthMm: 14, heightMm: 3, depthMm: 3 }
+  const density = new Float64Array(elementCount(strutGrid))
+  for (let x = 1; x <= 12; x++) density[elementIndex(strutGrid, x, 1, 1)] = 1
+  const raw = marchingCubes(density, strutGrid)
+  function volume({ vertices, triangles }: Surface3D) {
+    let result = 0
+    for (let i = 0; i < triangles.length; i += 3) {
+      const normal = triangleNormal(vertices, triangles[i], triangles[i + 1], triangles[i + 2])
+      result += normal.reduce((sum, value, d) => sum + value * vertices[3 * triangles[i] + d], 0) / 6
+    }
+    return result
+  }
+  const standard = extractSurface3D(density, strutGrid)
+  const maximum = taubinSmooth(raw, strutGrid, 12)
+  for (const mesh of [standard, maximum]) {
+    expect(volume(mesh) / volume(raw)).toBeGreaterThan(0.95)
+    expect(isWatertight(mesh, true)).toBe(true)
+  }
+  expect(taubinSmooth(raw, strutGrid, 50).vertices).toEqual(maximum.vertices)
+})
+
+it('preserves the inside diameter of all four prescribed bolt bores at 12 passes', () => {
+  const bracketGrid = presetGrid3D(resolutions3D[0])
+  const problem = makePreset3D('boltBracket3d', bracketGrid)
+  const density = new Simp3D(problem).initialDensity()
+  const raw = marchingCubes(density, bracketGrid)
+  const smooth = extractSurface3D(density, bracketGrid, 0.5, 12, problem.passive)
+  function boreDiameter({ vertices, triangles }: Surface3D, x: number, y: number, centerZ: number) {
+    const crossings = []
+    for (let i = 0; i < triangles.length; i += 3) {
+      const [a, b, c] = Array.from(triangles.subarray(i, i + 3), vertex => 3 * vertex)
+      const ux = vertices[b] - vertices[a], uy = vertices[b + 1] - vertices[a + 1]
+      const vx = vertices[c] - vertices[a], vy = vertices[c + 1] - vertices[a + 1]
+      const determinant = ux * vy - uy * vx
+      if (determinant === 0) continue
+      const dx = x - vertices[a], dy = y - vertices[a + 1]
+      const u = (dx * vy - dy * vx) / determinant, v = (ux * dy - uy * dx) / determinant
+      if (u < 0 || v < 0 || u + v > 1) continue
+      const z = vertices[a + 2] + u * (vertices[b + 2] - vertices[a + 2]) + v * (vertices[c + 2] - vertices[a + 2])
+      if (Math.abs(z - centerZ) < 6) crossings.push(z)
+    }
+    expect(crossings).toHaveLength(2)
+    return Math.max(...crossings) - Math.min(...crossings)
+  }
+  for (const y of [15, 45]) for (const z of [10, 30]) {
+    expect(boreDiameter(raw, 6.25, y - 0.25, z)).toBeCloseTo(10, 10)
+    expect(boreDiameter(smooth, 6.25, y - 0.25, z)).toBeCloseTo(10, 10)
+  }
 })

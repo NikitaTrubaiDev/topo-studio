@@ -48,3 +48,22 @@ it('transfers frames and preserves warm state across step, pause, and resume unt
   send({ type: 'step' })
   expect(events.at(-2)).toMatchObject({ type: 'frame', snapshot: { iteration: 1 } })
 })
+
+it('reports the final true relative residual when PCG fails', async () => {
+  const scope = {
+    onmessage: undefined as ((event: { data: WorkerCommand3D }) => void) | undefined,
+    postMessage: vi.fn<(event: WorkerEvent3D) => void>(),
+  }
+  vi.stubGlobal('self', scope)
+  const { Pcg3D } = await import('../../solver3d/pcg3d')
+  const solve = vi.spyOn(Pcg3D.prototype, 'solve').mockReturnValue({ converged: false, iterations: 4000, relativeResidual: 0.0125 })
+  try {
+    await import('../simp3dWorker')
+    const problem = makePreset3D('cantilever3d', presetGrid3D([6, 4, 4]))
+    scope.onmessage!({ data: { type: 'init', problem } })
+    scope.onmessage!({ data: { type: 'step' } })
+    expect(scope.postMessage.mock.calls[0][0]).toEqual({ type: 'error', issue: 'solve3dError', relativeResidual: 0.0125 })
+  } finally {
+    solve.mockRestore()
+  }
+})

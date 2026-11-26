@@ -1,11 +1,12 @@
-import { expect, it } from 'vitest'
+import { expect, it, vi } from 'vitest'
 import { elasticity3D, h8Corners, h8Stiffness, strainDisplacementH8 } from '../elementH8'
 import { DensityFilter3D, projectDensity3D } from '../filter3d'
 import { isWatertight } from '../export3d'
 import { marchingCubes, taubinSmooth } from '../marchingCubes'
+import { Pcg3D } from '../pcg3d'
 import { defaultParams3D, makePreset3D, presetGrid3D, presets3D, resolutions3D } from '../presets3d'
 import { Analysis3D, Simp3D, validateProblem3D } from '../simp3d'
-import { elementCount, elementIndex, nodeIndex3D, nodePosition } from '../types3d'
+import { elementCount, elementIndex, nodeCount, nodeIndex3D, nodePosition } from '../types3d'
 import { dictionaries, languages } from '../../i18n/dictionaries'
 
 const relative = (actual: number, expected: number) => Math.abs(actual / expected - 1)
@@ -83,6 +84,75 @@ it('normalizes the spherical filter and excludes passive voids from both passes'
   const result = filter.apply(field, new Float64Array(n))
   for (let e = 0; e < n; e++) expect(result[e]).toBeCloseTo(e === 5 ? 0 : 1, 14)
   expect(filter.transpose(result, new Float64Array(n))[5]).toBe(0)
+})
+
+it('assigns equal cone weights at equal physical distances on a 3:1 grid', () => {
+  const grid = { nelx: 3, nely: 7, nelz: 7, widthMm: 9, heightMm: 7, depthMm: 7 }
+  const impulse = new Float64Array(elementCount(grid))
+  impulse[elementIndex(grid, 1, 3, 3)] = 1
+  const weights = new DensityFilter3D(grid, 4).transpose(impulse, new Float64Array(impulse.length))
+  const weight = (x: number, y: number, z: number) => weights[elementIndex(grid, x, y, z)]
+  expect(weight(2, 3, 3)).toBeGreaterThan(0)
+  expect(weight(2, 3, 3)).toBe(weight(1, 6, 3))
+  expect(weight(2, 3, 3)).toBe(weight(1, 3, 6))
+  expect(weight(1, 3, 3) / weight(2, 3, 3)).toBe(4)
+})
+
+it('accepts 4:1 H8 cells and rejects stretched cells with a structured diagnostic', () => {
+  const grid = { nelx: 12, nely: 4, nelz: 4, widthMm: 48, heightMm: 8, depthMm: 4 }
+  expect(() => validateProblem3D(makePreset3D('cantilever3d', grid))).not.toThrow()
+  for (const stretched of [{ ...grid, widthMm: 48.01 }, { ...grid, widthMm: 10_000, heightMm: 1, depthMm: 1 }]) {
+    expect(() => validateProblem3D(makePreset3D('cantilever3d', stretched))).toThrow(expect.objectContaining({ code: 'aspectRatio3dError' }))
+  }
+})
+
+it('restarts from the finite iterate when apparent PCG convergence fails the true residual check', () => {
+  const grid = presetGrid3D([1, 1, 1])
+  const ke = new Float64Array(24 * 24)
+  for (let j = 0; j < 24; j++) ke[25 * j] = 1
+  const pcg = new Pcg3D(grid, ke, new Uint8Array(24))
+  pcg.prepare(Float64Array.of(1), 1, 1, 3)
+  const force = new Float64Array(24).fill(1)
+  const u = new Float64Array(24)
+  const apply = pcg.apply.bind(pcg)
+  function driftOnce() {
+    let calls = 0
+    pcg.apply = (input, output) => {
+      apply(input, output)
+      if (++calls === 2) for (let j = 0; j < output.length; j++) output[j] *= 2
+    }
+  }
+  driftOnce()
+  expect(pcg.solve(force, u, 1e-10, 1)).toEqual({ converged: false, iterations: 1, relativeResidual: 0.5 })
+  expect(u.every(value => value === 0.5)).toBe(true)
+  u.fill(0)
+  driftOnce()
+  expect(pcg.solve(force, u, 1e-10, 2)).toEqual({ converged: true, iterations: 2, relativeResidual: 0 })
+  expect(u).toEqual(force)
+})
+
+it('includes material-bearing and loaded nodes in deflection while excluding floating near-void nodes', () => {
+  const grid = presetGrid3D([6, 4, 4])
+  const problem = makePreset3D('cantilever3d', grid)
+  const { fixed, forces } = validateProblem3D(problem)
+  const density = new Float64Array(elementCount(grid)).fill(0.001)
+  const loaded = problem.loadCases[0].forces[0].node
+  const material = nodeIndex3D(grid, 1, 1, 1), floating = nodeCount(grid) - 1
+  density[0] = 0.25
+  const solve = vi.spyOn(Pcg3D.prototype, 'solve').mockImplementation((_force, u) => {
+    u[3 * material] = 3
+    u[3 * loaded] = 2
+    u[3 * floating] = 99
+    return { converged: true, iterations: 1, relativeResidual: 0 }
+  })
+  try {
+    const analysis = new Analysis3D(problem, fixed, forces)
+    expect(analysis.solve(density, 3, 1e-6).maxDeflection).toBe(3)
+    density[0] = 0.249
+    expect(analysis.solve(density, 3, 1e-6).maxDeflection).toBe(2)
+  } finally {
+    solve.mockRestore()
+  }
 })
 
 it('backpropagates compliance and volume through projection and the cone with finite-difference accuracy', () => {

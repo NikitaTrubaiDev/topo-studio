@@ -28,7 +28,10 @@ function reset() {
 
 function report(error: unknown) {
   reset()
-  send({ type: 'error', issue: error instanceof ProblemError3D ? error.code : 'workerError' })
+  if (error instanceof ProblemError3D) {
+    const { code, relativeResidual } = error
+    send({ type: 'error', issue: code, ...(relativeResidual !== undefined && { relativeResidual }) })
+  } else send({ type: 'error', issue: 'workerError' })
 }
 
 function iterate() {

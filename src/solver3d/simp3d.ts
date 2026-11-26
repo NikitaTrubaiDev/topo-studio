@@ -2,7 +2,7 @@ import { elasticity3D, h8Corners, h8Stiffness, strainDisplacementH8, vonMises3D 
 import { DensityFilter3D, projectDensity3D } from './filter3d'
 import { fixedDofs3D, Pcg3D } from './pcg3d'
 import {
-  cellSize, elementCount, elementIndex, nodeCount, nodeIndex3D, nodePosition, ProblemError3D,
+  cellSize, elementCount, elementIndex, maxCellAspectRatio3D, nodeCount, nodeIndex3D, nodePosition, ProblemError3D,
   type Grid3D, type SimpProblem3D, type Snapshot3D,
 } from './types3d'
 
@@ -42,6 +42,8 @@ export function validateProblem3D(problem: SimpProblem3D) {
     || params.volFrac > 1 || params.moveLimit > 1 || !['none', 'y', 'z', 'yz'].includes(params.symmetry ?? 'none')) {
     throw new ProblemError3D('settings3dError')
   }
+  const size = cellSize(grid)
+  if (Math.max(...size) / Math.min(...size) > maxCellAspectRatio3D) throw new ProblemError3D('aspectRatio3dError')
   if ((passive?.void && passive.void.length !== count) || (passive?.solid && passive.solid.length !== count)) {
     throw new ProblemError3D('mask3dError')
   }
@@ -104,6 +106,8 @@ export class Analysis3D {
   private readonly D: Float64Array
   private readonly stress = new Float64Array(6)
   private readonly strain = new Float64Array(6)
+  private readonly loadedNodes: Uint8Array
+  private readonly displacementNodes: Uint8Array
   readonly displacements: Float64Array[]
   readonly vonMises: Float64Array
   readonly gradient: Float64Array
@@ -114,23 +118,34 @@ export class Analysis3D {
     this.B = strainDisplacementH8(...size)
     this.D = elasticity3D(1, problem.material.nu)
     this.displacements = forces.map(force => new Float64Array(force.length))
+    this.loadedNodes = new Uint8Array(fixed.length / 3)
+    for (const force of forces) for (let d = 0; d < force.length; d += 3) {
+      if (force[d] || force[d + 1] || force[d + 2]) this.loadedNodes[d / 3] = 1
+    }
+    this.displacementNodes = this.loadedNodes.slice()
     this.vonMises = new Float64Array(elementCount(problem.grid))
     this.gradient = new Float64Array(this.vonMises.length)
   }
 
   solve(density: Float64Array, penal: number, tolerance: number) {
-    const { pcg, B, D, stress, strain, vonMises, gradient } = this
+    const { pcg, B, D, stress, strain, vonMises, gradient, displacementNodes } = this
     const { E0, Emin } = this.problem.material
     pcg.prepare(density, E0, Emin, penal)
+    displacementNodes.set(this.loadedNodes)
+    for (let e = 0, offset = 0; e < density.length; e++, offset += 24) {
+      if (density[e] < 0.25) continue
+      for (let j = 0; j < 24; j += 3) displacementNodes[pcg.dofs[offset + j] / 3] = 1
+    }
     let compliance = 0, maxDeflection = 0
     gradient.fill(0)
     vonMises.fill(0)
     for (let c = 0; c < this.forces.length; c++) {
       const force = this.forces[c], u = this.displacements[c]
-      if (!pcg.solve(force, u, tolerance).converged) throw new ProblemError3D('solve3dError')
+      const result = pcg.solve(force, u, tolerance)
+      if (!result.converged) throw new ProblemError3D('solve3dError', result.relativeResidual)
       for (let d = 0; d < u.length; d += 3) {
         compliance += force[d] * u[d] + force[d + 1] * u[d + 1] + force[d + 2] * u[d + 2]
-        maxDeflection = Math.max(maxDeflection, Math.hypot(u[d], u[d + 1], u[d + 2]))
+        if (displacementNodes[d / 3]) maxDeflection = Math.max(maxDeflection, Math.hypot(u[d], u[d + 1], u[d + 2]))
       }
       for (let e = 0, offset = 0; e < density.length; e++, offset += 24) {
         let energy = 0
@@ -216,6 +231,10 @@ export class Simp3D {
   initialDensity() {
     this.density(this.design, this.physical)
     return this.physical.slice()
+  }
+
+  get passiveMasks() {
+    return { solid: this.setup.solid, void: this.setup.voidMask }
   }
 
   private update(gradient: Float64Array) {

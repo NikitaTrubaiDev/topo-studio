@@ -3,6 +3,11 @@ import { MathUtils, PerspectiveCamera, Spherical, Vector3 } from 'three'
 export type CameraMode3D = 'nx' | 'standard'
 export type QuickView3D = 'iso' | 'front' | 'top' | 'right' | 'fit'
 
+export function isFitShortcut(event: KeyboardEvent) {
+  return (event.code === 'KeyF' || event.key.toLowerCase() === 'f') && !event.ctrlKey && !event.metaKey && !event.altKey &&
+    !(event.target instanceof HTMLElement && event.target.closest('input, select, textarea, [contenteditable], dialog'))
+}
+
 export function cameraGesture(mode: CameraMode3D, button: number, shift: boolean, ctrl: boolean, touch = false) {
   if (touch) return 'orbit'
   if (mode === 'nx') {
@@ -19,6 +24,7 @@ export function createCamera3D(canvas: HTMLCanvasElement, camera: PerspectiveCam
   const offset = new Vector3(), right = new Vector3(), up = new Vector3()
   const spherical = new Spherical()
   let mode: CameraMode3D = 'nx'
+  let isFitted = false
   let drag: { id: number; x: number; y: number; gesture: NonNullable<ReturnType<typeof cameraGesture>> } | undefined
 
   function zoom(factor: number) {
@@ -36,10 +42,23 @@ export function createCamera3D(canvas: HTMLCanvasElement, camera: PerspectiveCam
     if (view !== 'fit') camera.up.set(0, view === 'top' ? 0 : 1, view === 'top' ? -1 : 0)
     const vertical = MathUtils.degToRad(camera.fov) / 2
     const angle = Math.min(vertical, Math.atan(Math.tan(vertical) * camera.aspect))
+    const distance = 0.56 * span / Math.sin(angle)
+    if (distance + span > camera.far) {
+      camera.far = distance + span
+      camera.updateProjectionMatrix()
+    }
     target.copy(center)
-    camera.position.copy(target).add(offset.setLength(0.56 * span / Math.sin(angle)))
+    camera.position.copy(target).add(offset.setLength(distance))
     camera.lookAt(target)
+    isFitted = true
     draw()
+  }
+
+  function resize(aspect: number) {
+    camera.aspect = aspect
+    camera.updateProjectionMatrix()
+    if (isFitted) fit()
+    else draw()
   }
 
   function down(event: PointerEvent) {
@@ -57,6 +76,8 @@ export function createCamera3D(canvas: HTMLCanvasElement, camera: PerspectiveCam
     const dx = event.clientX - drag.x, dy = event.clientY - drag.y
     drag.x = event.clientX
     drag.y = event.clientY
+    if (!dy && (!dx || drag.gesture === 'zoom')) return
+    isFitted = false
     const height = Math.max(1, canvas.clientHeight)
     if (drag.gesture === 'zoom') zoom(Math.exp(dy * 0.012))
     else if (drag.gesture === 'orbit') {
@@ -87,6 +108,8 @@ export function createCamera3D(canvas: HTMLCanvasElement, camera: PerspectiveCam
 
   function wheel(event: WheelEvent) {
     event.preventDefault()
+    if (!event.deltaY) return
+    isFitted = false
     const units = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? canvas.clientHeight : 1
     zoom(Math.exp(MathUtils.clamp(event.deltaY * units * 0.0015, -1, 1)))
     draw()
@@ -105,7 +128,7 @@ export function createCamera3D(canvas: HTMLCanvasElement, camera: PerspectiveCam
   canvas.addEventListener('contextmenu', suppress)
 
   return {
-    fit,
+    fit, resize,
     setMode(value: CameraMode3D) { mode = value; canvas.dataset.camera = value },
     dispose() {
       canvas.removeEventListener('pointerdown', down)

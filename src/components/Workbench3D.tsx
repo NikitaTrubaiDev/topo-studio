@@ -3,10 +3,10 @@ import { useTranslation } from '../i18n'
 import { materials } from '../solver/presets'
 import type { MaterialId } from '../solver/project'
 import { exportObj3D, exportStl3D, isWatertight } from '../solver3d/export3d'
-import { marchingCubes, taubinSmooth, type Surface3D } from '../solver3d/marchingCubes'
+import { extractSurface3D, maxSmoothingPasses3D, type Surface3D } from '../solver3d/marchingCubes'
 import { defaultParams3D, makePreset3D, presetGrid3D, presets3D, resolutions3D, type Preset3D } from '../solver3d/presets3d'
 import { Simp3D } from '../solver3d/simp3d'
-import { ProblemError3D, elementCount, type Grid3D, type ProblemIssue3D, type SimpParams3D, type Symmetry3D } from '../solver3d/types3d'
+import { ProblemError3D, cellSize, elementCount, maxCellAspectRatio3D, type Grid3D, type ProblemIssue3D, type SimpParams3D, type Symmetry3D } from '../solver3d/types3d'
 import type { TimedSnapshot3D, WorkerCommand3D, WorkerEvent3D } from '../workers/protocol3d'
 import { ConvergenceChart, type Sample } from './ConvergenceChart'
 import { download } from './ExportDialog'
@@ -21,12 +21,15 @@ const symmetry = { none: 'none', y: 'mirrorY', z: 'mirrorZ3d', yz: 'mirrorYZ3d' 
 const materialIds = Object.keys(materials) as MaterialId[]
 const sliders = [
   ['volFrac', 'volumeFraction', 'tipVolumeFraction', 0.02, 1, 0.01],
-  ['rmin', 'radius', 'tipRadius', 1, 4, 0.1],
+  ['rmin', 'radius', 'hint3dRadius', 1, 4, 0.1],
   ['penal', 'simpPenalty', 'tipSimpPenalty', 1, 5, 0.1],
   ['moveLimit', 'moveLimit3d', 'hint3dMoveLimit', 0.01, 0.35, 0.01],
   ['maxIter', 'maxIter3d', 'hint3dMaxIter', 1, 250, 1],
   ['changeTol', 'changeTol3d', 'hint3dChangeTol', 0, 0.05, 0.001],
 ] as const
+
+const incompatibleSymmetry = (preset: Preset3D, value?: Symmetry3D) =>
+  preset === 'lBracket3d' && (value === 'y' || value === 'yz')
 
 function LabeledControl({ id, name, tip, children }: { id: string; name: string; tip: TooltipMessage; children: ReactNode }) {
   return <div className="field-3d">
@@ -75,7 +78,7 @@ function SurfaceDialog({ surface, settings, change, close }: {
       <Tooltip message="hint3dTaubin" info={t('smoothing')}><label htmlFor="taubin-3d">{t('smoothing')}</label></Tooltip>
       <output>{number(settings.smoothing)}</output>
     </div>
-    <input id="taubin-3d" type="range" min={0} max={12} value={settings.smoothing}
+    <input id="taubin-3d" type="range" min={0} max={maxSmoothingPasses3D} value={settings.smoothing}
       onChange={event => adjust({ ...settings, smoothing: event.target.valueAsNumber })} />
     <p className="contour-summary" aria-live="polite">{t('meshSummary3d')
       .replace('{vertices}', number((surface?.vertices.length ?? 0) / 3)).replace('{triangles}', number(triangles))}</p>
@@ -98,7 +101,7 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
   const [state, setState] = useState<RunState>('ready')
   const [frame, setFrame] = useState<TimedSnapshot3D>()
   const [samples, setSamples] = useState<Sample[]>([])
-  const [error, setError] = useState<ProblemIssue3D | 'workerError'>()
+  const [error, setError] = useState<{ issue: ProblemIssue3D | 'workerError'; relativeResidual?: number }>()
   const [mode, setMode] = useState<ViewMode3D>('auto')
   const [exportOpen, setExportOpen] = useState(false)
   const [settings, setSettings] = useState<SurfaceSettings>({ threshold: 0.5, smoothing: 4 })
@@ -107,19 +110,20 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
   const problem = useMemo(() => makePreset3D(preset, grid, params, materials[material]), [preset, grid, params, material])
   const preview = useMemo(() => {
     try {
-      return { density: new Simp3D(problem).initialDensity() }
+      const solver = new Simp3D(problem)
+      return { density: solver.initialDensity(), passive: solver.passiveMasks }
     } catch (cause) {
       return { density: Float64Array.from({ length: elementCount(problem.grid) }, (_, e) =>
         problem.passive?.void?.[e] ? 0 : problem.passive?.solid?.[e] ? 1 : problem.params.volFrac),
-      issue: cause instanceof ProblemError3D ? cause.code : 'workerError' as const }
+      passive: problem.passive, issue: cause instanceof ProblemError3D ? cause.code : 'workerError' as const }
     }
   }, [problem])
   const density = frame?.density ?? preview.density
   const view = mode === 'auto' ? frame && (state === 'paused' || state === 'complete') ? 'cad' : 'voxels' : mode
   const buildSurface = active && (view !== 'voxels' || exportOpen)
   const surface = useMemo(() => buildSurface
-    ? taubinSmooth(marchingCubes(density, problem.grid, settings.threshold), problem.grid, settings.smoothing)
-    : undefined, [density, problem.grid, settings, buildSurface])
+    ? extractSurface3D(density, problem.grid, settings.threshold, settings.smoothing, preview.passive)
+    : undefined, [density, problem.grid, settings, buildSurface, preview.passive])
 
   useEffect(() => () => {
     worker.current?.terminate()
@@ -151,6 +155,12 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
     setParams(current => ({ ...current, [key]: value }))
   }
 
+  function selectPreset(next: Preset3D) {
+    reset()
+    setPreset(next)
+    setParams(current => incompatibleSymmetry(next, current.symmetry) ? { ...current, symmetry: 'none' } : current)
+  }
+
   function send(type: 'start' | 'pause' | 'step') {
     try {
       if (!worker.current) {
@@ -171,14 +181,14 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
             setState('complete')
             stopWorker()
           } else {
-            setError(data.issue)
+            setError(data)
             setState('error')
             stopWorker()
           }
         }
         instance.onerror = () => {
           if (instance !== worker.current) return
-          setError('workerError')
+          setError({ issue: 'workerError' })
           setState('error')
           stopWorker()
         }
@@ -187,13 +197,16 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
       setState(type === 'start' ? 'running' : type === 'pause' ? 'pausing' : 'stepping')
       worker.current.postMessage({ type } satisfies WorkerCommand3D)
     } catch {
-      setError('workerError')
+      setError({ issue: 'workerError' })
       setState('error')
       stopWorker()
     }
   }
 
   const canRun = !preview.issue && (state === 'ready' || state === 'paused')
+  const issue = preview.issue ?? error?.issue
+  const issueText = issue && t(issue).replace('{limit}', number(maxCellAspectRatio3D))
+  const filterRadiusMm = params.rmin * Math.min(...cellSize(grid))
   const metrics = [
     ['iteration', 'tipIteration', number(frame?.iteration), ''],
     ['compliance', 'tipCompliance', significant(frame?.compliance), `${t('N')}·${t('mm')}`],
@@ -216,7 +229,7 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
         <h2>{t('setup')}</h2>
         <section>
           <LabeledControl id="preset-3d" name={t('preset')} tip="hint3dPreset">
-            <select id="preset-3d" value={preset} onChange={event => { reset(); setPreset(event.target.value as Preset3D) }}>
+            <select id="preset-3d" value={preset} onChange={event => selectPreset(event.target.value as Preset3D)}>
               {presets3D.map(value => <option key={value} value={value}>{t(value)}</option>)}
             </select>
           </LabeledControl>
@@ -239,9 +252,11 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
           {sliders.map(([key, label, tip, min, max, step]) => <div key={key}>
             <div className="parameter-label">
               <Tooltip message={tip} info={t(label)}><label htmlFor={`${key}-3d`}>{t(label)}</label></Tooltip>
-              <output>{key === 'volFrac' ? `${number(Math.round(params[key] * 100))}%` : number(params[key])}{key === 'rmin' && ` ${t('elementShort')}`}</output>
+              <output>{key === 'volFrac' ? `${number(Math.round(params[key] * 100))}%`
+                : key === 'rmin' ? `${significant(filterRadiusMm)} ${t('mm')}` : number(params[key])}</output>
             </div>
             <input id={`${key}-3d`} type="range" min={min} max={max} step={step} value={params[key]}
+              aria-valuetext={key === 'rmin' ? `${significant(filterRadiusMm)} ${t('mm')}` : undefined}
               onChange={event => setParam(key, event.target.valueAsNumber)} />
           </div>)}
           <Tooltip message="tipHeaviside" info={t('heaviside')}><label className="check-field">
@@ -249,15 +264,19 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
             {t('heaviside')}
           </label></Tooltip>
           <LabeledControl id="symmetry-3d" name={t('symmetry')} tip="hint3dSymmetry">
-            <select id="symmetry-3d" value={params.symmetry} onChange={event => setParam('symmetry', event.target.value as Symmetry3D)}>
-              {(Object.keys(symmetry) as Symmetry3D[]).map(value => <option key={value} value={value}>{t(symmetry[value])}</option>)}
+            <select id="symmetry-3d" value={params.symmetry} aria-describedby={preset === 'lBracket3d' ? 'symmetry-note-3d' : undefined}
+              onChange={event => setParam('symmetry', event.target.value as Symmetry3D)}>
+              {(Object.keys(symmetry) as Symmetry3D[]).map(value => <option key={value} value={value}
+                disabled={incompatibleSymmetry(preset, value)}>{t(symmetry[value])}</option>)}
             </select>
           </LabeledControl>
+          {preset === 'lBracket3d' && <p id="symmetry-note-3d" className="hint">{t('lBracketSymmetry3d')}</p>}
         </section>
         <section>
           <h3>{t('geometry')}</h3>
           {dimensions.map(([key, label]) => <LabeledControl key={key} id={`${key}-3d`} name={`${t(label)} (${t('mm')})`} tip="hint3dDimensions">
             <input id={`${key}-3d`} className="field-input" type="number" min={1} max={10000} step="any" defaultValue={size[key]}
+              aria-describedby="aspect-ratio-3d" aria-invalid={preview.issue === 'aspectRatio3dError' || undefined}
               onBlur={event => {
                 const value = event.currentTarget.valueAsNumber
                 if (value >= 1 && value <= 10000 && value !== size[key]) { reset(); setSize(current => ({ ...current, [key]: value })) }
@@ -265,6 +284,7 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
               }}
               onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }} />
           </LabeledControl>)}
+          <p id="aspect-ratio-3d" className="hint">{t('aspectRatioHint3d').replace('{limit}', number(maxCellAspectRatio3D))}</p>
         </section>
       </aside>
       <div className="results">
@@ -278,7 +298,8 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
             }}>{t('export')}</button></Tooltip>
           </div>
         </div>
-        {(preview.issue || error) && <p className="error" role="alert">{t((preview.issue ?? error)!)} {error && t('resetError')}</p>}
+        {issueText && <p className="error" role="alert">{issueText}{error?.relativeResidual !== undefined &&
+          ` ${t('solveResidual3d').replace('{residual}', significant(error.relativeResidual))}`} {error && t('resetError')}</p>}
         <Viewport3D active={active} problem={problem} density={density} mode={mode} setMode={setMode}
           view={mode === 'auto' && !surface?.triangles.length ? 'voxels' : view} surface={surface} frame={frame} />
         {exportOpen && <SurfaceDialog surface={surface} settings={settings} change={setSettings} close={() => setExportOpen(false)} />}
@@ -293,11 +314,12 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
             <div><dt><Tooltip message="tipMass" info={t('mass')}>{t('mass')}</Tooltip></dt>
               <dd>{significant(kpi?.initialMass)} → {significant(kpi?.mass)} {t('g')}</dd>
               {kpi && <small>{significant(kpi.saved)}% {t('saved')}</small>}</div>
-            <div><dt><Tooltip message="tipDeflection" info={t('deflection')}>{t('deflection')}</Tooltip></dt>
+            <div><dt><Tooltip message="hint3dDeflection" info={t('deflection')}>{t('deflection')}</Tooltip></dt>
               <dd>{significant(kpi?.maxDeflection)} {t('mm')}</dd></div>
-            <div><dt><Tooltip message="tipSafety" info={t('safety')}>{t('safety')}</Tooltip></dt>
+            <div><dt><Tooltip message="hint3dSafety" info={t('safety')}>{t('safety')}</Tooltip></dt>
               <dd className={kpi?.safetyFactor === undefined ? undefined : kpi.safetyFactor < 1 ? 'fail' : kpi.safetyFactor < 1.5 ? 'caution' : 'safe'}>{significant(kpi?.safetyFactor)}</dd>
-              <small><Tooltip message="tipP95Safety" info={t('p95Safety')}>{t('p95Safety')} · {significant(kpi?.p95SafetyFactor)}</Tooltip></small></div>
+              <small><Tooltip message="hint3dP95Safety" info={t('p95Safety')}>{t('p95Safety')} · {significant(kpi?.p95SafetyFactor)}</Tooltip></small>
+              <small>{t('simpSafetyEstimate3d')}</small></div>
           </dl>
         </section>
         <ConvergenceChart samples={samples} target={params.volFrac} />

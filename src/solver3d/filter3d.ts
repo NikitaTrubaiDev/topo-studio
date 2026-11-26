@@ -1,4 +1,4 @@
-import { elementCount, elementIndex, type Grid3D } from './types3d'
+import { cellSize, elementCount, elementIndex, type Grid3D } from './types3d'
 
 export class DensityFilter3D {
   private readonly rows: Int32Array
@@ -11,9 +11,14 @@ export class DensityFilter3D {
     const columns: number[] = []
     const weights: number[] = []
     const offsets: [number, number, number, number][] = []
-    const reach = Math.ceil(radius) - 1
-    for (let z = -reach; z <= reach; z++) for (let y = -reach; y <= reach; y++) for (let x = -reach; x <= reach; x++) {
-      const weight = radius - Math.hypot(x, y, z)
+    const size = cellSize(grid)
+    const [hx, hy, hz] = size
+    const radiusMm = radius * Math.min(...size)
+    const counts = [nelx, nely, nelz]
+    const [rx, ry, rz] = size.map((side, axis) =>
+      Math.min(counts[axis] - 1, Math.max(0, Math.ceil(radiusMm / side) - 1)))
+    for (let z = -rz; z <= rz; z++) for (let y = -ry; y <= ry; y++) for (let x = -rx; x <= rx; x++) {
+      const weight = radiusMm - Math.hypot(x * hx, y * hy, z * hz)
       if (weight > 0) offsets.push([x, y, z, weight])
     }
     let e = 0

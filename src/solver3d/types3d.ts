@@ -14,7 +14,7 @@ export type Symmetry3D = 'none' | 'z' | 'y' | 'yz'
 export interface SimpParams3D {
   /** Power applied to physical density in the stiffness interpolation. */
   penal: number
-  /** Radius of the spherical cone in element counts. */
+  /** Radius of the spherical cone in multiples of the shortest cell side. */
   rmin: number
   /** Physical volume fraction of the full domain, including passive cells. */
   volFrac: number
@@ -79,11 +79,15 @@ export interface Snapshot3D {
   done: boolean
 }
 
-export type ProblemIssue3D = 'settings3dError' | 'mask3dError' | 'support3dError' | 'load3dError'
+export const maxCellAspectRatio3D = 4
+
+export type ProblemIssue3D = 'settings3dError' | 'aspectRatio3dError' | 'mask3dError' | 'support3dError' | 'load3dError'
   | 'attachment3dError' | 'volume3dError' | 'solve3dError'
 
 export class ProblemError3D extends Error {
-  constructor(readonly code: ProblemIssue3D) { super(code) }
+  constructor(readonly code: ProblemIssue3D, readonly relativeResidual?: number) {
+    super(relativeResidual === undefined ? code : `${code}: relative residual ${relativeResidual}`)
+  }
 }
 
 export function elementCount(grid: Grid3D) {

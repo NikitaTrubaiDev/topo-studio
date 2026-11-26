@@ -1,12 +1,17 @@
 import { h8Corners } from './elementH8'
 import { cellSize, elementCount, elementIndex, type Grid3D } from './types3d'
+import type { PassiveMasks } from '../solver/types'
 
 export interface Surface3D {
   /** Interleaved XYZ coordinates in mm. */
   vertices: Float64Array
   /** Counterclockwise triangle indices as seen from outside. */
   triangles: Uint32Array
+  /** Vertices on the boundary of a prescribed material or void cell. */
+  pinned?: Uint8Array
 }
+
+export const maxSmoothingPasses3D = 12
 
 const edges = [
   [0, 1], [1, 3], [3, 2], [2, 0], [4, 5], [5, 7], [7, 6], [6, 4], [0, 4], [1, 5], [3, 7], [2, 6],
@@ -26,7 +31,7 @@ const faces = [
  * Intersections on ghost edges use the exact domain plane so mounting faces
  * remain at the specified dimensions regardless of the chosen threshold.
  */
-export function marchingCubes(density: ArrayLike<number>, grid: Grid3D, threshold = 0.5): Surface3D {
+export function marchingCubes(density: ArrayLike<number>, grid: Grid3D, threshold = 0.5, passive?: PassiveMasks): Surface3D {
   if (density.length !== elementCount(grid) || !(threshold > 0 && threshold < 1)) throw new RangeError('Invalid isosurface input')
   const { nelx, nely, nelz } = grid
   const [hx, hy, hz] = cellSize(grid)
@@ -34,6 +39,7 @@ export function marchingCubes(density: ArrayLike<number>, grid: Grid3D, threshol
   const area = nx * ny
   const field = new Float64Array(area * nz)
   const ghost = new Uint8Array(field.length)
+  const prescribed = passive && new Uint8Array(field.length)
   for (let z = 0; z < nz; z++) for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) {
     const index = (z * ny + y) * nx + x
     if (x === 0 || y === 0 || z === 0 || x === nx - 1 || y === ny - 1 || z === nz - 1) {
@@ -41,13 +47,16 @@ export function marchingCubes(density: ArrayLike<number>, grid: Grid3D, threshol
       field[index] = -threshold
       continue
     }
-    const value = density[elementIndex(grid, x - 1, y - 1, z - 1)] - threshold
+    const e = elementIndex(grid, x - 1, y - 1, z - 1)
+    if (prescribed) prescribed[index] = Number(!!(passive?.solid?.[e] || passive?.void?.[e]))
+    const value = density[e] - threshold
     if (!Number.isFinite(value)) throw new RangeError('Non-finite density')
     // Keep edge crossings separate even at a sample equal to the iso value.
     field[index] = (value < 0 ? -1 : 1) * Math.max(Math.abs(value), 1e-5)
   }
   const vertexCache = new Int32Array(field.length * 3).fill(-1)
   const vertices: number[] = [], triangles: number[] = []
+  const pinned: number[] = []
   const ids = new Int32Array(8), next = new Int8Array(12), cuts = new Int8Array(4)
   const loop: number[] = []
 
@@ -68,6 +77,7 @@ export function marchingCubes(density: ArrayLike<number>, grid: Grid3D, threshol
       return offset * side
     }
     vertices.push(coordinate(x, nelx, hx, 0), coordinate(y, nely, hy, 1), coordinate(z, nelz, hz, 2))
+    if (prescribed) pinned[index] = prescribed[lo] || prescribed[hi]
     vertexCache[key] = index
     return index
   }
@@ -120,6 +130,7 @@ export function marchingCubes(density: ArrayLike<number>, grid: Grid3D, threshol
       } else {
         // An interior fan vertex keeps face diagonals local to their own cube.
         const center = vertices.length / 3
+        if (prescribed) pinned[center] = Number(loop.some(index => pinned[index]))
         for (let d = 0; d < 3; d++) {
           const first = vertices[3 * loop[0] + d]
           let offset = 0
@@ -130,7 +141,8 @@ export function marchingCubes(density: ArrayLike<number>, grid: Grid3D, threshol
       }
     }
   }
-  return { vertices: Float64Array.from(vertices), triangles: Uint32Array.from(triangles) }
+  return { vertices: Float64Array.from(vertices), triangles: Uint32Array.from(triangles),
+    ...(prescribed && { pinned: Uint8Array.from(pinned) }) }
 }
 
 export function triangleNormal(vertices: ArrayLike<number>, a: number, b: number, c: number): [number, number, number] {
@@ -140,15 +152,24 @@ export function triangleNormal(vertices: ArrayLike<number>, a: number, b: number
   return [uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx]
 }
 
+/** Six times the oriented tetrahedron volume relative to a reference vertex. */
+export function signedTriangleVolume6(vertices: ArrayLike<number>, a: number, b: number, c: number, origin: number) {
+  const [nx, ny, nz] = triangleNormal(vertices, a, b, c)
+  a *= 3; origin *= 3
+  return nx * (vertices[a] - vertices[origin]) + ny * (vertices[a + 1] - vertices[origin + 1])
+    + nz * (vertices[a + 2] - vertices[origin + 2])
+}
+
 export function taubinSmooth(mesh: Surface3D, grid: Grid3D, passes: number, lambda = 0.5, mu = -0.53): Surface3D {
   if (passes <= 0 || !mesh.triangles.length) return mesh
-  const { triangles } = mesh
+  const { triangles, pinned } = mesh
   let vertices = mesh.vertices.slice()
   const smoothed = vertices.slice()
   let expanded = vertices.slice()
   const rounded = new Float32Array(vertices.length)
   const limits = [grid.widthMm, grid.heightMm, grid.depthMm]
-  const boundary = Uint8Array.from(vertices, (value, i) => Number(value === 0 || value === limits[i % 3]))
+  const boundary = Uint8Array.from(vertices, (value, i) => Number(!!pinned?.[Math.floor(i / 3)] || value === 0 || value === limits[i % 3]))
+  const maxOffset = Math.min(...cellSize(grid)) * 0.08 / Math.sqrt(3)
   const adjacency = Array.from({ length: vertices.length / 3 }, () => new Set<number>())
   for (let i = 0; i < triangles.length; i += 3) {
     for (let j = 0; j < 3; j++) {
@@ -164,7 +185,8 @@ export function taubinSmooth(mesh: Surface3D, grid: Grid3D, passes: number, lamb
       let delta = 0
       for (const neighbor of neighbors) delta += input[3 * neighbor + d] - input[i]
       const value = input[i] + weight * delta / (neighbors.size || 1)
-      output[i] = boundary[i] ? mesh.vertices[i] : Math.min(limits[d], Math.max(0, value))
+      const original = mesh.vertices[i]
+      output[i] = boundary[i] ? original : Math.min(limits[d], original + maxOffset, Math.max(0, original - maxOffset, value))
     }
     rounded.set(output)
     // Reject a pass that reverses a facet or collapses it at STL precision.
@@ -176,31 +198,57 @@ export function taubinSmooth(mesh: Surface3D, grid: Grid3D, passes: number, lamb
     }
     return true
   }
-  for (let i = 0; i < passes; i++) {
+  function volume6(points: Float64Array) {
+    let volume = 0
+    for (let i = 0; i < triangles.length; i += 3) {
+      volume += signedTriangleVolume6(points, triangles[i], triangles[i + 1], triangles[i + 2], 0)
+    }
+    return volume
+  }
+  const minimumVolume = 0.97 * volume6(vertices)
+  for (let i = 0; i < Math.min(maxSmoothingPasses3D, Math.floor(passes)); i++) {
     // If a local feature limits the step, retain the Taubin ratio and reduce the step.
     let weight = 1
     while (weight >= 1 / 64 &&
-      !(pass(vertices, smoothed, lambda * weight) && pass(smoothed, expanded, mu * weight))) weight *= 0.5
+      !(pass(vertices, smoothed, lambda * weight) && pass(smoothed, expanded, mu * weight)
+        && volume6(expanded) >= minimumVolume)) weight *= 0.5
     if (weight < 1 / 64) break
     const previous = vertices
     vertices = expanded
     expanded = previous
   }
-  return { vertices, triangles }
+  return { ...mesh, vertices }
+}
+
+export function extractSurface3D(density: ArrayLike<number>, grid: Grid3D, threshold = 0.5, passes = 4, passive?: PassiveMasks) {
+  return taubinSmooth(marchingCubes(density, grid, threshold, passive), grid, passes)
 }
 
 export function vertexNormals({ vertices, triangles }: Surface3D) {
   const normals = new Float64Array(vertices.length)
+  const facetNormals = new Float64Array(vertices.length)
   for (let i = 0; i < triangles.length; i += 3) {
     const n = triangleNormal(vertices, triangles[i], triangles[i + 1], triangles[i + 2])
+    const area = Math.hypot(...n)
+    if (!(area > 0 && Number.isFinite(area))) continue
     for (let j = 0; j < 3; j++) {
       const offset = 3 * triangles[i + j]
+      if (facetNormals[offset] === 0 && facetNormals[offset + 1] === 0 && facetNormals[offset + 2] === 0) {
+        for (let d = 0; d < 3; d++) facetNormals[offset + d] = n[d]
+      }
       for (let d = 0; d < 3; d++) normals[offset + d] += n[d]
     }
   }
   for (let i = 0; i < normals.length; i += 3) {
     const length = Math.hypot(normals[i], normals[i + 1], normals[i + 2])
-    if (length > 0) for (let d = 0; d < 3; d++) normals[i + d] /= length
+    const facetLength = Math.hypot(facetNormals[i], facetNormals[i + 1], facetNormals[i + 2])
+    if (Number.isFinite(length) && length > facetLength * 1e-12) {
+      for (let d = 0; d < 3; d++) normals[i + d] /= length
+    } else if (facetLength > 0) {
+      for (let d = 0; d < 3; d++) normals[i + d] = facetNormals[i + d] / facetLength
+    } else {
+      normals.set([0, 0, 1], i)
+    }
   }
   return normals
 }
