@@ -21,6 +21,10 @@ jobs:
           node-version: 26
           cache: npm
       - run: npm ci
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: npm run build:wasm
       - run: npm test
       - run: npm run build
       - uses: actions/upload-pages-artifact@v3

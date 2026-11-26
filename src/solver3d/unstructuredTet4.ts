@@ -3,6 +3,7 @@ import { brickMasks3D, rigidComponents3D, rigidComponentsStable3D } from './desi
 import { elasticity3D } from './elementH8'
 import { tet4Stiffness } from './elementT4'
 import { cellSize, ProblemError3D, type SimpProblem3D } from './types3d'
+import { WasmFilter3D, type WasmBackend3D } from './wasmBackend'
 
 export function unstructuredTet4Element(positions: Float64Array, ids: ArrayLike<number>, E: number, nu: number) {
   const { rows, det } = tetCoordinates3D(positions, ids)
@@ -14,12 +15,35 @@ export function unstructuredTet4Element(positions: Float64Array, ids: ArrayLike<
   return { ...tet4Stiffness(grads, det / 6, elasticity3D(E, nu)), centroid }
 }
 
+export function adaptiveElementTemplates3D(mesh: AdaptiveMesh3D, nu: number) {
+  const { tetrahedra, positions } = mesh
+  const templateIndex = new Int32Array(tetrahedra.length / 4)
+  const matrices: Float64Array[] = [], strains: Float64Array[] = []
+  const templates = new Map<string, number>()
+  for (let e = 0; e < templateIndex.length; e++) {
+    const ids = tetrahedra.subarray(4 * e, 4 * e + 4)
+    // Cache only geometrically identical local Jacobians.
+    const key = Array.from(ids.subarray(1)).flatMap(id => [0, 1, 2].map(d =>
+      positions[3 * id + d] - positions[3 * ids[0] + d])).join(',')
+    let template = templates.get(key)
+    if (template === undefined) {
+      template = matrices.length
+      const { B, Ke } = unstructuredTet4Element(positions, ids, 1, nu)
+      matrices.push(Ke)
+      strains.push(B)
+      templates.set(key, template)
+    }
+    templateIndex[e] = template
+  }
+  return { templateIndex, matrices, strains }
+}
+
 export class UnstructuredStiffness3D {
   readonly width = 12
   readonly dofs: Int32Array
   readonly templateIndex: Int32Array
-  readonly matrices: Float64Array[] = []
-  readonly strains: Float64Array[] = []
+  readonly matrices: Float64Array[]
+  readonly strains: Float64Array[]
   readonly inverseDiagonal: Float64Array
   private readonly starts: Int32Array
   private readonly columns: Int32Array
@@ -27,35 +51,25 @@ export class UnstructuredStiffness3D {
   private readonly slots: Int32Array
   private readonly diagonal: Int32Array
 
-  constructor(readonly mesh: AdaptiveMesh3D, nu: number, readonly fixed: Uint8Array) {
+  constructor(readonly mesh: AdaptiveMesh3D, nu: number, readonly fixed: Uint8Array,
+    geometry = adaptiveElementTemplates3D(mesh, nu)) {
     const { tetrahedra, positions } = mesh
     const count = tetrahedra.length / 4, nodes = positions.length / 3
     this.dofs = new Int32Array(count * 12)
-    this.templateIndex = new Int32Array(count)
+    this.templateIndex = geometry.templateIndex
+    this.matrices = geometry.matrices
+    this.strains = geometry.strains
     this.inverseDiagonal = new Float64Array(fixed.length)
     this.starts = new Int32Array(nodes + 1)
     this.diagonal = new Int32Array(nodes)
     this.slots = new Int32Array(count * 16)
     const adjacency = Array.from({ length: nodes }, () => new Map<number, number>())
-    const templates = new Map<string, number>()
     for (let e = 0; e < count; e++) {
       const ids = tetrahedra.subarray(4 * e, 4 * e + 4)
       for (let i = 0; i < 4; i++) {
         for (const j of ids) adjacency[ids[i]].set(j, 0)
         for (let d = 0; d < 3; d++) this.dofs[12 * e + 3 * i + d] = 3 * ids[i] + d
       }
-      // Cache only geometrically identical local Jacobians.
-      const key = Array.from(ids.subarray(1)).flatMap(id => [0, 1, 2].map(d =>
-        positions[3 * id + d] - positions[3 * ids[0] + d])).join(',')
-      let template = templates.get(key)
-      if (template === undefined) {
-        template = this.matrices.length
-        const { B, Ke } = unstructuredTet4Element(positions, ids, 1, nu)
-        this.matrices.push(Ke)
-        this.strains.push(B)
-        templates.set(key, template)
-      }
-      this.templateIndex[e] = template
     }
     const columns: number[] = []
     for (let i = 0; i < nodes; i++) {
@@ -183,7 +197,7 @@ export function preflightAdaptiveSolver3D(problem: SimpProblem3D, mesh: Adaptive
   }
   const available = Math.floor((maxAdaptiveBytes - bytes - retainedBytes) / (12 * filterChunkSize))
   const capacity = Math.min(maxCachedPairs, available * filterChunkSize, Math.ceil(pairs / filterChunkSize) * filterChunkSize)
-  return { radius, rows, capacity, estimatedBytes: bytes + 12 * capacity }
+  return { radius, rows, capacity, estimatedBytes: bytes + 12 * capacity, spareBytes: maxAdaptiveBytes - bytes - 12 * capacity - retainedBytes }
 }
 
 /** Normalize the volume-weighted cone. Rows beyond the cache limit use the
@@ -196,11 +210,15 @@ export class UnstructuredConeFilter3D {
   private readonly uncached: (number[][] | undefined)[]
   private readonly cachedRows: number
   private readonly radius: number
+  private wasm?: WasmFilter3D
+  private wasmRows = 0
+  private readonly wasmEntryLimit: number
 
   constructor(private readonly mesh: AdaptiveMesh3D, plan: ReturnType<typeof preflightAdaptiveSolver3D>) {
     const { volumes } = mesh
     const { rows, capacity } = plan
     this.radius = plan.radius
+    this.wasmEntryLimit = Math.max(0, Math.floor((plan.spareBytes - 20 * volumes.length - 4) / 12))
     const starts = this.starts = new Uint32Array(volumes.length + 1)
     this.inverse = new Float64Array(volumes.length)
     let cachedRows = volumes.length, length = 0
@@ -237,9 +255,54 @@ export class UnstructuredConeFilter3D {
     return this.mesh.volumes[j] * filterWeight(this.mesh.centroids, e, j, this.radius)
   }
 
+  setBackend(backend?: WasmBackend3D) {
+    this.wasm?.dispose()
+    this.wasm = undefined
+    this.wasmRows = 0
+    if (!backend || !this.cachedRows) return
+    const { starts, columns, weights, cachedRows } = this
+    // Retain the JS cache for live switching and respect the AMR budget.
+    let rows = 0
+    while (rows < cachedRows && starts[rows + 1] <= this.wasmEntryLimit) rows++
+    if (rows === 0) return
+    const count = this.mesh.volumes.length
+    const entries = starts[rows]
+    try {
+      this.wasm = new WasmFilter3D(backend, count, memory => {
+        const rowPtr = memory.upload(starts.subarray(0, rows + 1))
+        const colPtr = memory.allocate(entries * 4), weightPtr = memory.allocate(entries * 8)
+        const cols = memory.u32(colPtr, entries), values = memory.f64(weightPtr, entries)
+        for (let i = 0; i < entries; i += filterChunkSize) {
+          const end = Math.min(entries - i, filterChunkSize), chunk = i / filterChunkSize
+          cols.set(columns[chunk].subarray(0, end), i)
+          values.set(weights[chunk].subarray(0, end), i)
+        }
+        return (input, output, transpose) => backend.abi.filter_csr(rows, count, rowPtr, colPtr, weightPtr, input, output, transpose)
+      })
+      this.wasmRows = rows
+    } catch {
+      this.wasm = undefined
+    }
+  }
+
+  get wasmBytes() {
+    return this.wasm ? 16 * this.mesh.volumes.length + 4 * (this.wasmRows + 1) + 12 * this.starts[this.wasmRows] : 0
+  }
+
+  private accelerate(input: Float64Array, output: Float64Array, transpose: boolean) {
+    if (!this.wasm) return 0
+    try {
+      this.wasm.apply(input, output, transpose)
+      return this.wasmRows
+    } catch {
+      this.setBackend()
+      return 0
+    }
+  }
+
   apply(input: Float64Array, output: Float64Array) {
     const { starts, columns, weights, cachedRows, uncached, inverse } = this
-    for (let e = 0; e < output.length; e++) {
+    for (let e = this.accelerate(input, output, false); e < output.length; e++) {
       let sum = 0
       for (let j = starts[e]; j < starts[e + 1]; j++) sum += weights[j >>> 16][j & 65535] * input[columns[j >>> 16][j & 65535]]
       if (e >= cachedRows) {
@@ -253,8 +316,9 @@ export class UnstructuredConeFilter3D {
 
   transpose(input: Float64Array, output: Float64Array) {
     const { starts, columns, weights, cachedRows, uncached, inverse } = this
-    output.fill(0)
-    for (let e = 0; e < input.length; e++) {
+    const first = this.accelerate(input, output, true)
+    if (first === 0) output.fill(0)
+    for (let e = first; e < input.length; e++) {
       const value = input[e]
       if (value === 0) continue
       for (let j = starts[e]; j < starts[e + 1]; j++) output[columns[j >>> 16][j & 65535]] += weights[j >>> 16][j & 65535] * value

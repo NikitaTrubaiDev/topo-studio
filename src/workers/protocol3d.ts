@@ -4,14 +4,17 @@ import type { elementSurface3D } from '../solver3d/mesh3d'
 import type { Surface3D, creaseGeometry3D } from '../solver3d/surface3d'
 import type { SurfaceValidity3D } from '../solver3d/surfaceValidation3d'
 import type { ElementType3D, Grid3D, ProblemIssue3D, SimpProblem3D, Snapshot3D } from '../solver3d/types3d'
+import type { SolverEngine3D } from '../solver3d/wasmBackend'
 
 export type TimedSnapshot3D = Snapshot3D & { iterMs: number }
 export type WorkerCommand3D = { type: 'init'; problem: SimpProblem3D }
-  | { type: 'preview'; requestId: number; problem: SimpProblem3D }
+  | { type: 'preview'; requestId: number; problem: SimpProblem3D; engine?: SolverEngine3D }
+  | { type: 'engine'; engine: SolverEngine3D }
   | { type: 'start' | 'pause' | 'step' | 'reset' }
   | { type: 'refine'; threshold?: number }
 export type WorkerEvent3D = { type: 'frame'; snapshot: TimedSnapshot3D }
   | Preview3D
+  | { type: 'engine'; engine: SolverEngine3D }
   | { type: 'refined'; mesh: AdaptiveMesh3D; snapshot: TimedSnapshot3D }
   | { type: 'paused' } | { type: 'done' }
   | { type: 'error'; issue: WorkerIssue3D; relativeResidual?: number; recoverable?: boolean }

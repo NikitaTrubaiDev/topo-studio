@@ -4,6 +4,7 @@ import { generateAdaptiveMesh3D, transferAdaptiveDensity3D } from '../solver3d/a
 import { preflightAdaptiveSolver3D } from '../solver3d/unstructuredTet4'
 import { Simp3D, validateProblem3D } from '../solver3d/simp3d'
 import { elementCount, ProblemError3D, type SimpProblem3D } from '../solver3d/types3d'
+import { loadWasmBackend3D, type SolverEngine3D, type WasmBackend3D } from '../solver3d/wasmBackend'
 import type { Preview3D, TimedSnapshot3D, WorkerCommand3D, WorkerEvent3D } from './protocol3d'
 
 const scope = self as unknown as DedicatedWorkerGlobalScope
@@ -12,6 +13,8 @@ let solver: Simp3D | undefined
 let timer: ReturnType<typeof setTimeout> | undefined
 let running = false
 let finished = false
+let engineRequest = 0
+let backend: WasmBackend3D | undefined
 let latest: Pick<TimedSnapshot3D, 'density' | 'vonMises' | 'iteration'> | undefined
 
 function send(event: WorkerEvent3D, transfer: Transferable[] = []) {
@@ -26,10 +29,30 @@ function stop() {
 
 function reset() {
   stop()
+  engineRequest++
+  solver?.setBackend()
+  backend = undefined
   solver = undefined
   problem = undefined
   finished = false
   latest = undefined
+}
+
+async function selectEngine(engine: SolverEngine3D, preview?: Preview3D) {
+  const request = ++engineRequest
+  const next = engine === 'wasm' ? backend ?? await loadWasmBackend3D() : undefined
+  if (request !== engineRequest) return
+  backend = next
+  solver?.setBackend(backend)
+  send({ type: 'engine', engine: backend ? 'wasm' : 'js' })
+  if (preview) send(preview, [preview.density.buffer])
+}
+
+function reportEngineFallback(next: Simp3D) {
+  if (backend && next.engine === 'js') {
+    backend = undefined
+    send({ type: 'engine', engine: 'js' })
+  }
 }
 
 function report(error: unknown, recoverable = false) {
@@ -41,7 +64,7 @@ function report(error: unknown, recoverable = false) {
   } else send({ type: 'error', issue: 'workerError', ...recovery })
 }
 
-function preview(requestId: number, next: SimpProblem3D) {
+function preview(requestId: number, next: SimpProblem3D, engine?: SolverEngine3D) {
   reset()
   problem = next
   const { grid, params, passive, elementType = 'hex8' } = next
@@ -76,11 +99,12 @@ function preview(requestId: number, next: SimpProblem3D) {
     })
     event = { type: 'preview', requestId, density, passive, issue: error instanceof ProblemError3D ? error.code : 'workerError' }
   }
-  send(event, [event.density.buffer])
+  if (engine) void selectEngine(engine, event)
+  else send(event, [event.density.buffer])
 }
 
 function ensureSolver() {
-  if (!solver && problem) solver = new Simp3D(problem)
+  if (!solver && problem) solver = new Simp3D(problem, undefined, undefined, backend)
   return solver
 }
 
@@ -101,11 +125,20 @@ function refine(threshold?: number) {
   const plan = preflightAdaptiveSolver3D(solver.problem, mesh, solver.adaptiveBytes)
   const design = transferAdaptiveDensity3D(mesh, previous, solver.designDensity)
   const next = new Simp3D({ ...solver.problem, mesh }, { design, iteration: latest.iteration }, plan)
-  const snapshot = { ...next.step(false), done: latest.iteration >= next.problem.params.maxIter, iterMs: performance.now() - start }
+  let snapshot: TimedSnapshot3D
+  try {
+    next.setBackend(backend)
+    snapshot = { ...next.step(false), done: latest.iteration >= next.problem.params.maxIter, iterMs: performance.now() - start }
+  } catch (error) {
+    next.setBackend()
+    throw error
+  }
+  solver.setBackend()
   solver = next
   problem = next.problem
   latest = { iteration: snapshot.iteration, density: snapshot.density.slice(), vonMises: snapshot.vonMises.slice() }
   finished = snapshot.done
+  reportEngineFallback(next)
   send({ type: 'refined', mesh, snapshot }, snapshotBuffers(snapshot))
 }
 
@@ -115,6 +148,7 @@ function iterate() {
   try {
     const start = performance.now()
     const snapshot = { ...solver.step(), iterMs: performance.now() - start }
+    reportEngineFallback(solver)
     finished = snapshot.done
     if (solver.problem.mesh) latest = { iteration: snapshot.iteration, density: snapshot.density.slice(), vonMises: snapshot.vonMises.slice() }
     send({ type: 'frame', snapshot }, snapshotBuffers(snapshot))
@@ -130,7 +164,10 @@ scope.onmessage = ({ data }: MessageEvent<WorkerCommand3D>) => {
   try {
     switch (data.type) {
       case 'preview':
-        preview(data.requestId, data.problem)
+        preview(data.requestId, data.problem, data.engine)
+        break
+      case 'engine':
+        void selectEngine(data.engine)
         break
       case 'init':
         reset()

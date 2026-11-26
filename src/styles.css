@@ -89,6 +89,17 @@ h1, h2, h3, p, dl { margin: 0; }
   font-size: 13px;
 }
 .controls .hint { color: var(--muted); font-size: 11px; }
+.solver-engine-badge {
+  justify-self: end;
+  padding: 3px 9px;
+  border: 1px solid #465760;
+  border-radius: 4px;
+  color: #c4d1d7;
+  background: #19232d;
+  font: 600 11px var(--mono);
+}
+.solver-engine-badge[data-engine="wasm"] { color: var(--accent); border-color: #4f8078; background: #1d3437; }
+.solver-engine-badge:hover:not(:disabled) { border-color: var(--accent); }
 input[type="range"], input[type="checkbox"] { accent-color: var(--accent); }
 input[type="range"] { width: 100%; margin: 1px 0 6px; }
 output { color: var(--accent); font: 11px var(--mono); white-space: nowrap; }

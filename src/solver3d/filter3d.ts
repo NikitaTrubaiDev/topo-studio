@@ -1,5 +1,6 @@
 import { tetCentroids, tetVolumeFraction } from './elementT4'
 import { cellSize, elementCount, type ElementType3D, type Grid3D } from './types3d'
+import { WasmFilter3D, type WasmBackend3D } from './wasmBackend'
 
 type FilterStencil = {
   offsets: number[][]
@@ -14,6 +15,7 @@ export class DensityFilter3D {
   private readonly perCell: number
   private readonly rim: number[]
   private readonly voidMask?: Uint8Array
+  private wasm?: WasmFilter3D
 
   constructor(private readonly grid: Grid3D, radius: number, passiveVoid?: Uint8Array, elementType: ElementType3D = 'hex8') {
     const { nelx, nely, nelz } = grid
@@ -101,14 +103,55 @@ export class DensityFilter3D {
   }
 
   apply(input: Float64Array, output: Float64Array) {
+    if (this.accelerate(input, output, false)) return output
     this.multiply(input, output, false)
     return output
   }
 
   transpose(input: Float64Array, output: Float64Array) {
+    if (this.accelerate(input, output, true)) return output
     output.fill(0)
     this.multiply(input, output, true)
     return output
+  }
+
+  setBackend(backend?: WasmBackend3D) {
+    this.wasm?.dispose()
+    this.wasm = undefined
+    if (!backend) return
+    const { nelx, nely, nelz } = this.grid
+    const { perCell, inverseWeight } = this
+    const stencils = this.stencils.flat()
+    const starts = new Uint32Array(stencils.length + 1)
+    stencils.forEach(({ delta }, row) => { starts[row + 1] = starts[row] + delta.length })
+    const entries = starts[stencils.length]
+    try {
+      this.wasm = new WasmFilter3D(backend, inverseWeight.length, memory => {
+        const rows = memory.upload(starts), inverse = memory.upload(inverseWeight)
+        const shiftPtr = memory.allocate(16 * entries), weightPtr = memory.allocate(8 * entries)
+        const shifts = new Int32Array(backend.abi.memory.buffer, shiftPtr, 4 * entries)
+        const values = memory.f64(weightPtr, entries)
+        stencils.forEach(({ offsets, delta, weights }, row) => {
+          values.set(weights, starts[row])
+          offsets.forEach(([x, y, z], i) => shifts.set([x, y, z, delta[i]], 4 * (starts[row] + i)))
+        })
+        return (input, output, transpose) => backend.abi.filter_stencil(nelx, nely, nelz, perCell, rows,
+          shiftPtr, weightPtr, inverse, input, output, transpose)
+      })
+    } catch {
+      this.wasm = undefined
+    }
+  }
+
+  private accelerate(input: Float64Array, output: Float64Array, transpose: boolean) {
+    if (!this.wasm) return false
+    try {
+      this.wasm.apply(input, output, transpose)
+      return true
+    } catch {
+      this.setBackend()
+      return false
+    }
   }
 }
 

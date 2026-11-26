@@ -13,6 +13,7 @@ import { defaultAdaptiveOptions3D, type AdaptiveMesh3D } from '../solver3d/adapt
 import { adaptivePresetGrid3D, adaptiveResolutions3D, defaultParams3D, makePreset3D, presetGrid3D, presets3D, resolutions3D, type Preset3D } from '../solver3d/presets3d'
 import { cellSize, elementCount, maxCellAspectRatio3D, nodeCount, nodePosition, type ElementType3D, type Grid3D, type SimpProblem3D, type ProblemIssue3D, type SimpParams3D, type Symmetry3D } from '../solver3d/types3d'
 import type { Preview3D, SurfaceEvent3D, SurfaceInput3D, SurfaceRequest3D, TimedSnapshot3D, WorkerCommand3D, WorkerEvent3D } from '../workers/protocol3d'
+import type { SolverEngine3D } from '../solver3d/wasmBackend'
 import { ConvergenceChart, type Sample } from './ConvergenceChart'
 import { download } from './ExportDialog'
 import { Tooltip, type TooltipMessage } from './Tooltip'
@@ -143,6 +144,8 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
   const [material, setMaterial] = useState<MaterialId>('steel')
   const [params, setParams] = useState(defaultParams3D)
   const [state, setState] = useState<RunState>('ready')
+  const requestedEngine = useRef<SolverEngine3D>('wasm')
+  const [engine, setEngine] = useState<SolverEngine3D>()
   const [frame, setFrame] = useState<TimedSnapshot3D>()
   const [refinedMesh, setRefinedMesh] = useState<AdaptiveMesh3D>()
   const [samples, setSamples] = useState<Sample[]>([])
@@ -191,13 +194,15 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
 
   useEffect(() => {
     const requestId = ++previewRequest.current
+    setEngine(undefined)
     let instance: Worker | undefined
     try {
       instance = new Worker(new URL('../workers/simp3dWorker.ts', import.meta.url), { type: 'module' })
       worker.current = instance
       instance.onmessage = ({ data }: MessageEvent<WorkerEvent3D>) => {
         if (instance !== worker.current || requestId !== previewRequest.current) return
-        if (data.type === 'preview') {
+        if (data.type === 'engine') setEngine(data.engine)
+        else if (data.type === 'preview') {
           if (data.requestId === requestId) setPreviewResult({ problem, restart, preview: data })
         } else if (data.type === 'refined') {
           setRefinedMesh(data.mesh)
@@ -230,7 +235,7 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
         setError({ issue: 'workerError' })
         setState('error')
       }
-      instance.postMessage({ type: 'preview', requestId, problem } satisfies WorkerCommand3D)
+      instance.postMessage({ type: 'preview', requestId, problem, engine: requestedEngine.current } satisfies WorkerCommand3D)
     } catch {
       setPreviewResult({ problem, restart, failed: true })
       setState('error')
@@ -322,6 +327,13 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
     }
   }
 
+  function toggleEngine() {
+    if (!worker.current || !engine) return
+    requestedEngine.current = engine === 'wasm' ? 'js' : 'wasm'
+    setEngine(undefined)
+    worker.current.postMessage({ type: 'engine', engine: requestedEngine.current } satisfies WorkerCommand3D)
+  }
+
   const issue = !stable ? 'support3dError' : preview?.issue ?? (error?.recoverable ? undefined : error?.issue) ?? (currentPreview?.failed ? 'workerError' : undefined)
   const canRun = !pendingPreview && !issue && (state === 'ready' || state === 'paused')
   const forceMagnitudeError = t('forceMagnitude3dError')
@@ -360,6 +372,13 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
       <aside className="controls panel" aria-label={t('setup')}>
         <h2>{t('setup')}</h2>
         <section>
+          <LabeledControl id="solver-engine-3d" name={t('solverEngine3d')} tip="hint3dSolverEngine">
+            <button type="button" id="solver-engine-3d" className="solver-engine-badge"
+              data-engine={engine} aria-pressed={engine === 'wasm'} onClick={toggleEngine}
+              disabled={!engine || !worker.current}>
+              {t(engine === 'wasm' ? 'wasmEngine3d' : engine === 'js' ? 'jsEngine3d' : 'loadingEngine3d')}
+            </button>
+          </LabeledControl>
           <LabeledControl id="preset-3d" name={t('preset')} tip="hint3dPreset">
             <select id="preset-3d" value={preset} onChange={event => selectPreset(event.target.value as Preset3D)}>
               {presets3D.map(value => <option key={value} value={value}>{t(value)}</option>)}

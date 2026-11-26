@@ -7,6 +7,7 @@
     "dev": "vite",
     "test": "vitest run",
     "bench:solver": "vitest bench --run --reporter=verbose",
+    "build:wasm": "node scripts/build-wasm.mjs",
     "build": "tsc --noEmit && vite build"
   },
   "dependencies": {

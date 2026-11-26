@@ -1,11 +1,12 @@
 import { generateAdaptiveMesh3D } from './adaptiveMesh3d'
-import { preflightAdaptiveSolver3D, unstructuredSetup3D, UnstructuredConeFilter3D, UnstructuredStiffness3D } from './unstructuredTet4'
+import { adaptiveElementTemplates3D, preflightAdaptiveSolver3D, unstructuredSetup3D, UnstructuredConeFilter3D, UnstructuredStiffness3D } from './unstructuredTet4'
 import { brickMasks3D, forceMagnitude3D, nodeTouchesMaterial3D, rigidComponents3D, rigidComponentsStable3D, rigidRank3D, validForceMagnitude3D } from './design3d'
 import { elasticity3D, h8Corners, h8Stiffness, strainDisplacementH8, vonMises3D } from './elementH8'
 import { tet4Templates, tetCorners, tetVolumeFraction } from './elementT4'
 import { DensityFilter3D, projectDensity3D } from './filter3d'
 import type { Stiffness3D } from './stiffness3d'
 import { fixedDofs3D, Pcg3D } from './pcg3d'
+import type { SolverEngine3D, WasmBackend3D, WasmSolver3D } from './wasmBackend'
 import {
   cellSize, elementCount, maxCellAspectRatio3D, nodeCount, nodeIndex3D, nodePosition, ProblemError3D,
   type SimpProblem3D, type Snapshot3D,
@@ -132,7 +133,13 @@ export function validateProblem3D(problem: SimpProblem3D) {
 
 /** Same-grid engineering analysis. The PCG work vectors and displacements remain warm between calls. */
 export class Analysis3D {
-  private readonly pcg: Pcg3D<Stiffness3D | UnstructuredStiffness3D>
+  private pcg?: Pcg3D<Stiffness3D | UnstructuredStiffness3D>
+  private wasm?: WasmSolver3D
+  private backend?: WasmBackend3D
+  private readonly mesh
+  private readonly width: number
+  private readonly matrices: readonly Float64Array[]
+  private readonly geometry?: ReturnType<typeof adaptiveElementTemplates3D>
   private readonly B: readonly Float64Array[]
   private readonly D: Float64Array
   private readonly stress = new Float64Array(6)
@@ -143,16 +150,20 @@ export class Analysis3D {
   readonly vonMises: Float64Array
   readonly gradient: Float64Array
 
-  constructor(readonly problem: SimpProblem3D, fixed: Uint8Array, readonly forces: Float64Array[]) {
+  constructor(readonly problem: SimpProblem3D, private readonly fixed: Uint8Array, readonly forces: Float64Array[],
+    backend?: WasmBackend3D) {
     const size = cellSize(problem.grid)
     const { elementType = 'hex8' } = problem
     const mesh = elementType === 'adaptiveTet4' ? problem.mesh ?? generateAdaptiveMesh3D(problem) : undefined
     const { nu } = problem.material
     const templates = elementType === 'tet4' ? tet4Templates(1, nu, ...size)
       : mesh ? [] : [{ Ke: h8Stiffness(1, nu, ...size), B: strainDisplacementH8(...size) }]
-    this.pcg = new Pcg3D(problem.grid, templates[0]?.Ke ?? new Float64Array(), fixed,
-      { nu, elementType, stiffness: mesh ? new UnstructuredStiffness3D(mesh, nu, fixed) : undefined, matrices: templates.map(t => t.Ke) })
-    this.B = this.pcg.stiffness instanceof UnstructuredStiffness3D ? this.pcg.stiffness.strains : templates.map(t => t.B)
+    this.mesh = mesh
+    this.width = elementType === 'hex8' ? 24 : 12
+    this.geometry = mesh && adaptiveElementTemplates3D(mesh, nu)
+    this.matrices = this.geometry?.matrices ?? templates.map(t => t.Ke)
+    this.B = this.geometry?.strains ?? templates.map(t => t.B)
+    this.backend = backend
     this.D = elasticity3D(1, problem.material.nu)
     this.displacements = forces.map(force => new Float64Array(force.length))
     this.loadedNodes = new Uint8Array(fixed.length / 3)
@@ -160,29 +171,66 @@ export class Analysis3D {
       if (force[d] || force[d + 1] || force[d + 2]) this.loadedNodes[d / 3] = 1
     }
     this.displacementNodes = this.loadedNodes.slice()
-    this.vonMises = new Float64Array(this.pcg.modulus.length)
+    this.vonMises = new Float64Array(mesh?.stats.elements ?? elementCount(problem.grid, elementType))
     this.gradient = new Float64Array(this.vonMises.length)
   }
 
+  get engine(): SolverEngine3D { return this.backend ? 'wasm' : 'js' }
+
+  setBackend(backend?: WasmBackend3D) {
+    this.wasm?.dispose()
+    this.wasm = undefined
+    this.backend = backend
+    if (backend) this.pcg = undefined
+  }
+
   solve(density: Float64Array, penal: number, tolerance: number) {
-    const { pcg, B, D, stress, strain, vonMises, gradient, displacementNodes } = this
+    if (this.backend) {
+      try {
+        const { grid, elementType = 'hex8', material } = this.problem
+        const { fixed, mesh, geometry, matrices } = this
+        const wasm = this.wasm ??= mesh && geometry
+          ? this.backend.adaptive(fixed, mesh.tetrahedra, geometry.templateIndex, matrices)
+          : this.backend.structured(grid, fixed, elementType, matrices, material.nu)
+        wasm.prepare(density, material, penal)
+        return this.analyze(density, penal, tolerance, wasm)
+      } catch {
+        this.setBackend()
+      }
+    }
+    const { grid, elementType, material: { nu } } = this.problem
+    const { matrices, fixed, mesh, geometry } = this
+    const pcg = this.pcg ??= new Pcg3D(grid, matrices[0], fixed,
+      { nu, elementType, stiffness: mesh && new UnstructuredStiffness3D(mesh, nu, fixed, geometry), matrices })
     const { E0, Emin } = this.problem.material
-    const { width, matrices, templateIndex, dofs } = pcg.stiffness
     pcg.prepare(density, E0, Emin, penal)
+    return this.analyze(density, penal, tolerance, undefined, pcg)
+  }
+
+  private analyze(density: Float64Array, penal: number, tolerance: number, wasm?: WasmSolver3D,
+    pcg?: Pcg3D<Stiffness3D | UnstructuredStiffness3D>) {
+    const { B, D, stress, strain, vonMises, gradient, displacementNodes, matrices, width } = this
+    const { E0, Emin } = this.problem.material
+    const nodes = wasm?.nodes, dofs = pcg?.dofs
+    const templateIndex = wasm?.templates ?? pcg!.stiffness.templateIndex
+    const modulus = wasm?.modulus ?? pcg!.modulus
+    const corners = width / 3
     displacementNodes.set(this.loadedNodes)
     for (let e = 0, offset = 0; e < density.length; e++, offset += width) {
       if (density[e] < 0.25) continue
-      for (let j = 0; j < width; j += 3) displacementNodes[dofs[offset + j] / 3] = 1
+      for (let j = 0; j < corners; j++) displacementNodes[nodes ? nodes[e * corners + j] : dofs![offset + 3 * j] / 3] = 1
     }
     let compliance = 0, maxDeflection = 0
     gradient.fill(0)
     vonMises.fill(0)
     for (let c = 0; c < this.forces.length; c++) {
       const force = this.forces[c], u = this.displacements[c]
-      const result = pcg.solve(force, u, tolerance)
+      const wasmResult = wasm?.solve(force, u, tolerance)
+      const result = wasmResult ?? pcg!.solve(force, u, tolerance)
       if (!result.converged) throw new ProblemError3D('solve3dError', result.relativeResidual)
+      if (wasmResult) compliance += wasmResult.compliance
       for (let d = 0; d < u.length; d += 3) {
-        compliance += force[d] * u[d] + force[d + 1] * u[d + 1] + force[d + 2] * u[d + 2]
+        if (!wasm) compliance += force[d] * u[d] + force[d + 1] * u[d + 1] + force[d + 2] * u[d + 2]
         if (displacementNodes[d / 3]) maxDeflection = Math.max(maxDeflection, Math.hypot(u[d], u[d + 1], u[d + 2]))
       }
       for (let e = 0, offset = 0; e < density.length; e++, offset += width) {
@@ -190,19 +238,25 @@ export class Analysis3D {
         let energy = 0
         strain.fill(0)
         for (let j = 0; j < width; j++) {
-          const q = u[dofs[offset + j]]
-          let Ku = 0
-          for (let k = 0; k < width; k++) Ku += Ke[j * width + k] * u[dofs[offset + k]]
-          energy += q * Ku
+          const q = u[nodes ? 3 * nodes[e * corners + Math.floor(j / 3)] + j % 3 : dofs![offset + j]]
+          if (!wasm) {
+            let Ku = 0
+            for (let k = 0; k < width; k++) Ku += Ke[j * width + k] * u[dofs![offset + k]]
+            energy += q * Ku
+          }
           for (let k = 0; k < 6; k++) strain[k] += Be[k * width + j] * q
         }
-        gradient[e] -= penal * (E0 - Emin) * density[e] ** (penal - 1) * Math.max(0, energy)
+        if (!wasm) gradient[e] -= penal * (E0 - Emin) * density[e] ** (penal - 1) * Math.max(0, energy)
         for (let j = 0; j < 6; j++) {
           let value = 0
           for (let k = 0; k < 6; k++) value += D[j * 6 + k] * strain[k]
-          stress[j] = pcg.modulus[e] * value
+          stress[j] = modulus[e] * value
         }
         vonMises[e] = Math.max(vonMises[e], vonMises3D(stress[0], stress[1], stress[2], stress[3], stress[4], stress[5]))
+      }
+      if (wasm) {
+        const partial = wasm.gradient
+        for (let e = 0; e < gradient.length; e++) gradient[e] += partial[e]
       }
     }
     if (!Number.isFinite(compliance) || !Number.isFinite(maxDeflection) || vonMises.some(value => !Number.isFinite(value))) {
@@ -216,6 +270,7 @@ export class Simp3D {
   private readonly setup
   private readonly filter: DensityFilter3D | UnstructuredConeFilter3D
   private analysis?: Analysis3D
+  private backend?: WasmBackend3D
   private readonly design: Float64Array
   private readonly candidate: Float64Array
   private readonly physical: Float64Array
@@ -233,15 +288,15 @@ export class Simp3D {
 
   readonly problem: SimpProblem3D
 
-  readonly adaptiveBytes: number
+  private readonly estimatedAdaptiveBytes: number
 
   constructor(input: SimpProblem3D, previous?: { design: Float64Array; iteration: number },
-    prepared?: ReturnType<typeof preflightAdaptiveSolver3D>) {
+    prepared?: ReturnType<typeof preflightAdaptiveSolver3D>, backend?: WasmBackend3D) {
     this.problem = input.elementType === 'adaptiveTet4' && !input.mesh ? { ...input, mesh: generateAdaptiveMesh3D(input) } : input
     const { grid, params, elementType = 'hex8', mesh } = this.problem
     const count = mesh?.stats.elements ?? elementCount(grid, elementType)
     const plan = mesh && (prepared ?? preflightAdaptiveSolver3D(this.problem, mesh))
-    this.adaptiveBytes = plan?.estimatedBytes ?? 0
+    this.estimatedAdaptiveBytes = plan?.estimatedBytes ?? 0
     this.setup = validateProblem3D(this.problem)
     this.filter = mesh && plan ? new UnstructuredConeFilter3D(mesh, plan)
       : new DensityFilter3D(grid, params.rmin, this.setup.voidMask, elementType)
@@ -280,9 +335,21 @@ export class Simp3D {
       const value = this.beta ? 0.5 + Math.atanh((2 * physical - 1) * Math.tanh(this.beta / 2)) / this.beta : physical
       for (let e = 0; e < count; e++) this.design[e] = this.setup.voidMask[e] ? 0 : value
     }
+    this.setBackend(backend)
   }
 
   get designDensity() { return this.design.slice() }
+  get engine(): SolverEngine3D { return this.backend ? 'wasm' : 'js' }
+  get adaptiveBytes() {
+    return this.estimatedAdaptiveBytes + (this.filter instanceof UnstructuredConeFilter3D ? this.filter.wasmBytes : 0)
+  }
+
+  setBackend(backend?: WasmBackend3D) {
+    if (this.backend === backend) return
+    this.backend = backend
+    this.analysis?.setBackend(backend)
+    this.filter.setBackend(backend)
+  }
 
   private projectionBeta(iteration: number) {
     return this.problem.params.heaviside ? 2 ** Math.min(3, Math.floor((iteration - 1) / 20)) : 0
@@ -414,8 +481,9 @@ export class Simp3D {
       this.matchVolume()
     }
     const volume = this.density(this.design, this.physical)
-    const analysis = this.analysis ??= new Analysis3D(this.problem, this.setup.fixed, this.setup.forces)
+    const analysis = this.analysis ??= new Analysis3D(this.problem, this.setup.fixed, this.setup.forces, this.backend)
     const { compliance, maxDeflection } = analysis.solve(this.physical, params.penal, this.iteration <= 10 ? 1e-5 : 1e-6)
+    if (this.backend && analysis.engine === 'js') this.setBackend()
     const { vonMises, displacements } = analysis
     let maxVonMises = 0
     const stress: number[] = []
