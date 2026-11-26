@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { ConvergenceChart, type Sample } from './components/ConvergenceChart'
 import { Controls } from './components/Controls'
 import { Engineering } from './components/Engineering'
@@ -25,8 +25,11 @@ const initialSettings: Settings = {
   preset: 'mbb', resolution: '48 × 16', material: 'steel', widthMm: 120, thicknessMm: 10, params: defaultParams,
 }
 const languageKey = 'topostudio-language'
+const Workbench3D = lazy(() => import('./components/Workbench3D'))
 
 export default function App() {
+  const [is3D, setIs3D] = useState(false)
+  const [visited3D, setVisited3D] = useState(false)
   const [language, setLanguage] = useState<Language>(() => {
     try {
       const saved = localStorage.getItem(languageKey)
@@ -37,15 +40,45 @@ export default function App() {
   })
   useEffect(() => {
     document.documentElement.lang = language
-    document.title = `TopoStudio · ${dictionaries[language].app}`
+    document.title = `TopoStudio · ${dictionaries[language][is3D ? 'app3d' : 'app']}`
     try { localStorage.setItem(languageKey, language) } catch { /* Storage may be disabled. */ }
-  }, [language])
+  }, [language, is3D])
+  const header = (transport?: ReactNode) => <WorkbenchHeader is3D={is3D} language={language} setLanguage={setLanguage}
+    transport={transport} setIs3D={value => { setIs3D(value); if (value) setVisited3D(true) }} />
   return <LanguageContext.Provider value={language}>
-    <Workbench language={language} setLanguage={setLanguage} />
+    <div hidden={is3D}><Workbench active={!is3D} header={header} /></div>
+    {visited3D && <div hidden={!is3D}><Suspense fallback={header()}>
+      <Workbench3D active={is3D} header={header} />
+    </Suspense></div>}
   </LanguageContext.Provider>
 }
 
-function Workbench({ language, setLanguage }: { language: Language; setLanguage: (value: Language) => void }) {
+function WorkbenchHeader({ is3D, setIs3D, language, setLanguage, transport }: {
+  is3D: boolean
+  setIs3D: (value: boolean) => void
+  language: Language
+  setLanguage: (value: Language) => void
+  transport?: ReactNode
+}) {
+  const { t } = useTranslation()
+  return <header className="app-header">
+    <div className="brand">
+      <span className="brand-mark" aria-hidden="true">T</span>
+      <div><h1>TopoStudio</h1><p>{t(is3D ? 'app3d' : 'app')}</p></div>
+    </div>
+    <div className="segmented mode-switcher" role="group" aria-label={t('workbenchMode')}>
+      <Tooltip message="hint3dMode2d"><button type="button" aria-pressed={!is3D} onClick={() => setIs3D(false)}>2D</button></Tooltip>
+      <Tooltip message="hint3dMode3d"><button type="button" aria-pressed={is3D} onClick={() => setIs3D(true)}>3D</button></Tooltip>
+    </div>
+    {transport}
+    <div className="segmented language-switcher" role="group" aria-label={t('language')}>
+      {languages.map(value => <button key={value} type="button" aria-pressed={language === value}
+        onClick={() => setLanguage(value)}>{value.toUpperCase()}</button>)}
+    </div>
+  </header>
+}
+
+function Workbench({ active, header }: { active: boolean; header: (transport: ReactNode) => ReactNode }) {
   const { t, diagnostic, number, significant, fixed } = useTranslation()
   const [projectError, setProjectError] = useState<Diagnostic>()
   const [projectRevision, setProjectRevision] = useState(0)
@@ -123,6 +156,13 @@ function Workbench({ language, setLanguage }: { language: Language; setLanguage:
     paintRequest.current = undefined
     queued.current = undefined
   }, [])
+
+  useEffect(() => {
+    if (!active && runState === 'running') {
+      workerRef.current?.postMessage({ type: 'pause' } satisfies WorkerCommand)
+      setRunState('pausing')
+    }
+  }, [active, runState])
 
   function reset() {
     workerRef.current?.terminate()
@@ -246,22 +286,12 @@ function Workbench({ language, setLanguage }: { language: Language; setLanguage:
 
   return (
     <div className="min-h-screen antialiased">
-      <header className="app-header">
-        <div className="brand">
-          <span className="brand-mark" aria-hidden="true">T</span>
-          <div><h1>TopoStudio</h1><p>{t('app')}</p></div>
-        </div>
-        <div className="transport" role="group" aria-label={t('playback')}>
+      {header(<div className="transport" role="group" aria-label={t('playback')}>
           <button type="button" onClick={() => send('start')} disabled={!canRun} className="play"><span aria-hidden="true">▶</span> {t('play')}</button>
           <button type="button" onClick={() => send('pause')} disabled={runState !== 'running'}><span aria-hidden="true">Ⅱ</span> {t('pause')}</button>
           <button type="button" onClick={() => send('step')} disabled={!canRun}><span aria-hidden="true">▸│</span> {t('step')}</button>
           <button type="button" onClick={reset} disabled={runState === 'ready'}><span aria-hidden="true">↺</span> {t('reset')}</button>
-        </div>
-        <div className="segmented language-switcher" role="group" aria-label={t('language')}>
-          {languages.map(value => <button key={value} type="button" aria-pressed={language === value}
-            onClick={() => setLanguage(value)}>{value.toUpperCase()}</button>)}
-        </div>
-      </header>
+      </div>)}
       <main className={`workspace${setupVisible ? '' : ' workspace-expanded'}`}>
         <Controls settings={settings} setSettings={changeSettings} hidden={!setupVisible}>
           <LoadCases grid={grid} cases={problem.loadCases} active={activeCase} onSelect={setSelectedCaseId}

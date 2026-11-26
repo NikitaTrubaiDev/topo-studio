@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import { useTranslation } from '../i18n'
 import type { Message } from '../i18n/dictionaries'
 
-type TooltipMessage = Extract<Message, `tip${string}`>
+export type TooltipMessage = Extract<Message, `tip${string}` | `hint3d${string}`>
 
 export function Tooltip({ message, children, info }: {
   message: TooltipMessage

@@ -319,3 +319,44 @@ output { color: var(--accent); font: 11px var(--mono); white-space: nowrap; }
 @keyframes tooltip-in { from { opacity: 0; } to { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { .tooltip-popup { animation: none; } }
 .canvas-field:has(.magnification) .build-indicator { top: 35px; }
+
+.mode-switcher {
+  flex: 0 0 auto;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid #3b515d;
+  border-radius: 999px;
+  background: #101820;
+}
+.mode-switcher button { min-width: 40px; border-radius: 999px; font: 650 13px var(--mono); }
+.viewport-field-3d { position: relative; height: clamp(360px, calc(100svh - 205px), 810px); background: #141d27; }
+.viewport-field-3d canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+.viewport-field-3d canvas:focus-visible { outline: 1px solid var(--accent); outline-offset: -2px; }
+.viewport-field-3d canvas[data-drag] { cursor: grabbing; }
+.viewport-field-3d canvas[data-drag="pan"] { cursor: move; }
+.viewport-field-3d canvas[data-drag="zoom"] { cursor: ns-resize; }
+.view-presets-3d { position: absolute; top: 12px; right: 12px; }
+.view-presets-3d button { background: #131d26e8; border-color: #344653; }
+.camera-hint-3d, .viewport-notice-3d, .stress-legend-3d {
+  border: 1px solid #344653;
+  border-radius: 5px;
+  background: #131d26e8;
+  color: #c8d7e2;
+  padding: 6px 8px;
+}
+.camera-hint-3d { position: absolute; bottom: 12px; left: 12px; max-width: calc(100% - 154px); font-size: 11px; pointer-events: none; }
+.viewport-notice-3d { position: absolute; top: 43%; left: 50%; transform: translateX(-50%); width: max-content; max-width: 80%; font-size: 13px; }
+.stress-legend-3d { width: 121px; }
+.inspection-3d { border-top: 1px solid var(--border); border-bottom: 0; }
+.section-planes-3d { display: flex; align-items: center; gap: 8px 16px; flex-wrap: wrap; }
+.section-axis-3d { display: grid; grid-template-columns: auto minmax(44px, 92px) 64px; gap: 6px; align-items: center; }
+.section-axis-3d label { font: 12px var(--mono); color: var(--muted); }
+.section-axis-3d input { margin: 0; }
+.field-3d { display: grid; gap: 4px; }
+@media (max-width: 520px) {
+  .viewport-field-3d { height: clamp(300px, 58svh, 540px); }
+  .view-presets-3d { top: 8px; right: 8px; }
+  .view-presets-3d button { padding-inline: 5px; }
+  .section-planes-3d { column-gap: 10px; }
+  .section-axis-3d { grid-template-columns: auto 50px 54px; }
+}
