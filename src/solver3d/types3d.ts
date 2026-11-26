@@ -1,4 +1,5 @@
 import type { Material, PassiveMasks } from '../solver/types'
+import type { AdaptiveMesh3D, AdaptiveOptions3D } from './adaptiveMesh3d'
 
 export interface Grid3D {
   nelx: number
@@ -9,7 +10,7 @@ export interface Grid3D {
   depthMm: number
 }
 
-export type ElementType3D = 'hex8' | 'tet4'
+export type ElementType3D = 'hex8' | 'tet4' | 'adaptiveTet4'
 
 export type Symmetry3D = 'none' | 'z' | 'y' | 'yz'
 
@@ -51,6 +52,8 @@ export interface LoadCase3D {
 export interface SimpProblem3D {
   elementType?: ElementType3D
   grid: Grid3D
+  adaptive?: AdaptiveOptions3D
+  mesh?: AdaptiveMesh3D
   material: Material
   params: SimpParams3D
   supports: readonly Support3D[]

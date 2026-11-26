@@ -1,6 +1,7 @@
 import { Multigrid3D } from './multigrid3d'
 import { Stiffness3D } from './stiffness3d'
-import { elementCount, nodeCount, type ElementType3D, type Grid3D, type Support3D } from './types3d'
+import type { UnstructuredStiffness3D } from './unstructuredTet4'
+import { nodeCount, type ElementType3D, type Grid3D, type Support3D } from './types3d'
 
 const maxRestarts = 4
 const stallIterations = 256
@@ -21,8 +22,8 @@ function dot(a: Float64Array, b: Float64Array) {
   return sum
 }
 
-export class Pcg3D {
-  readonly stiffness: Stiffness3D
+export class Pcg3D<S extends Stiffness3D | UnstructuredStiffness3D = Stiffness3D> {
+  readonly stiffness: S
   readonly modulus: Float64Array
   private readonly multigrid?: Multigrid3D
   private readonly rhs: Float64Array
@@ -33,13 +34,14 @@ export class Pcg3D {
   private readonly preconditioned: Float64Array
 
   constructor(grid: Grid3D, readonly Ke: Float64Array, readonly fixed: Uint8Array,
-    options: { nu?: number; elementType?: ElementType3D; matrices?: readonly Float64Array[] } = {}) {
-    const { nu, elementType = 'hex8', matrices = [Ke] } = options
-    this.stiffness = new Stiffness3D(grid, matrices, fixed, elementType)
-    if (nu !== undefined && Math.min(grid.nelx, grid.nely, grid.nelz) >= 4) {
-      this.multigrid = new Multigrid3D(this.stiffness, nu, elementType)
+    options: { nu?: number; elementType?: ElementType3D; matrices?: readonly Float64Array[]; stiffness?: S } = {}) {
+    const { nu, elementType = 'hex8', matrices = [Ke], stiffness } = options
+    const operator = stiffness ?? new Stiffness3D(grid, matrices, fixed, elementType)
+    this.stiffness = operator as S
+    if (operator instanceof Stiffness3D && nu !== undefined && Math.min(grid.nelx, grid.nely, grid.nelz) >= 4) {
+      this.multigrid = new Multigrid3D(operator, nu, elementType)
     }
-    this.modulus = new Float64Array(elementCount(grid, elementType))
+    this.modulus = new Float64Array(operator.templateIndex.length)
     this.rhs = new Float64Array(fixed.length)
     this.residual = new Float64Array(fixed.length)
     this.direction = new Float64Array(fixed.length)

@@ -33,24 +33,28 @@ export function tet4Templates(E: number, nu: number, hx: number, hy: number, hz:
     const det = a.reduce((sum, v, d) => sum + v * grads[0][d], 0)
     grads.unshift(size.map((_, d) => -grads[0][d] - grads[1][d] - grads[2][d]))
     const volume = hx * hy * hz * det / 6
-    const B = new Float64Array(6 * 12)
-    grads.forEach((grad, i) => {
-      const [dx, dy, dz] = grad.map((v, d) => v / (det * size[d]))
-      const j = 3 * i
-      B[j] = B[36 + j + 1] = B[60 + j + 2] = dx
-      B[12 + j + 1] = B[36 + j] = B[48 + j + 2] = dy
-      B[24 + j + 2] = B[48 + j + 1] = B[60 + j] = dz
-    })
-    const DB = new Float64Array(B.length)
-    for (let r = 0; r < 6; r++) for (let j = 0; j < 12; j++) for (let k = 0; k < 6; k++) {
-      DB[r * 12 + j] += D[r * 6 + k] * B[k * 12 + j]
-    }
-    const Ke = new Float64Array(144)
-    for (let i = 0; i < 12; i++) for (let j = i; j < 12; j++) {
-      let value = 0
-      for (let k = 0; k < 6; k++) value += B[k * 12 + i] * DB[k * 12 + j]
-      Ke[i * 12 + j] = Ke[j * 12 + i] = value * volume
-    }
-    return { B, Ke, volume }
+    return tet4Stiffness(grads.map(grad => grad.map((v, d) => v / (det * size[d]))), volume, D)
   }))
+}
+
+/** Constant engineering strain and full symmetric stiffness of a linear tetrahedron. */
+export function tet4Stiffness(grads: number[][], volume: number, D: Float64Array) {
+  const B = new Float64Array(6 * 12)
+  grads.forEach(([dx, dy, dz], i) => {
+    const j = 3 * i
+    B[j] = B[36 + j + 1] = B[60 + j + 2] = dx
+    B[12 + j + 1] = B[36 + j] = B[48 + j + 2] = dy
+    B[24 + j + 2] = B[48 + j + 1] = B[60 + j] = dz
+  })
+  const DB = new Float64Array(B.length)
+  for (let r = 0; r < 6; r++) for (let j = 0; j < 12; j++) for (let k = 0; k < 6; k++) {
+    DB[r * 12 + j] += D[r * 6 + k] * B[k * 12 + j]
+  }
+  const Ke = new Float64Array(144)
+  for (let i = 0; i < 12; i++) for (let j = i; j < 12; j++) {
+    let value = 0
+    for (let k = 0; k < 6; k++) value += B[k * 12 + i] * DB[k * 12 + j]
+    Ke[i * 12 + j] = Ke[j * 12 + i] = value * volume
+  }
+  return { B, Ke, volume }
 }

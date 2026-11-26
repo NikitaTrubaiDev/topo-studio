@@ -87,4 +87,38 @@ it('transfers the tagged nonlinear Tet4 starting field and reuses solver state f
   expect(events[0]).toMatchObject({ type: 'preview', requestId: 41, density: expected.initialDensity(), passive: expected.passiveMasks })
   scope.onmessage!({ data: { type: 'step' } })
   expect(events[1]).toMatchObject({ type: 'frame', snapshot: { iteration: 1, density: expected.step().density } })
-})
+}, 15000)
+
+it('generates adaptive geometry before solving and continues the same iteration history after AMR', async () => {
+  const events: WorkerEvent3D[] = []
+  const scope = {
+    onmessage: undefined as ((event: { data: WorkerCommand3D }) => void) | undefined,
+    postMessage(event: WorkerEvent3D, transfer: ArrayBuffer[]) {
+      events.push(structuredClone(event, { transfer }))
+    },
+  }
+  vi.stubGlobal('self', scope)
+  await import('../simp3dWorker')
+  const grid = { ...presetGrid3D([12, 6, 4]), widthMm: 60, heightMm: 30, depthMm: 20 }
+  const problem = makePreset3D('cantilever3d', grid, { ...defaultParams3D, rmin: 1, changeTol: 0 }, undefined, 'adaptiveTet4')
+  problem.adaptive = { maxLevel: 2, refineLoads: false, refineFeatures: false }
+  const send = (data: WorkerCommand3D) => scope.onmessage!({ data })
+  send({ type: 'preview', problem, requestId: 72 })
+  const generated = events[0]
+  expect(generated).toMatchObject({ type: 'preview', requestId: 72, mesh: { stats: { elements: expect.any(Number) } } })
+  if (generated.type !== 'preview' || !generated.mesh) throw new Error('Missing adaptive preview')
+  expect(generated.density).toHaveLength(generated.mesh.stats.elements)
+  send({ type: 'step' })
+  expect(events[1]).toMatchObject({ type: 'frame', snapshot: { iteration: 1 } })
+  send({ type: 'refine', threshold: 0.5 })
+  const refined = events.at(-1)
+  expect(refined).toMatchObject({ type: 'refined', snapshot: { iteration: 1 } })
+  if (refined?.type !== 'refined') throw new Error('Missing AMR frame')
+  expect(refined.mesh.stats.elements).toBeGreaterThan(generated.mesh.stats.elements)
+  expect(refined.snapshot.volFrac).toBeCloseTo(problem.params.volFrac, 7)
+  send({ type: 'step' })
+  expect(events.at(-2)).toMatchObject({ type: 'frame', snapshot: { iteration: 2 } })
+  send({ type: 'reset' })
+  send({ type: 'preview', problem, requestId: 73 })
+  expect(events.at(-1)).toMatchObject({ type: 'preview', requestId: 73, mesh: { stats: { elements: generated.mesh.stats.elements } } })
+}, 15000)

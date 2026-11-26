@@ -6,6 +6,8 @@ import { cellSize, elementCount, elementIndex, type ElementType3D, type Grid3D }
 import { surfaceValidator3D, validateSurface3D } from './surfaceValidation3d'
 import type { PassiveMasks } from '../solver/types'
 
+import type { AdaptiveMesh3D } from './adaptiveMesh3d'
+
 export { signedTriangleVolume6, triangleNormal, type Surface3D } from './surface3d'
 export { marchingTetrahedra } from './tetSurface3d'
 
@@ -161,7 +163,8 @@ function marchCubes(density: ArrayLike<number>, grid: Grid3D, threshold: number,
 /** Extract the cell-centered scalar field, with optional refinement on smaller grids.
  * Tet4 values are restricted by physical volume, independent of brick parity. */
 export function prepareCadSurface3D(density: ArrayLike<number>, grid: Grid3D, threshold: number, passes: number,
-  passive?: PassiveMasks, elementType: ElementType3D = 'hex8') {
+  passive?: PassiveMasks, elementType: ElementType3D = 'hex8', mesh?: AdaptiveMesh3D) {
+  if (elementType === 'adaptiveTet4') return prepareSurface3D(density, grid, threshold, passes, passive, elementType, mesh)
   const { nelx, nely, nelz } = grid
   const count = elementCount(grid)
   if (density.length !== elementCount(grid, elementType)) throw new RangeError('Invalid CAD density input')
@@ -347,16 +350,19 @@ function smoothSurface(mesh: Surface3D, grid: Grid3D, passes: number, lambda = 0
 }
 
 export function extractSurface3D(density: ArrayLike<number>, grid: Grid3D, threshold = 0.5, passes = 4, passive?: PassiveMasks,
-  elementType: ElementType3D = 'hex8') {
-  if (passes < 1) return (elementType === 'tet4' ? marchingTetrahedra : marchingCubes)(density, grid, threshold, passive)
-  return prepareSurface3D(density, grid, threshold, passes, passive, elementType).surface
+  elementType: ElementType3D = 'hex8', mesh?: AdaptiveMesh3D) {
+  if (passes < 1 && elementType !== 'adaptiveTet4') return (elementType === 'tet4' ? marchingTetrahedra : marchingCubes)(density, grid, threshold, passive)
+  return prepareSurface3D(density, grid, threshold, passes, passive, elementType, mesh).surface
 }
 
 /** Extract and validate at both export precisions, reusing validation from smoothing. */
 export function prepareSurface3D(density: ArrayLike<number>, grid: Grid3D, threshold = 0.5, passes = 4, passive?: PassiveMasks,
-  elementType: ElementType3D = 'hex8') {
-  const march = elementType === 'tet4' ? marchingTetrahedra : marchingCubes
-  return smoothSurface(march(density, grid, threshold, passive), grid, passes)
+  elementType: ElementType3D = 'hex8', mesh?: AdaptiveMesh3D) {
+  if (elementType === 'adaptiveTet4' && !mesh) throw new RangeError('Adaptive mesh required')
+  const surface = elementType === 'hex8' ? marchingCubes(density, grid, threshold, passive)
+    : marchingTetrahedra(density, grid, threshold, passive, mesh)
+  if (mesh && surface.triangles.length / 3 > cadTriangleBudget) throw new CadTriangleBudgetError('Adaptive Tet4 triangle budget exceeded')
+  return smoothSurface(surface, grid, passes, 0.5, -0.53, mesh ? 0.35 : 0.08)
 }
 
 export function vertexNormals({ vertices, triangles }: Surface3D) {

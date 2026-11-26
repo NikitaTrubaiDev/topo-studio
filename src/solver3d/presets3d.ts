@@ -6,6 +6,7 @@ import {
 } from './types3d'
 
 export const resolutions3D = [[24, 12, 8], [36, 18, 12], [48, 24, 16], [64, 32, 20], [80, 40, 24]] as const
+export const adaptiveResolutions3D = [[24, 12, 8], [32, 16, 12], [40, 20, 16]] as const
 export const presets3D = ['cantilever3d', 'boltBracket3d', 'archBridge3d', 'lBracket3d'] as const
 export type Preset3D = typeof presets3D[number]
 export const defaultParams3D: SimpParams3D = {
@@ -15,6 +16,14 @@ export const defaultParams3D: SimpParams3D = {
 export function presetGrid3D(resolution: readonly [number, number, number]): Grid3D {
   const [nelx, nely, nelz] = resolution
   return { nelx, nely, nelz, widthMm: 120, heightMm: 60, depthMm: 40 }
+}
+
+export function adaptivePresetGrid3D(resolution: number, size: Pick<Grid3D, 'widthMm' | 'heightMm' | 'depthMm'>) {
+  const base = adaptiveResolutions3D[resolution] ?? adaptiveResolutions3D[0]
+  const longest = Math.max(size.widthMm, size.heightMm, size.depthMm)
+  const count = Math.max(...base) / 2
+  const steps = [size.widthMm, size.heightMm, size.depthMm].map(span => 2 * Math.max(2, Math.round(count * span / longest)))
+  return { ...size, nelx: steps[0], nely: steps[1], nelz: steps[2] }
 }
 
 export function makePreset3D(

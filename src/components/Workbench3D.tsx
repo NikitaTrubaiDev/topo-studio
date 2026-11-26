@@ -9,7 +9,8 @@ import {
 } from '../solver3d/design3d'
 import { exportObj3D, exportStl3D } from '../solver3d/export3d'
 import { maxSmoothingPasses3D } from '../solver3d/marchingCubes'
-import { defaultParams3D, makePreset3D, presetGrid3D, presets3D, resolutions3D, type Preset3D } from '../solver3d/presets3d'
+import { defaultAdaptiveOptions3D, type AdaptiveMesh3D } from '../solver3d/adaptiveMesh3d'
+import { adaptivePresetGrid3D, adaptiveResolutions3D, defaultParams3D, makePreset3D, presetGrid3D, presets3D, resolutions3D, type Preset3D } from '../solver3d/presets3d'
 import { cellSize, elementCount, maxCellAspectRatio3D, nodeCount, nodePosition, type ElementType3D, type Grid3D, type SimpProblem3D, type ProblemIssue3D, type SimpParams3D, type Symmetry3D } from '../solver3d/types3d'
 import type { Preview3D, SurfaceEvent3D, SurfaceInput3D, SurfaceRequest3D, TimedSnapshot3D, WorkerCommand3D, WorkerEvent3D } from '../workers/protocol3d'
 import { ConvergenceChart, type Sample } from './ConvergenceChart'
@@ -17,7 +18,9 @@ import { download } from './ExportDialog'
 import { Tooltip, type TooltipMessage } from './Tooltip'
 import { Viewport3D, type ViewMode3D } from './Viewport3D'
 
-type RunState = 'ready' | 'running' | 'pausing' | 'paused' | 'stepping' | 'complete' | 'error'
+const elementLabels = { hex8: 'hex8Elements3d', tet4: 'tet4Elements3d', adaptiveTet4: 'adaptiveTet4Elements3d' } as const
+
+type RunState = 'refining' | 'ready' | 'running' | 'pausing' | 'paused' | 'stepping' | 'complete' | 'error'
 type SurfaceSettings = { threshold: number; smoothing: number }
 type Dimension = 'widthMm' | 'heightMm' | 'depthMm'
 const dimensions = [['widthMm', 'width'], ['heightMm', 'height'], ['depthMm', 'depth3d']] as const
@@ -82,7 +85,8 @@ function ExportDialog3D({ result, pending, elementType, settings, change, close 
   function save(format: 'stl' | 'obj') {
     if (!surface || !valid?.[format]) return
     try {
-      const data = format === 'stl' ? exportStl3D(surface, true) : exportObj3D(surface, true)
+      const data = format === 'stl' ? exportStl3D(surface, true)
+        : elementType === 'adaptiveTet4' ? exportObj3D(surface, true, 50) : exportObj3D(surface, true)
       download(data, format, format === 'stl' ? 'model/stl' : 'model/obj', 'topostudio-3d')
     } catch {
       setExportError(true)
@@ -94,7 +98,7 @@ function ExportDialog3D({ result, pending, elementType, settings, change, close 
   }
   return <dialog ref={dialog} className="export-dialog panel" onClose={close} aria-labelledby="export-title-3d">
     <form method="dialog" className="export-header">
-      <h2 id="export-title-3d">{t('exportTitle3d')} · {t(elementType === 'tet4' ? 'tet4Elements3d' : 'hex8Elements3d')}</h2>
+      <h2 id="export-title-3d">{t('exportTitle3d')} · {t(elementLabels[elementType])}</h2>
       <Tooltip message="hint3dClose"><button className="tool-button" autoFocus>{t('close')}</button></Tooltip>
     </form>
     <div className="parameter-label">
@@ -126,6 +130,8 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
   const [preset, setPreset] = useState<Preset3D>('cantilever3d')
   const [elementType, setElementType] = useState<ElementType3D>('hex8')
   const [resolution, setResolution] = useState(0)
+  const [adaptive, setAdaptive] = useState(defaultAdaptiveOptions3D)
+  const isAdaptive = elementType === 'adaptiveTet4'
   const [history, setHistory] = useState<BoundaryHistory3D>()
   const [selectedCase, selectCase] = useState('')
   const [tool, setTool] = useState<EditTool3D>('orbit')
@@ -138,8 +144,9 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
   const [params, setParams] = useState(defaultParams3D)
   const [state, setState] = useState<RunState>('ready')
   const [frame, setFrame] = useState<TimedSnapshot3D>()
+  const [refinedMesh, setRefinedMesh] = useState<AdaptiveMesh3D>()
   const [samples, setSamples] = useState<Sample[]>([])
-  const [error, setError] = useState<{ issue: ProblemIssue3D | 'workerError'; relativeResidual?: number }>()
+  const [error, setError] = useState<{ issue: ProblemIssue3D | 'workerError'; relativeResidual?: number; recoverable?: boolean }>()
   const [mode, setMode] = useState<ViewMode3D>('auto')
   const [exportOpen, setExportOpen] = useState(false)
   const [settings, setSettings] = useState<SurfaceSettings>({ threshold: 0.5, smoothing: 4 })
@@ -151,10 +158,12 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
     problem: SimpProblem3D; restart: number; preview?: Preview3D; failed?: boolean
   }>()
   const [surfaceResult, setSurfaceResult] = useState<{ input: SurfaceInput3D; result: SurfaceEvent3D; frame?: TimedSnapshot3D }>()
-  const grid = useMemo(() => ({ ...presetGrid3D(resolutions3D[resolution]), ...size }), [resolution, size])
+  const grid = useMemo(() => isAdaptive ? adaptivePresetGrid3D(resolution, size)
+    : { ...presetGrid3D(resolutions3D[resolution]), ...size }, [isAdaptive, resolution, size])
   const presetProblem = useMemo(() => makePreset3D(preset, grid, params, materials[material], elementType), [preset, grid, params, material, elementType])
   const design = history?.present ?? presetProblem
-  const problem = useMemo(() => ({ ...presetProblem, supports: design.supports, loadCases: design.loadCases }), [presetProblem, design])
+  const problem = useMemo(() => ({ ...presetProblem, supports: design.supports, loadCases: design.loadCases,
+    ...(isAdaptive && { adaptive }) }), [presetProblem, design, isAdaptive, adaptive])
   const activeCase = problem.loadCases.find(load => load.id === selectedCase) ?? problem.loadCases[0]
   const stable = useMemo(() => rigidRank3D(grid, design.supports) === 6, [grid, design.supports])
   const magnitude = forceMagnitude3D(force)
@@ -162,16 +171,19 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
   const preview = currentPreview?.preview
   const pendingPreview = !currentPreview
   const density = frame?.density ?? preview?.density
+  const mesh = refinedMesh ?? preview?.mesh
+  const meshStats = mesh?.stats
+  const viewportProblem = useMemo(() => mesh ? { ...problem, mesh } : problem, [problem, mesh])
   const view = mode === 'auto' ? frame && (state === 'paused' || state === 'complete') ? 'cad' : 'voxels' : mode
-  const buildSurface = active && (view !== 'voxels' || exportOpen)
+  const buildSurface = active && (view === 'cad' || view === 'stress' || exportOpen)
   const passive = preview?.passive
   const surfaceInput = useMemo<SurfaceInput3D | undefined>(() => density &&
-    { density, grid, ...settings, passive, elementType, cad: true }, [density, grid, settings, passive, elementType])
+    { density, grid, ...settings, passive, elementType, mesh, cad: true }, [density, grid, settings, passive, elementType, mesh])
   const exported = surfaceResult && surfaceResult.input === surfaceInput ? surfaceResult.result : undefined
   // Preserve the last surface for this run while a newer worker result is
   // pending. Keep stress colors tied to the frame that produced the geometry.
   const matchingSurface = frame && surfaceResult?.frame && surfaceResult.input.grid === grid
-    && surfaceResult.input.elementType === elementType && surfaceResult.input.passive === passive
+    && surfaceResult.input.elementType === elementType && surfaceResult.input.passive === passive && surfaceResult.input.mesh === mesh
     && surfaceResult.input.threshold === settings.threshold && surfaceResult.input.smoothing === settings.smoothing
   const display = exported || matchingSurface ? surfaceResult : undefined
   const renderData = display?.result.type === 'surface' ? display.result.render : undefined
@@ -187,20 +199,28 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
         if (instance !== worker.current || requestId !== previewRequest.current) return
         if (data.type === 'preview') {
           if (data.requestId === requestId) setPreviewResult({ problem, restart, preview: data })
+        } else if (data.type === 'refined') {
+          setRefinedMesh(data.mesh)
+          setFrame(data.snapshot)
+          setSamples(values => [...values.slice(0, -1), { iteration: data.snapshot.iteration,
+            compliance: data.snapshot.compliance, volFrac: data.snapshot.volFrac }])
+          setState('paused')
         } else if (data.type === 'frame') {
           const { snapshot } = data
           setFrame(snapshot)
           setSamples(values => [...values, { iteration: snapshot.iteration, compliance: snapshot.compliance, volFrac: snapshot.volFrac }])
           if (snapshot.done) {
             setState('complete')
-            instance?.terminate()
-            worker.current = null
+            if (!isAdaptive) {
+              instance?.terminate()
+              worker.current = null
+            }
           }
         } else if (data.type === 'paused') setState('paused')
         else if (data.type === 'done') setState('complete')
         else {
           setError(data)
-          setState('error')
+          setState(data.recoverable ? 'paused' : 'error')
         }
       }
       instance.onerror = () => {
@@ -219,7 +239,7 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
       if (worker.current === instance) worker.current = null
       instance?.terminate()
     }
-  }, [problem, restart])
+  }, [problem, restart, isAdaptive])
 
   useEffect(() => {
     if (!buildSurface || !surfaceInput || exported) return
@@ -254,6 +274,7 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
 
   function clearRun() {
     setFrame(undefined)
+    setRefinedMesh(undefined)
     setSamples([])
     setError(undefined)
     setState('ready')
@@ -289,31 +310,36 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
     setParams(current => incompatibleSymmetry(next, current.symmetry) ? { ...current, symmetry: 'none' } : current)
   }
 
-  function send(type: 'start' | 'pause' | 'step') {
+  function send(type: 'start' | 'pause' | 'step' | 'refine') {
     if (!worker.current) return
+    if (error?.recoverable) setError(undefined)
     try {
-      setState(type === 'start' ? 'running' : type === 'pause' ? 'pausing' : 'stepping')
-      worker.current.postMessage({ type } satisfies WorkerCommand3D)
+      setState(type === 'start' ? 'running' : type === 'pause' ? 'pausing' : type === 'refine' ? 'refining' : 'stepping')
+      worker.current.postMessage({ type, ...(type === 'refine' && { threshold: settings.threshold }) } satisfies WorkerCommand3D)
     } catch {
       setError({ issue: 'workerError' })
       setState('error')
     }
   }
 
-  const issue = !stable ? 'support3dError' : preview?.issue ?? error?.issue ?? (currentPreview?.failed ? 'workerError' : undefined)
+  const issue = !stable ? 'support3dError' : preview?.issue ?? (error?.recoverable ? undefined : error?.issue) ?? (currentPreview?.failed ? 'workerError' : undefined)
   const canRun = !pendingPreview && !issue && (state === 'ready' || state === 'paused')
   const forceMagnitudeError = t('forceMagnitude3dError')
     .replace('{min}', significant(minForceMagnitude3D)).replace('{max}', number(maxForceMagnitude3D))
-  const issueText = issue === 'forceMagnitude3dError' ? forceMagnitudeError : issue && t(issue).replace('{limit}', number(maxCellAspectRatio3D))
+  const displayedIssue = issue ?? error?.issue
+  const issueText = displayedIssue === 'forceMagnitude3dError' ? forceMagnitudeError
+    : displayedIssue && t(displayedIssue).replace('{limit}', number(maxCellAspectRatio3D))
   function acceptForce(magnitude: number, apply: () => void) {
     const valid = magnitude === 0 || validForceMagnitude3D(magnitude)
     setForceInputError(!valid)
     if (valid) apply()
     return valid
   }
+  const meshElements = isAdaptive ? meshStats?.elements : elementCount(grid, elementType)
+  const meshNodes = isAdaptive ? meshStats?.nodes : nodeCount(grid)
   const filterRadiusMm = params.rmin * Math.min(...cellSize(grid))
   const metrics = [
-    ['elementCount3d', 'hint3dElementCount', number(elementCount(grid, elementType)), ''],
+    ['elementCount3d', 'hint3dElementCount', number(meshElements), ''],
     ['iteration', 'tipIteration', number(frame?.iteration), ''],
     ['compliance', 'tipCompliance', significant(frame?.compliance), `${t('N')}·${t('mm')}`],
     ['volume', 'tipVolume', fixed(frame && frame.volFrac * 100, 1), '%'],
@@ -341,21 +367,59 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
           </LabeledControl>
           <p className="hint">{t(`${preset}Detail`)}</p>
           <LabeledControl id="element-type-3d" name={t('elementType3d')} tip="hint3dElementType">
-            <select id="element-type-3d" value={elementType} onChange={event => { clearRun(); setElementType(event.target.value as ElementType3D) }}>
-              <option value="hex8">{t('hex8Elements3d')}</option>
-              <option value="tet4">{t('tet4Elements3d')}</option>
+            <select id="element-type-3d" value={elementType} onChange={event => {
+              const next = event.target.value as ElementType3D
+              clearRun()
+              if (isAdaptive !== (next === 'adaptiveTet4')) {
+                resetBoundaryHistory(); setResolution(0); setMode('auto')
+              }
+              setElementType(next)
+            }}>
+              {(Object.keys(elementLabels) as ElementType3D[]).map(value => <option key={value} value={value}>{t(elementLabels[value])}</option>)}
             </select>
           </LabeledControl>
           <LabeledControl id="resolution-3d" name={t('resolution')} tip="hint3dResolution">
             <select id="resolution-3d" value={resolution} onChange={event => { clearRun(); resetBoundaryHistory(); setResolution(Number(event.target.value)) }}>
-              {resolutions3D.map((value, i) => <option key={i} value={i}>{value.join(' × ')}</option>)}
+              {(isAdaptive ? adaptiveResolutions3D : resolutions3D).map((value, i) => {
+                const reference = isAdaptive ? adaptivePresetGrid3D(i, size) : undefined
+                const divisions = reference ? [reference.nelx / 2, reference.nely / 2, reference.nelz / 2] : value
+                return <option key={i} value={i}>{divisions.join(' × ')}</option>
+              })}
             </select>
           </LabeledControl>
-          <Tooltip message="hint3dFrameMemory"><output className="resolution-badge-3d">
-            {number(elementCount(grid, elementType))} {t('elements')} · {t('frameMemory3d').replace('{size}',
-              fixed((16 * elementCount(grid, elementType) + 24 * nodeCount(grid) * problem.loadCases.length) / 2 ** 20, 1))}
-          </output></Tooltip>
+          {meshElements !== undefined && meshNodes !== undefined && <Tooltip message="hint3dFrameMemory"><output className="resolution-badge-3d">
+            {number(meshElements)} {t('elements')} · {t('frameMemory3d').replace('{size}',
+              fixed((16 * meshElements + 24 * meshNodes * problem.loadCases.length) / 2 ** 20, 1))}
+          </output></Tooltip>}
         </section>
+        {isAdaptive && <section className="adaptive-mesh-3d">
+          <h3>{t('adaptiveMeshing3d')}</h3>
+          {([['refineLoads', 'adaptiveLoads3d', 'hint3dAdaptiveLoads'], ['refineFeatures', 'adaptiveFeatures3d', 'hint3dAdaptiveFeatures']] as const)
+            .map(([key, label, tip]) => <Tooltip key={key} message={tip}><label className="check-field">
+              <input type="checkbox" checked={adaptive[key]} onChange={event => {
+                clearRun(); setAdaptive({ ...adaptive, [key]: event.target.checked })
+              }} />{t(label)}
+            </label></Tooltip>)}
+          <LabeledControl id="adaptive-depth-3d" name={t('adaptiveDepth3d')} tip="hint3dAdaptiveDepth">
+            <select id="adaptive-depth-3d" value={adaptive.maxLevel} onChange={event => {
+              clearRun(); setAdaptive({ ...adaptive, maxLevel: event.target.value === '1' ? 1 : 2 })
+            }}><option value={1}>{t('adaptiveLevelOne3d')}</option><option value={2}>{t('adaptiveLevelTwo3d')}</option></select>
+          </LabeledControl>
+          <div className="segmented adaptive-actions-3d">
+            <Tooltip message="hint3dGenerateMesh"><button type="button" disabled={pendingPreview || state === 'refining'}
+              onClick={() => { setMode('density'); reset() }}>{t('generateMesh3d')}</button></Tooltip>
+            <Tooltip message="hint3dAdaptiveRefine"><button type="button" disabled={!frame || !!issue || !['paused', 'complete'].includes(state)}
+              onClick={() => { setMode('density'); send('refine') }}>{t('adaptiveRefine3d')}</button></Tooltip>
+          </div>
+          {meshStats && <Tooltip message="hint3dMeshStats"><dl className="mesh-stats-3d" aria-label={t('meshStats3d')}>
+            <dt>{t('meshNodes3d')}</dt><dd>{number(meshStats.nodes)}</dd>
+            <dt>{t('elementCount3d')}</dt><dd>{number(meshStats.elements)}</dd>
+            {(['meshCoarse3d', 'meshMedium3d', 'meshFine3d'] as const).map((key, i) => <div key={key}>
+              <dt>{t(key)}</dt><dd>{number(meshStats.levelCounts[i])}</dd>
+            </div>)}
+            <dt>{t('meshEdges3d')}</dt><dd>{fixed(meshStats.minEdgeMm, 2)}–{fixed(meshStats.maxEdgeMm, 2)} {t('mm')}</dd>
+          </dl></Tooltip>}
+        </section>}
         <section>
           <LabeledControl id="material-3d" name={t('material')} tip="tipMaterial">
             <select id="material-3d" value={material} onChange={event => { clearRun(); setMaterial(event.target.value as MaterialId) }}>
@@ -507,10 +571,10 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
           </div>
         </div>
         {issueText && <p className="error" role="alert">{issueText}{error?.relativeResidual !== undefined &&
-          ` ${t('solveResidual3d').replace('{residual}', significant(error.relativeResidual))}`} {error && t('resetError')}</p>}
-        {view !== 'voxels' && exported?.type === 'error' && exported.reason === 'triangle-budget' &&
+          ` ${t('solveResidual3d').replace('{residual}', significant(error.relativeResidual))}`} {error && !error.recoverable && t('resetError')}</p>}
+        {(view === 'cad' || view === 'stress') && exported?.type === 'error' && exported.reason === 'triangle-budget' &&
           <p className="error" role="alert">{t('cadBudget3dError')}</p>}
-        <Viewport3D active={active} problem={problem} density={density} mode={mode} setMode={setMode}
+        <Viewport3D active={active} problem={viewportProblem} density={density} mode={mode} setMode={setMode}
           view={mode === 'auto' && !surface?.triangles.length ? 'voxels' : view} surface={surface} frame={view === 'stress' ? display?.frame : frame} renderData={renderData}
           editor={{ tool, setTool, force, caseId: activeCase.id,
             place: node => {

@@ -1,8 +1,9 @@
 /// <reference lib="webworker" />
 
+import { generateAdaptiveMesh3D, transferAdaptiveDensity3D } from '../solver3d/adaptiveMesh3d'
 import { Simp3D, validateProblem3D } from '../solver3d/simp3d'
 import { elementCount, ProblemError3D, type SimpProblem3D } from '../solver3d/types3d'
-import type { Preview3D, WorkerCommand3D, WorkerEvent3D } from './protocol3d'
+import type { Preview3D, TimedSnapshot3D, WorkerCommand3D, WorkerEvent3D } from './protocol3d'
 
 const scope = self as unknown as DedicatedWorkerGlobalScope
 let problem: SimpProblem3D | undefined
@@ -10,6 +11,7 @@ let solver: Simp3D | undefined
 let timer: ReturnType<typeof setTimeout> | undefined
 let running = false
 let finished = false
+let latest: Pick<TimedSnapshot3D, 'density' | 'vonMises' | 'iteration'> | undefined
 
 function send(event: WorkerEvent3D, transfer: Transferable[] = []) {
   scope.postMessage(event, transfer)
@@ -26,14 +28,16 @@ function reset() {
   solver = undefined
   problem = undefined
   finished = false
+  latest = undefined
 }
 
-function report(error: unknown) {
-  reset()
+function report(error: unknown, recoverable = false) {
+  if (!recoverable) reset()
+  const recovery = recoverable ? { recoverable } : {}
   if (error instanceof ProblemError3D) {
     const { code, relativeResidual } = error
-    send({ type: 'error', issue: code, ...(relativeResidual !== undefined && { relativeResidual }) })
-  } else send({ type: 'error', issue: 'workerError' })
+    send({ type: 'error', issue: code, ...recovery, ...(relativeResidual !== undefined && { relativeResidual }) })
+  } else send({ type: 'error', issue: 'workerError', ...recovery })
 }
 
 function preview(requestId: number, next: SimpProblem3D) {
@@ -42,7 +46,18 @@ function preview(requestId: number, next: SimpProblem3D) {
   const { grid, params, passive, elementType = 'hex8' } = next
   let event: Preview3D
   try {
-    if (passive?.solid?.some(Boolean)) {
+    if (elementType === 'adaptiveTet4') {
+      const mesh = generateAdaptiveMesh3D(next)
+      problem = { ...next, mesh }
+      try {
+        solver = new Simp3D(problem)
+        event = { type: 'preview', requestId, mesh, density: solver.initialDensity(), passive: solver.passiveMasks }
+      } catch (error) {
+        const density = Float64Array.from(mesh.bricks, e => passive?.void?.[e] ? 0 : passive?.solid?.[e] ? 1 : params.volFrac)
+        event = { type: 'preview', requestId, mesh, density, passive,
+          issue: error instanceof ProblemError3D ? error.code : 'workerError' }
+      }
+    } else if (passive?.solid?.some(Boolean)) {
       solver = new Simp3D(next)
       event = { type: 'preview', requestId, density: solver.initialDensity(), passive: solver.passiveMasks }
     } else {
@@ -68,6 +83,31 @@ function ensureSolver() {
   return solver
 }
 
+function snapshotBuffers(snapshot: TimedSnapshot3D) {
+  return [snapshot.density.buffer, snapshot.vonMises.buffer, ...snapshot.displacements.map(u => u.buffer)]
+}
+
+function refine(threshold?: number) {
+  const previous = solver?.problem.mesh
+  if (!previous || !solver || !latest) return
+  stop()
+  const mesh = generateAdaptiveMesh3D(solver.problem, { mesh: previous, density: latest.density, vonMises: latest.vonMises, threshold })
+  if (mesh === previous) {
+    finished = false
+    send({ type: 'paused' })
+    return
+  }
+  const start = performance.now()
+  const design = transferAdaptiveDensity3D(mesh, previous, solver.designDensity)
+  const next = new Simp3D({ ...solver.problem, mesh }, { design, iteration: latest.iteration })
+  const snapshot = { ...next.step(false), iterMs: performance.now() - start }
+  solver = next
+  problem = next.problem
+  latest = { iteration: snapshot.iteration, density: snapshot.density.slice(), vonMises: snapshot.vonMises.slice() }
+  finished = false
+  send({ type: 'refined', mesh, snapshot }, snapshotBuffers(snapshot))
+}
+
 function iterate() {
   timer = undefined
   if (!solver || finished) return
@@ -75,9 +115,8 @@ function iterate() {
     const start = performance.now()
     const snapshot = { ...solver.step(), iterMs: performance.now() - start }
     finished = snapshot.done
-    send({ type: 'frame', snapshot }, [
-      snapshot.density.buffer, snapshot.vonMises.buffer, ...snapshot.displacements.map(u => u.buffer),
-    ])
+    if (solver.problem.mesh) latest = { iteration: snapshot.iteration, density: snapshot.density.slice(), vonMises: snapshot.vonMises.slice() }
+    send({ type: 'frame', snapshot }, snapshotBuffers(snapshot))
     if (finished) stop()
     else if (running) timer = setTimeout(iterate, 0)
     else send({ type: 'paused' })
@@ -113,11 +152,14 @@ scope.onmessage = ({ data }: MessageEvent<WorkerCommand3D>) => {
           else send({ type: 'paused' })
         }
         break
+      case 'refine':
+        refine(data.threshold)
+        break
       case 'reset':
         reset()
         break
     }
   } catch (error) {
-    report(error)
+    report(error, data.type === 'refine')
   }
 }

@@ -120,12 +120,15 @@ export function changeBoundary3D(history: BoundaryHistory3D, next: Boundary3D | 
 
 /** Independent displacement constraints on Tx, Ty, Tz, Rx, Ry and Rz. */
 export function rigidRank3D(grid: Grid3D, supports: readonly Support3D[]) {
-  const scale = Math.max(grid.widthMm, grid.heightMm, grid.depthMm)
-  const count = nodeCount(grid)
+  return rigidRankAt3D(supports, nodeCount(grid), Math.max(grid.widthMm, grid.heightMm, grid.depthMm),
+    node => nodePosition(grid, node))
+}
+
+export function rigidRankAt3D(supports: readonly Support3D[], count: number, scale: number, position: (node: number) => ArrayLike<number>) {
   const basis: number[][] = []
   for (const support of supports) {
     if (!Number.isInteger(support.node) || support.node < 0 || support.node >= count) continue
-    const [x, y, z] = nodePosition(grid, support.node).map(value => value / scale - 0.5)
+    const [x, y, z] = Array.from(position(support.node), value => value / scale - 0.5)
     const rows = [[1, 0, 0, 0, z, -y], [0, 1, 0, -z, 0, x], [0, 0, 1, y, -x, 0]]
     for (let axis = 0; axis < 3; axis++) {
       if (!support[supportAxes[axis]]) continue

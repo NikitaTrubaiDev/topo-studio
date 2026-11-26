@@ -6,13 +6,14 @@ import {
 } from 'three'
 import { useTranslation } from '../i18n'
 import { brickMasks3D, caseColor3D, caseNumber, forceMagnitude3D, validForceMagnitude3D, type EditTool3D, type ForceVector3D } from '../solver3d/design3d'
+import { locateAdaptiveTet3D } from '../solver3d/adaptiveMesh3d'
 import { nodalField3D } from '../solver3d/mesh3d'
 import { cellSize, nodeIndex3D, nodePosition, type Grid3D, type SimpProblem3D } from '../solver3d/types3d'
 import type { Surface3D, creaseGeometry3D } from '../solver3d/surface3d'
 import { createCamera3D, isFitShortcut, type CameraMode3D, type QuickView3D } from './camera3d'
 import { designDomainMesh3D, firstVisibleMeshHit3D, snapEditNode3D } from './viewportPicking3d'
 import { Tooltip } from './Tooltip'
-import type { FemEvent3D, FemRequest3D, TimedSnapshot3D } from '../workers/protocol3d'
+import type { FemEvent3D, FemGeometry3D, FemRequest3D, TimedSnapshot3D } from '../workers/protocol3d'
 
 const views = [
   ['iso', 'iso3d', 'hint3dIso'], ['front', 'front3d', 'hint3dFront'], ['top', 'top3d', 'hint3dTop'],
@@ -21,11 +22,19 @@ const views = [
 const choices = [
   ['auto', 'auto3d', 'hint3dAuto'], ['cad', 'smoothCad3d', 'hint3dCAD'],
   ['stress', 'stress', 'hint3dStress'], ['voxels', 'femMesh3d', 'hint3dFemMesh'],
+  ['density', 'meshDensity3d', 'hint3dMeshDensity'],
 ] as const
 export type ViewMode3D = typeof choices[number][0]
 
 const stressPalette = ['#182840', '#127ba8', '#3cc39c', '#f4d568', '#f86b60'].map(value => new Color(value))
+const refinementPalette = ['#607fa5', '#34c5dd', '#f1ab49']
 const axes = ['X', 'Y', 'Z']
+
+function stressColor(color: Color, ratio: number) {
+  const scaled = MathUtils.clamp(Number.isNaN(ratio) ? 0 : ratio, 0, 1) * (stressPalette.length - 1)
+  const index = Math.min(stressPalette.length - 2, Math.floor(scaled))
+  return color.copy(stressPalette[index]).lerp(stressPalette[index + 1], scaled - index)
+}
 
 function disposeGroup(group: Group | Scene) {
   const geometries = new Set<BufferGeometry>()
@@ -138,7 +147,7 @@ function setupScene(canvas: HTMLCanvasElement, grid: Grid3D) {
   box.dispose()
   domain.position.copy(center)
   scene.add(domain)
-  const model = new Group(), supports = new Group(), loads = new Group()
+  const model = new Group(), ghost = new Group(), supports = new Group(), loads = new Group()
   const marker = new Mesh(new SphereGeometry(Math.min(...cellSize(grid)) * 0.28, 12, 8),
     new MeshBasicMaterial({ color: '#e9feff', depthTest: false, depthWrite: false }))
   const arrow = new ArrowHelper(new Vector3(0, 1, 0), new Vector3(), 1, '#fbb075')
@@ -151,7 +160,7 @@ function setupScene(canvas: HTMLCanvasElement, grid: Grid3D) {
   }
   marker.renderOrder = 3
   marker.visible = arrow.visible = false
-  scene.add(model, supports, loads, marker, arrow)
+  scene.add(model, ghost, supports, loads, marker, arrow)
   const camera = new PerspectiveCamera(37, 1, span * 0.01, span * 25)
   const render = () => renderer.render(scene, camera)
   const controls = createCamera3D(canvas, camera, center, span, render)
@@ -168,7 +177,7 @@ function setupScene(canvas: HTMLCanvasElement, grid: Grid3D) {
   controls.fit('iso')
   const observer = new ResizeObserver(resize)
   observer.observe(canvas)
-  return { model, supports, loads, controls, planes, sectionPlanes, render, camera, marker, arrow, dispose() {
+  return { model, ghost, supports, loads, controls, planes, sectionPlanes, render, camera, marker, arrow, dispose() {
     observer.disconnect()
     controls.dispose()
     disposeGroup(scene)
@@ -176,21 +185,37 @@ function setupScene(canvas: HTMLCanvasElement, grid: Grid3D) {
   } }
 }
 
-function femMesh(data: FemEvent3D, wireframe: boolean, planes: Plane[]) {
+function femMesh(data: FemGeometry3D, wireframe: boolean, planes: Plane[], levels?: Uint8Array, opacity?: number) {
   const position = new BufferAttribute(data.positions, 3)
-  const geometry = new BufferGeometry()
+  let geometry = new BufferGeometry()
   geometry.setAttribute('position', position)
   geometry.setIndex(new BufferAttribute(data.triangles, 1))
+  if (levels) {
+    const expanded = geometry.toNonIndexed()
+    geometry.dispose()
+    geometry = expanded
+    const palette = refinementPalette.map(value => new Color(value))
+    const colors = new Float32Array(3 * data.triangles.length)
+    data.faceElements.forEach((e, face) => {
+      const color = palette[levels[e]]
+      for (let j = 0; j < 3; j++) color.toArray(colors, 9 * face + 3 * j)
+    })
+    geometry.setAttribute('color', new BufferAttribute(colors, 3))
+  }
   const group = new Group()
-  group.add(new Mesh(geometry, new MeshStandardMaterial({
-    color: '#afc3d7', metalness: 0.28, roughness: 0.54, flatShading: true, side: FrontSide, clippingPlanes: planes,
+  const surface = opacity === undefined ? new MeshStandardMaterial({
+    color: levels ? '#ffffff' : '#afc3d7', vertexColors: !!levels, metalness: levels ? 0.02 : 0.28,
+    roughness: 0.54, flatShading: true, side: FrontSide, clippingPlanes: planes,
     polygonOffset: wireframe, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
-  })))
+  }) : new MeshBasicMaterial({ color: '#84b4cc', transparent: true, opacity, depthWrite: false,
+    side: FrontSide, clippingPlanes: planes, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2 })
+  group.add(new Mesh(geometry, surface))
   if (wireframe) {
     const edges = new BufferGeometry()
     edges.setAttribute('position', new BufferAttribute(data.positions, 3))
     edges.setIndex(new BufferAttribute(data.edges, 1))
-    group.add(new LineSegments(edges, new LineBasicMaterial({ color: '#34475d', clippingPlanes: planes })))
+    group.add(new LineSegments(edges, new LineBasicMaterial({ color: opacity === undefined ? '#233447' : '#8babbe',
+      clippingPlanes: planes, ...(opacity !== undefined && { transparent: true, opacity: opacity * 1.5, depthWrite: false }) })))
   }
   return group
 }
@@ -218,6 +243,11 @@ export function surfaceMesh(problem: SimpProblem3D, surface: Surface3D, planes: 
     const peak = [frame.p95VonMises, frame.maxVonMises].find(value => Number.isFinite(value) && value > 0) ?? 1
     const color = new Color()
     for (let j = 0; j < vertices.length; j += 3) {
+      if (problem.mesh) {
+        const e = locateAdaptiveTet3D(problem.mesh, vertices, j)
+        stressColor(color, frame.vonMises[e] / peak).toArray(colors, j)
+        continue
+      }
       const cx = MathUtils.clamp(vertices[j] / size[0] - offset, 0, maxX)
       const cy = MathUtils.clamp(vertices[j + 1] / size[1] - offset, 0, maxY)
       const cz = MathUtils.clamp(vertices[j + 2] / size[2] - offset, 0, maxZ)
@@ -233,10 +263,7 @@ export function surfaceMesh(problem: SimpProblem3D, surface: Surface3D, planes: 
         value += weighted * stress
         weightSum += weighted
       }
-      const ratio = value / (weightSum || 1) / peak
-      const scaled = MathUtils.clamp(Number.isNaN(ratio) ? 0 : ratio, 0, 1) * (stressPalette.length - 1)
-      const index = Math.min(stressPalette.length - 2, Math.floor(scaled))
-      color.copy(stressPalette[index]).lerp(stressPalette[index + 1], scaled - index).toArray(colors, j)
+      stressColor(color, value / (weightSum || 1) / peak).toArray(colors, j)
     }
     geometry.setAttribute('color', new BufferAttribute(colors, 3))
     return new Mesh(geometry, new MeshBasicMaterial({ vertexColors: true, toneMapped: false, side: FrontSide, clippingPlanes: planes }))
@@ -267,7 +294,7 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
   density: Float64Array | undefined
   mode: ViewMode3D
   setMode: (mode: ViewMode3D) => void
-  view: 'cad' | 'voxels' | 'stress'
+  view: Exclude<ViewMode3D, 'auto'>
   surface?: Surface3D
   frame?: TimedSnapshot3D
   threshold: number
@@ -282,11 +309,17 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
   const [cameraMode, setCameraMode] = useState<CameraMode3D>('nx')
   const [showSupports, setShowSupports] = useState(true)
   const [wireframe, setWireframe] = useState(false)
+  const [showGhost, setShowGhost] = useState(false)
+  const [ghostOpacity, setGhostOpacity] = useState(0.15)
+  const femView = view === 'voxels' || view === 'density'
+  const refinementView = view === 'density'
+  const showEdges = wireframe || refinementView
   const [showLoads, setShowLoads] = useState(true)
   const [sections, setSections] = useState([1, 1, 1])
   const sectioned = sections.some(value => value < 1)
   const [fem, setFem] = useState<{ request: FemRequest3D; geometry: FemEvent3D }>()
-  const femThreshold = mode === 'auto' ? Math.min(0.12, threshold) : threshold
+  const femThreshold = problem.mesh && !frame && !showGhost ? Number.MIN_VALUE
+    : mode === 'auto' && !showGhost ? Math.min(0.12, threshold) : threshold
   const femType = problem.elementType ?? 'hex8'
   const hasDensity = !!density
   const { grid, params, passive } = problem
@@ -328,8 +361,9 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
   }, [active, problem, editor.caseId, tool])
 
   useEffect(() => {
-    if (!active || view !== 'voxels' || !density) return
-    const request: FemRequest3D = { type: 'fem', density, grid, threshold: femThreshold, elementType: femType, wireframe }
+    if (!active || (!femView && !showGhost) || !density) return
+    const request: FemRequest3D = { type: 'fem', density, grid, threshold: femThreshold, elementType: femType,
+      wireframe: showEdges, mesh: problem.mesh, ...(showGhost && { ghostThreshold: threshold }) }
     let live = true
     const worker = new Worker(new URL('../workers/surface3dWorker.ts', import.meta.url), { type: 'module' })
     worker.onmessage = ({ data }: MessageEvent<FemEvent3D>) => {
@@ -338,28 +372,30 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
     }
     worker.postMessage(request)
     return () => { live = false; worker.terminate() }
-  }, [active, view, density, grid, femThreshold, femType, wireframe])
+  }, [active, femView, density, grid, femThreshold, femType, showEdges, problem.mesh, showGhost, threshold])
 
   useEffect(() => {
     const current = scene.current
     if (!current) return
-    const { model, planes, render } = current
+    const { model, ghost, planes, render } = current
     disposeGroup(model)
+    disposeGroup(ghost)
     const clipping = sectioned ? planes : []
-    const geometry = hasDensity && fem?.request.grid === grid && fem.request.elementType === femType && fem.request.wireframe === wireframe
+    const geometry = hasDensity && fem?.request.grid === grid && fem.request.elementType === femType && fem.request.wireframe === showEdges && fem.request.mesh === problem.mesh
       ? fem.geometry : undefined
-    const solid = view === 'voxels'
-      ? geometry?.triangles.length && femMesh(geometry, wireframe, clipping)
+    const solid = femView
+      ? geometry?.triangles.length && femMesh(geometry, showEdges, clipping, refinementView ? problem.mesh?.levels : undefined)
       : surface?.triangles.length ? surfaceMesh(problem, surface, clipping, view === 'stress' ? frame : undefined, renderData) : undefined
     if (solid) {
       model.add(solid)
       const skin = solid instanceof Mesh ? solid : solid.children.find(object => object instanceof Mesh)
       if (clipping.length && skin instanceof Mesh) model.add(new Mesh(skin.geometry,
         new MeshBasicMaterial({ color: '#293a4d', side: BackSide, clippingPlanes: clipping,
-          polygonOffset: wireframe && view === 'voxels', polygonOffsetFactor: 1, polygonOffsetUnits: 1 })))
+          polygonOffset: showEdges && femView, polygonOffsetFactor: 1, polygonOffsetUnits: 1 })))
     }
+    if (showGhost && geometry?.ghost?.triangles.length) ghost.add(femMesh(geometry.ghost, true, clipping, undefined, ghostOpacity))
     render()
-  }, [active, grid, problem.elementType, view, surface, frame, fem, femType, hasDensity, wireframe, sectioned, renderData])
+  }, [active, grid, problem, view, femView, refinementView, surface, frame, fem, femType, hasDensity, showEdges, sectioned, renderData, showGhost, ghostOpacity])
 
   useEffect(() => {
     const current = scene.current
@@ -473,7 +509,7 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
     <section className="panel viewport viewport-3d" aria-label={t('viewport')}>
       <div className="viewport-tools">
         <div className="segmented" role="group" aria-label={t('resultView')}>
-          {choices.map(([value, label, tip]) => <Tooltip key={value} message={tip}>
+          {choices.filter(([value]) => value !== 'density' || femType === 'adaptiveTet4').map(([value, label, tip]) => <Tooltip key={value} message={tip}>
             <button type="button" aria-pressed={mode === value} onClick={() => setMode(value)}>{t(label)}</button>
           </Tooltip>)}
         </div>
@@ -499,9 +535,14 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
         </div>
         <p id="camera-hint-3d" className="camera-hint-3d">{t(tool === 'load' ? 'hint3dPlaceLoad' : tool === 'support' ? 'hint3dPlaceSupport' : cameraMode === 'nx' ? 'nxHint3d' : 'standardHint3d')}</p>
         {failed && <p role="alert" className="viewport-notice-3d">{t('webglError3d')}</p>}
-        {!failed && (view === 'voxels' ? mode === 'voxels' && density && !density.some(value => value >= threshold)
+        {!failed && (femView ? mode !== 'auto' && density && !density.some(value => value >= femThreshold)
           : surface && !surface.triangles.length) &&
           <p className="viewport-notice-3d">{t('noMaterial')} {t('helpThreshold')}</p>}
+        {refinementView && problem.mesh && <div className="mesh-legend-3d">
+          {(['meshCoarse3d', 'meshMedium3d', 'meshFine3d'] as const).map((key, i) => <span key={key}>
+            <i style={{ background: refinementPalette[i] }} />{t(key)}
+          </span>)}
+        </div>}
         {view === 'stress' && frame && <div className="scale stress-legend-3d">
           <div>{t('stress')} · {t('MPa')}</div>
           <div className="scale-ramp stress-ramp" />
@@ -519,7 +560,7 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
             <output>{fixed(value * limits[i], 1)} {t('mm')}</output>
           </div>)}
         </div>
-        {mode === 'voxels' && <div className="mesh-threshold-3d">
+        {(mode === 'voxels' || refinementView || showGhost) && <div className="mesh-threshold-3d">
           <Tooltip message="hint3dMeshThreshold"><label htmlFor="mesh-threshold-3d">{t('threshold')}</label></Tooltip>
           <input id="mesh-threshold-3d" type="range" min={0.01} max={0.99} step={0.01} value={threshold}
             aria-valuetext={fixed(threshold, 2)} onChange={event => setThreshold(event.target.valueAsNumber)} />
@@ -527,8 +568,14 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
         <div className="overlay-controls" role="group" aria-label={t('overlays')}>
           <Tooltip message="hint3dMeshWireframe"><label><input type="checkbox" checked={wireframe} onChange={event => {
             setWireframe(event.target.checked)
-            if (event.target.checked && view !== 'voxels') setMode('voxels')
+            if (event.target.checked && !femView) setMode('voxels')
           }} />{t('meshWireframe3d')}</label></Tooltip>
+          <Tooltip message="hint3dGhost"><label><input type="checkbox" checked={showGhost}
+            onChange={event => setShowGhost(event.target.checked)} />{t('removedGhost3d')}</label></Tooltip>
+          {showGhost && <Tooltip message="hint3dGhostOpacity"><label>{t('ghostOpacity3d')}
+            <input type="range" min={0.05} max={0.35} step={0.01} value={ghostOpacity}
+              onChange={event => setGhostOpacity(event.target.valueAsNumber)} />
+          </label></Tooltip>}
           <Tooltip message="hint3dSupports"><label><input type="checkbox" checked={showSupports} onChange={event => setShowSupports(event.target.checked)} />{t('supports')}</label></Tooltip>
           <Tooltip message="hint3dForces"><label><input type="checkbox" checked={showLoads} onChange={event => setShowLoads(event.target.checked)} />{t('forces')}</label></Tooltip>
         </div>

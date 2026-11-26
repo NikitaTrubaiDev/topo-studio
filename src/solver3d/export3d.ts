@@ -1,5 +1,5 @@
 import { vertexNormals } from './marchingCubes'
-import { triangleNormal, type Surface3D } from './surface3d'
+import { creaseGeometry3D, triangleNormal, type Surface3D } from './surface3d'
 import { isWatertight } from './surfaceValidation3d'
 
 export { isWatertight } from './surfaceValidation3d'
@@ -30,16 +30,17 @@ export function exportStl3D(mesh: Surface3D, skipValidation = false) {
 }
 
 /** Skip validation only for a mesh already checked at OBJ precision. */
-export function exportObj3D(mesh: Surface3D, skipValidation = false) {
+export function exportObj3D(mesh: Surface3D, skipValidation = false, creaseDegrees?: number) {
   if (!skipValidation && !isWatertight(mesh)) throw new RangeError('OBJ requires a watertight surface')
   const { vertices, triangles } = mesh
-  const normals = vertexNormals(mesh)
+  const separateNormals = creaseDegrees !== undefined
+  const normals = separateNormals ? creaseGeometry3D(mesh, creaseDegrees).normals : vertexNormals(mesh)
   const lines = ['# TopoStudio 3D | millimetres', 'o TopoStudio']
   for (let i = 0; i < vertices.length; i += 3) lines.push(`v ${vertices[i]} ${vertices[i + 1]} ${vertices[i + 2]}`)
   for (let i = 0; i < normals.length; i += 3) lines.push(`vn ${normals[i]} ${normals[i + 1]} ${normals[i + 2]}`)
   for (let i = 0; i < triangles.length; i += 3) {
     const a = triangles[i] + 1, b = triangles[i + 1] + 1, c = triangles[i + 2] + 1
-    lines.push(`f ${a}//${a} ${b}//${b} ${c}//${c}`)
+    lines.push(separateNormals ? `f ${a}//${i + 1} ${b}//${i + 2} ${c}//${i + 3}` : `f ${a}//${a} ${b}//${b} ${c}//${c}`)
   }
   return lines.join('\n') + '\n'
 }

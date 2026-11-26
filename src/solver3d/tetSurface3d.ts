@@ -1,3 +1,4 @@
+import type { AdaptiveMesh3D } from './adaptiveMesh3d'
 import { h8Corners } from './elementH8'
 import { tetFaces } from './elementT4'
 import { visitActiveCells3D } from './mesh3d'
@@ -86,22 +87,29 @@ function trimContact(faces: ClipFace[], distance: (point: number[]) => number): 
 
 /** Extract the solid Tet4 boundary. Face-connected material is preserved. At edge-
  * or vertex-only contacts, trim the singular feature locally to make a manifold. */
-export function marchingTetrahedra(density: ArrayLike<number>, grid: Grid3D, threshold = 0.5, passive?: PassiveMasks): Surface3D {
-  if (density.length !== elementCount(grid, 'tet4') || !(threshold > 0 && threshold < 1)) {
+export function marchingTetrahedra(density: ArrayLike<number>, grid: Grid3D, threshold = 0.5, passive?: PassiveMasks, mesh?: AdaptiveMesh3D): Surface3D {
+  if (density.length !== (mesh?.stats.elements ?? elementCount(grid, 'tet4')) || !(threshold > 0 && threshold < 1)) {
     throw new RangeError('Invalid Tet4 isosurface input')
   }
   for (let e = 0; e < density.length; e++) if (!Number.isFinite(density[e])) throw new RangeError('Non-finite density')
 
-  const count = nodeCount(grid)
+  const count = mesh?.stats.nodes ?? nodeCount(grid)
+  const elementType = mesh ? 'adaptiveTet4' : 'tet4'
   const edgeKey = (a: number, b: number) => Math.min(a, b) * count + Math.max(a, b)
   const exposedTriangles: number[] = []
-  visitActiveCells3D(grid, 'tet4', density, threshold, (nodes, exposed) => {
+  visitActiveCells3D(grid, elementType, density, threshold, (nodes, exposed) => {
     for (const { corners: [a, b, c] } of exposed) exposedTriangles.push(nodes[a], nodes[b], nodes[c])
-  })
+  }, true, mesh)
   const { singularEdges, singularNodes } = findContacts(exposedTriangles, count, edgeKey)
   const { nelx, nely, nelz } = grid
   const prescribed = passive && new Uint8Array(count)
-  if (prescribed) for (let z = 0, e = 0; z < nelz; z++) for (let y = 0; y < nely; y++) for (let x = 0; x < nelx; x++, e++) {
+  if (prescribed && mesh) {
+    mesh.bricks.forEach((brick, e) => {
+      if (passive.solid?.[brick] || passive.void?.[brick]) {
+        for (let j = 0; j < 4; j++) prescribed[mesh.tetrahedra[4 * e + j]] = 1
+      }
+    })
+  } else if (prescribed) for (let z = 0, e = 0; z < nelz; z++) for (let y = 0; y < nely; y++) for (let x = 0; x < nelx; x++, e++) {
     if (passive.solid?.[e] || passive.void?.[e]) {
       for (const [dx, dy, dz] of h8Corners) prescribed[nodeIndex3D(grid, x + dx, y + dy, z + dz)] = 1
     }
@@ -110,6 +118,7 @@ export function marchingTetrahedra(density: ArrayLike<number>, grid: Grid3D, thr
   const vertices: number[] = [], triangles: number[] = [], pins: number[] = []
   const nodesToVertices = new Int32Array(count).fill(-1)
   function position(node: number) {
+    if (mesh) return Array.from(mesh.positions.subarray(3 * node, 3 * node + 3))
     const result = nodePosition(grid, node)
     if (node % (nelx + 1) === nelx) result[0] = grid.widthMm
     if (Math.floor(node / (nelx + 1)) % (nely + 1) === nely) result[1] = grid.heightMm
@@ -131,7 +140,7 @@ export function marchingTetrahedra(density: ArrayLike<number>, grid: Grid3D, thr
     for (const node of exposedTriangles) triangles.push(atNode(node))
   } else {
     const cutVertices = new Map<string, number>()
-    visitActiveCells3D(grid, 'tet4', density, threshold, (nodes, exposed, brickCorners) => {
+    visitActiveCells3D(grid, elementType, density, threshold, (nodes, exposed, brickCorners) => {
       const ids = brickCorners.map(corner => nodes[corner])
       if (!ids.some(id => singularNodes[id])) {
         for (const { corners: [a, b, c] } of exposed) triangles.push(atNode(nodes[a]), atNode(nodes[b]), atNode(nodes[c]))
@@ -168,7 +177,7 @@ export function marchingTetrahedra(density: ArrayLike<number>, grid: Grid3D, thr
         })
         for (let i = 1; i + 1 < polygon.length; i++) triangles.push(polygon[0], polygon[i], polygon[i + 1])
       }
-    })
+    }, false, mesh)
   }
   return { vertices: Float64Array.from(vertices), triangles: Uint32Array.from(triangles),
     ...(prescribed && { pinned: Uint8Array.from(pins) }) }

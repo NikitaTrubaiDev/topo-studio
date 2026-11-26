@@ -1,3 +1,4 @@
+import type { AdaptiveMesh3D } from './adaptiveMesh3d'
 import { h8Corners } from './elementH8'
 import { tetCorners, tetFaces, tetVolumeFraction } from './elementT4'
 import { nodeCount, nodeIndex3D, nodePosition, type ElementType3D, type Grid3D } from './types3d'
@@ -50,7 +51,23 @@ type ElementFace = { corners: readonly number[]; offset: readonly number[]; othe
 
 /** Visit active cells and their oriented boundary faces in solver element order. */
 export function visitActiveCells3D(grid: Grid3D, type: ElementType3D, density: ArrayLike<number>, threshold: number,
-  visit: (nodes: Int32Array, exposed: readonly ElementFace[], corners: readonly number[]) => void, boundaryOnly = false) {
+  visit: (nodes: ArrayLike<number>, exposed: readonly ElementFace[], corners: readonly number[], element: number) => void,
+  boundaryOnly = false, mesh?: AdaptiveMesh3D, removed = false) {
+  const active = (e: number) => removed ? density[e] < threshold : density[e] >= threshold
+  if (type === 'adaptiveTet4') {
+    if (!mesh || mesh.stats.elements !== density.length) throw new RangeError('Invalid adaptive mesh field')
+    const exposed: ElementFace[] = []
+    for (let e = 0; e < density.length; e++) {
+      if (!active(e)) continue
+      exposed.length = 0
+      tetFaces.forEach((corners, f) => {
+        const other = mesh.neighbors[4 * e + f]
+        if (other < 0 || !active(other)) exposed.push({ corners, other, offset: [] })
+      })
+      if (!boundaryOnly || exposed.length) visit(mesh.tetrahedra.subarray(4 * e, 4 * e + 4), exposed, [0, 1, 2, 3], e)
+    }
+    return
+  }
   const { nelx, nely, nelz } = grid
   const nodes = new Int32Array(8)
   const exposed: ElementFace[] = []
@@ -61,14 +78,14 @@ export function visitActiveCells3D(grid: Grid3D, type: ElementType3D, density: A
     const corners = type === 'tet4' ? tetCorners[parity] : hex
     let hasNodes = false
     for (let t = 0; t < templates.length; t++) {
-      if (!(density[e++] >= threshold)) continue
+      if (!active(e++)) continue
       exposed.length = 0
       for (const face of templates[t]) {
         const { offset, other } = face
         const i = x + offset[0], j = y + offset[1], k = z + offset[2]
-        if (i >= 0 && i < nelx && j >= 0 && j < nely && k >= 0 && k < nelz &&
-          density[((k * nely + j) * nelx + i) * templates.length + other] >= threshold) continue
-        exposed.push(face)
+        const inside = i >= 0 && i < nelx && j >= 0 && j < nely && k >= 0 && k < nelz
+        if (inside && active(((k * nely + j) * nelx + i) * templates.length + other)) continue
+        exposed.push(inside ? face : { ...face, other: -1 })
       }
       if (boundaryOnly && !exposed.length) continue
       if (!hasNodes) {
@@ -78,24 +95,30 @@ export function visitActiveCells3D(grid: Grid3D, type: ElementType3D, density: A
         }
         hasNodes = true
       }
-      visit(nodes, exposed, corners[t])
+      visit(nodes, exposed, corners[t], e - 1)
     }
   }
 }
 
 /** Exposed oriented faces and true element edges, without triangulation diagonals on Hex8 faces. */
-export function elementSurface3D(grid: Grid3D, type: ElementType3D, density: ArrayLike<number>, threshold: number, withEdges: boolean) {
-  const count = nodeCount(grid)
-  const triangles: number[] = [], edges: number[] = []
+export function elementSurface3D(grid: Grid3D, type: ElementType3D, density: ArrayLike<number>, threshold: number, withEdges: boolean,
+  mesh?: AdaptiveMesh3D, removed = false) {
+  const count = mesh?.stats.nodes ?? nodeCount(grid)
+  const triangles: number[] = [], edges: number[] = [], faceElements: number[] = []
   const seen = withEdges ? new Set<number>() : undefined
   const positions = new Float32Array(3 * count)
-  for (let i = 0; i < count; i++) positions.set(nodePosition(grid, i), 3 * i)
-  visitActiveCells3D(grid, type, density, threshold, (nodes, exposed) => {
-    for (const { corners } of exposed) {
+  if (mesh) positions.set(mesh.positions)
+  else for (let i = 0; i < count; i++) positions.set(nodePosition(grid, i), 3 * i)
+  visitActiveCells3D(grid, type, density, threshold, (nodes, exposed, _, element) => {
+    for (const { corners, other } of exposed) {
       const a = nodes[corners[0]], b = nodes[corners[1]], c = nodes[corners[2]]
       triangles.push(a, b, c)
-      if (corners.length === 4) triangles.push(a, c, nodes[corners[3]])
-      if (seen) for (let l = 0; l < corners.length; l++) {
+      faceElements.push(element)
+      if (corners.length === 4) {
+        triangles.push(a, c, nodes[corners[3]])
+        faceElements.push(element)
+      }
+      if (seen && (!removed || other < 0)) for (let l = 0; l < corners.length; l++) {
         const m = nodes[corners[l]], n = nodes[corners[(l + 1) % corners.length]]
         const key = Math.min(m, n) * count + Math.max(m, n)
         if (seen.has(key)) continue
@@ -103,6 +126,6 @@ export function elementSurface3D(grid: Grid3D, type: ElementType3D, density: Arr
         edges.push(m, n)
       }
     }
-  }, true)
-  return { positions, triangles: Uint32Array.from(triangles), edges: Uint32Array.from(edges) }
+  }, true, mesh, removed)
+  return { positions, triangles: Uint32Array.from(triangles), edges: Uint32Array.from(edges), faceElements: Uint32Array.from(faceElements) }
 }

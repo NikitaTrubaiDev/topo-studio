@@ -1,7 +1,10 @@
+import { generateAdaptiveMesh3D } from './adaptiveMesh3d'
+import { unstructuredSetup3D, UnstructuredConeFilter3D, UnstructuredStiffness3D } from './unstructuredTet4'
 import { brickMasks3D, forceMagnitude3D, nodeTouchesMaterial3D, rigidRank3D, validForceMagnitude3D } from './design3d'
 import { elasticity3D, h8Corners, h8Stiffness, strainDisplacementH8, vonMises3D } from './elementH8'
 import { tet4Templates, tetCorners, tetVolumeFraction } from './elementT4'
 import { DensityFilter3D, projectDensity3D } from './filter3d'
+import type { Stiffness3D } from './stiffness3d'
 import { fixedDofs3D, Pcg3D } from './pcg3d'
 import {
   cellSize, elementCount, maxCellAspectRatio3D, nodeCount, nodeIndex3D, ProblemError3D,
@@ -47,6 +50,11 @@ export function validateProblem3D(problem: SimpProblem3D) {
   const { grid, params, material, passive, supports, loadCases, elementType = 'hex8' } = problem
   const { nelx, nely, nelz } = grid
   const count = elementCount(grid)
+  if (elementType === 'adaptiveTet4') {
+    validateProblem3D({ ...problem, elementType: 'hex8' })
+    if (problem.adaptive && ![1, 2].includes(problem.adaptive.maxLevel)) throw new ProblemError3D('settings3dError')
+    return unstructuredSetup3D(problem, problem.mesh ?? generateAdaptiveMesh3D(problem))
+  }
   if ((elementType !== 'hex8' && elementType !== 'tet4') || ![nelx, nely, nelz, params.maxIter].every(value => Number.isSafeInteger(value) && value > 0)
     || ![grid.widthMm, grid.heightMm, grid.depthMm, material.E0, material.Emin, material.yieldMPa,
       material.densityKgM3, params.rmin, params.volFrac, params.moveLimit].every(positive)
@@ -130,7 +138,7 @@ export function validateProblem3D(problem: SimpProblem3D) {
 
 /** Same-grid engineering analysis. The PCG work vectors and displacements remain warm between calls. */
 export class Analysis3D {
-  private readonly pcg: Pcg3D
+  private readonly pcg: Pcg3D<Stiffness3D | UnstructuredStiffness3D>
   private readonly B: readonly Float64Array[]
   private readonly D: Float64Array
   private readonly stress = new Float64Array(6)
@@ -144,11 +152,13 @@ export class Analysis3D {
   constructor(readonly problem: SimpProblem3D, fixed: Uint8Array, readonly forces: Float64Array[]) {
     const size = cellSize(problem.grid)
     const { elementType = 'hex8' } = problem
+    const mesh = elementType === 'adaptiveTet4' ? problem.mesh ?? generateAdaptiveMesh3D(problem) : undefined
     const { nu } = problem.material
     const templates = elementType === 'tet4' ? tet4Templates(1, nu, ...size)
-      : [{ Ke: h8Stiffness(1, nu, ...size), B: strainDisplacementH8(...size) }]
-    this.pcg = new Pcg3D(problem.grid, templates[0].Ke, fixed, { nu, elementType, matrices: templates.map(t => t.Ke) })
-    this.B = templates.map(t => t.B)
+      : mesh ? [] : [{ Ke: h8Stiffness(1, nu, ...size), B: strainDisplacementH8(...size) }]
+    this.pcg = new Pcg3D(problem.grid, templates[0]?.Ke ?? new Float64Array(), fixed,
+      { nu, elementType, stiffness: mesh ? new UnstructuredStiffness3D(mesh, nu, fixed) : undefined, matrices: templates.map(t => t.Ke) })
+    this.B = this.pcg.stiffness instanceof UnstructuredStiffness3D ? this.pcg.stiffness.strains : templates.map(t => t.B)
     this.D = elasticity3D(1, problem.material.nu)
     this.displacements = forces.map(force => new Float64Array(force.length))
     this.loadedNodes = new Uint8Array(fixed.length / 3)
@@ -210,7 +220,7 @@ export class Analysis3D {
 
 export class Simp3D {
   private readonly setup
-  private readonly filter: DensityFilter3D
+  private readonly filter: DensityFilter3D | UnstructuredConeFilter3D
   private analysis?: Analysis3D
   private readonly design: Float64Array
   private readonly candidate: Float64Array
@@ -227,12 +237,16 @@ export class Simp3D {
   private beta: number
   private iteration = 0
 
-  constructor(readonly problem: SimpProblem3D) {
-    const { grid, params } = problem
-    const { elementType = 'hex8' } = problem
-    const count = elementCount(grid, elementType)
-    this.setup = validateProblem3D(problem)
-    this.filter = new DensityFilter3D(grid, params.rmin, this.setup.voidMask, elementType)
+  readonly problem: SimpProblem3D
+
+  constructor(input: SimpProblem3D, previous?: { design: Float64Array; iteration: number }) {
+    if (input.elementType === 'adaptiveTet4' && !input.mesh) validateProblem3D({ ...input, elementType: 'hex8' })
+    this.problem = input.elementType === 'adaptiveTet4' && !input.mesh ? { ...input, mesh: generateAdaptiveMesh3D(input) } : input
+    const { grid, params, elementType = 'hex8', mesh } = this.problem
+    const count = mesh?.stats.elements ?? elementCount(grid, elementType)
+    this.setup = validateProblem3D(this.problem)
+    this.filter = mesh ? new UnstructuredConeFilter3D(mesh.centroids, mesh.volumes, params.rmin * Math.min(...cellSize(grid)), this.setup.voidMask)
+      : new DensityFilter3D(grid, params.rmin, this.setup.voidMask, elementType)
     this.design = new Float64Array(count)
     this.candidate = new Float64Array(count)
     this.physical = new Float64Array(count)
@@ -240,8 +254,8 @@ export class Simp3D {
     this.derivative = new Float64Array(count)
     this.dc = new Float64Array(count)
     this.dv = new Float64Array(count)
-    this.totalVolume = elementCount(grid)
-    this.volumes = Float64Array.from({ length: count }, (_, i) => elementType === 'tet4' ? tetVolumeFraction(i % 5) : 1)
+    this.totalVolume = mesh ? grid.widthMm * grid.heightMm * grid.depthMm : elementCount(grid)
+    this.volumes = mesh?.volumes ?? Float64Array.from({ length: count }, (_, i) => elementType === 'tet4' ? tetVolumeFraction(i % 5) : 1)
     this.volumeWeights = new Float64Array(count)
     for (let e = 0; e < count; e++) {
       this.scratch[e] = this.setup.solid[e] || this.setup.voidMask[e] ? 0 : this.volumes[e]
@@ -253,13 +267,27 @@ export class Simp3D {
       this.orbitValues = new Float64Array(count)
       for (let e = 0; e < count; e++) this.orbitVolume[representatives[e]] += this.volumes[e]
     }
-    this.beta = params.heaviside ? 1 : 0
-    if (this.setup.solid.some(Boolean)) this.matchVolume()
+    this.iteration = previous?.iteration ?? 0
+    this.beta = this.projectionBeta(Math.max(1, this.iteration))
+    if (previous) {
+      this.design.set(previous.design)
+      if (this.orbitValues && this.orbitVolume) {
+        for (let e = 0; e < count; e++) this.orbitValues[representatives[e]] += this.design[e] * this.volumes[e]
+        for (let e = 0; e < count; e++) this.design[e] = this.orbitValues[representatives[e]] / this.orbitVolume[representatives[e]]
+      }
+      this.matchVolume()
+    } else if (this.setup.solid.some(Boolean)) this.matchVolume()
     else {
       const physical = params.volFrac * this.totalVolume / this.setup.allowed
       const value = this.beta ? 0.5 + Math.atanh((2 * physical - 1) * Math.tanh(this.beta / 2)) / this.beta : physical
       for (let e = 0; e < count; e++) this.design[e] = this.setup.voidMask[e] ? 0 : value
     }
+  }
+
+  get designDensity() { return this.design.slice() }
+
+  private projectionBeta(iteration: number) {
+    return this.problem.params.heaviside ? 2 ** Math.min(3, Math.floor((iteration - 1) / 20)) : 0
   }
 
   private density(input: Float64Array, output: Float64Array) {
@@ -352,7 +380,9 @@ export class Simp3D {
     }
     const target = volFrac * this.totalVolume
     const linearOffset = this.beta ? 0 : dot(this.physical, this.volumes) - dot(this.design, this.volumeWeights)
-    let low = 0, high = 1e5
+    // The normalized sensitivity ratio is at most one, so this upper
+    // endpoint cannot increase the current volume.
+    let low = 0, high = 1
     for (let i = 0; i < 64; i++) {
       const multiplier = (low + high) * 0.5
       for (let e = 0; e < this.design.length; e++) {
@@ -377,10 +407,10 @@ export class Simp3D {
     return change
   }
 
-  step(): Snapshot3D {
-    const { params, grid, material } = this.problem
-    this.iteration++
-    const nextBeta = params.heaviside ? 2 ** Math.min(3, Math.floor((this.iteration - 1) / 20)) : 0
+  step(advance = true): Snapshot3D {
+    const { params, grid, material, mesh } = this.problem
+    if (advance) this.iteration++
+    const nextBeta = this.projectionBeta(Math.max(1, this.iteration))
     if (nextBeta !== this.beta) {
       this.beta = nextBeta
       this.matchVolume()
@@ -398,11 +428,11 @@ export class Simp3D {
     }
     stress.sort((a, b) => a - b)
     const p95VonMises = stress[Math.ceil(stress.length * 0.95) - 1] ?? 0
-    const massPerCell = cellSize(grid).reduce((a, b) => a * b) * material.densityKgM3 * 1e-6
+    const massPerCell = (mesh ? 1 : cellSize(grid).reduce((a, b) => a * b)) * material.densityKgM3 * 1e-6
     const mass = volume * massPerCell
     const initialMass = this.setup.allowed * massPerCell
-    const change = this.update(analysis.gradient)
-    const done = this.iteration >= params.maxIter || (change <= params.changeTol && (!params.heaviside || this.beta === 8))
+    const change = advance ? this.update(analysis.gradient) : 0
+    const done = advance && (this.iteration >= params.maxIter || (change <= params.changeTol && (!params.heaviside || this.beta === 8)))
     return { iteration: this.iteration, density: this.physical.slice(), vonMises: vonMises.slice(),
       displacements: displacements.map(u => u.slice()), compliance, volFrac: volume / this.totalVolume, change,
       maxVonMises, p95VonMises, metrics: { mass, initialMass, saved: 100 * (1 - mass / initialMass), maxDeflection,

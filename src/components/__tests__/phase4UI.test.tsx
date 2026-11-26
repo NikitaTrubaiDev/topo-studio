@@ -127,14 +127,14 @@ it('renders finite clamped colors with non-finite stress, density, or scale inpu
   mesh.material.dispose()
 })
 
-it.each(languages)('shows both element modes, the high resolution, and mesh controls in %s', language => {
+it.each(languages)('shows the three element modes, the high resolution, and mesh controls in %s', language => {
   act(() => root.render(<LanguageContext.Provider value={language}>
     <Workbench3D active={false} header={transport => transport} />
   </LanguageContext.Provider>))
   const dictionary = dictionaries[language]
   const type = mount.querySelector<HTMLSelectElement>('#element-type-3d')!
   const resolution = mount.querySelector<HTMLSelectElement>('#resolution-3d')!
-  expect(Array.from(type.options, option => option.textContent)).toEqual([dictionary.hex8Elements3d, dictionary.tet4Elements3d])
+  expect(Array.from(type.options, option => option.textContent)).toEqual([dictionary.hex8Elements3d, dictionary.tet4Elements3d, dictionary.adaptiveTet4Elements3d])
   expect(Array.from(resolution.options, option => option.textContent)).toContain('64 × 32 × 20')
   choose(resolution, '3')
   const count = () => mount.querySelector('.telemetry dd')?.textContent?.replace(/[^\d]/g, '')
