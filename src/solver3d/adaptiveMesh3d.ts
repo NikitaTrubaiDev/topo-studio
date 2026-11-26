@@ -37,6 +37,14 @@ export interface AdaptiveField3D {
   threshold?: number
 }
 
+// A regular leaf emits at least twelve tetrahedra. Check this lower bound
+// before growing octree storage and check the actual count during emission.
+export const maxAdaptiveTetrahedra3D = 120_000
+
+function checkTetCount(count: number) {
+  if (count > maxAdaptiveTetrahedra3D) throw new ProblemError3D('adaptiveBudget3dError')
+}
+
 const corners = Array.from({ length: 8 }, (_, i) => [i & 1, i >> 1 & 1, i >> 2])
 const axes = [0, 1, 2]
 const point = (values: number[]) => values as Point
@@ -153,6 +161,7 @@ export function generateAdaptiveMesh3D(problem: SimpProblem3D, field?: AdaptiveF
   if (!counts.every(n => Number.isSafeInteger(n) && n > 0) || ![grid.widthMm, grid.heightMm, grid.depthMm]
     .every(n => Number.isFinite(n) && n > 0) || ![1, 2].includes(adaptive.maxLevel)) throw new ProblemError3D('settings3dError')
   const base = counts.map(n => n % 2 ? n : n / 2)
+  checkTetCount(12 * base[0] * base[1] * base[2])
   const dims = point(base.map(n => n * latticeSize))
   const pitch = point([grid.widthMm, grid.heightMm, grid.depthMm].map((v, d) => v / dims[d]))
   let leaves: OctreeLeaf3D[] = []
@@ -183,11 +192,16 @@ export function generateAdaptiveMesh3D(problem: SimpProblem3D, field?: AdaptiveF
     if (sy) targets[i] = targets[mirrorVoxel(i, dims, true, false)] = Math.max(targets[i], targets[mirrorVoxel(i, dims, true, false)])
     if (sz) targets[i] = targets[mirrorVoxel(i, dims, false, true)] = Math.max(targets[i], targets[mirrorVoxel(i, dims, false, true)])
   }
+  let leafCount = leaves.length
   function refine(leaf: OctreeLeaf3D): OctreeLeaf3D[] {
     const { origin: [x, y, z], size, level } = leaf
     if (level < adaptive.maxLevel) {
       for (let k = z; k < z + size; k++) for (let j = y; j < y + size; j++) for (let i = x; i < x + size; i++) {
-        if (targets[ownerIndex(dims, i, j, k)] > level) return split(leaf).flatMap(refine)
+        if (targets[ownerIndex(dims, i, j, k)] > level) {
+          leafCount += 7
+          checkTetCount(12 * leafCount)
+          return split(leaf).flatMap(refine)
+        }
       }
     }
     return [leaf]
@@ -209,6 +223,7 @@ export function generateAdaptiveMesh3D(problem: SimpProblem3D, field?: AdaptiveF
       }
     }
     if (!marked.size) break
+    checkTetCount(12 * (leaves.length + 7 * marked.size))
     leaves = leaves.flatMap((leaf, i) => marked.has(i) ? split(leaf) : [leaf])
     owners = ownersOf(leaves, dims)
   }
@@ -241,6 +256,7 @@ function tetrahedralize(grid: Grid3D, leaves: OctreeLeaf3D[], owners: Int32Array
     const brick = brickAt(grid, origin.map((v, d) => (v + size / 2) * pitch[d]))
     leafOffsets[leaf] = levels.length
     function emit(a: number, b: number, c: number) {
+      checkTetCount(levels.length + 1)
       const ids = [center, a, b, c]
       const vectors = ids.slice(1).map(id => axes.map(d => positions[3 * id + d] - positions[3 * center + d]))
       const det = simplex(vectors).det
@@ -324,7 +340,66 @@ export function locateAdaptiveTet3D(mesh: AdaptiveMesh3D, xyz: ArrayLike<number>
 }
 
 export function transferAdaptiveDensity3D(mesh: AdaptiveMesh3D, previous: AdaptiveMesh3D, density: Float64Array) {
-  return Float64Array.from(mesh.volumes, (_, e) => density[locateAdaptiveTet3D(previous, mesh.centroids, 3 * e)])
+  if (mesh === previous) return density.slice()
+  const result = new Float64Array(mesh.stats.elements)
+  const sourceLeaf = new Uint32Array(mesh.leaves.length)
+  const count = previous.leaves.length
+  const mass = new Float64Array(count), mappedMass = new Float64Array(count)
+  const minimum = new Float64Array(count).fill(Infinity), maximum = new Float64Array(count).fill(-Infinity)
+  const volume = new Float64Array(count)
+  // Octree refinement nests every destination leaf inside one old leaf.
+  for (let leaf = 0; leaf < count; leaf++) {
+    for (let e = previous.leafOffsets[leaf]; e < previous.leafOffsets[leaf + 1]; e++) {
+      mass[leaf] += previous.volumes[e] * density[e]
+      minimum[leaf] = Math.min(minimum[leaf], density[e])
+      maximum[leaf] = Math.max(maximum[leaf], density[e])
+    }
+  }
+  const sample = new Float64Array(3)
+  for (let leaf = 0; leaf < mesh.leaves.length; leaf++) {
+    const { origin: [x, y, z] } = mesh.leaves[leaf]
+    const parent = previous.owners[ownerIndex(previous.dimensions, x, y, z)]
+    sourceLeaf[leaf] = parent
+    for (let e = mesh.leafOffsets[leaf]; e < mesh.leafOffsets[leaf + 1]; e++) {
+      let value = minimum[parent]
+      if (value !== maximum[parent]) {
+        const old = locateAdaptiveTet3D(previous, mesh.centroids, 3 * e)
+        const { rows, det } = tetCoordinates3D(previous.positions, previous.tetrahedra, 4 * old)
+        const origin = 3 * previous.tetrahedra[4 * old]
+        const contained = mesh.tetrahedra.subarray(4 * e, 4 * e + 4).every(node => {
+          const weights = rows.map(row => row.reduce((sum, v, d) =>
+            sum + v * (mesh.positions[3 * node + d] - previous.positions[origin + d]), 0) / det)
+          return weights.every(w => w >= -1e-9) && weights.reduce((a, b) => a + b, 0) <= 1 + 1e-9
+        })
+        value = density[old]
+        if (!contained) {
+          value = 0
+          // Four interior Gauss points for tets that cross the old triangulation.
+          for (let j = 0; j < 4; j++) {
+            const node = mesh.tetrahedra[4 * e + j]
+            for (const d of axes) sample[d] = mesh.centroids[3 * e + d] +
+              (mesh.positions[3 * node + d] - mesh.centroids[3 * e + d]) / Math.sqrt(5)
+            value += density[locateAdaptiveTet3D(previous, sample)] / 4
+          }
+        }
+      }
+      result[e] = value
+      volume[parent] += mesh.volumes[e]
+      mappedMass[parent] += value * mesh.volumes[e]
+    }
+  }
+  // Correct quadrature error within each old leaf, without overshooting its
+  // density range or moving material across passive-mask boundaries.
+  for (let leaf = 0; leaf < mesh.leaves.length; leaf++) {
+    const parent = sourceLeaf[leaf], delta = mass[parent] - mappedMass[parent]
+    if (Math.abs(delta) <= 1e-13 * volume[parent]) continue
+    const bound = delta > 0 ? maximum[parent] : minimum[parent]
+    const fraction = Math.min(1, delta / (bound * volume[parent] - mappedMass[parent]))
+    for (let e = mesh.leafOffsets[leaf]; e < mesh.leafOffsets[leaf + 1]; e++) {
+      result[e] += fraction * (bound - result[e])
+    }
+  }
+  return result
 }
 
 /** Restrain new nodes on fully supported reference faces/edges as well as the

@@ -1,3 +1,6 @@
+export const cadTriangleBudget = 250_000
+export class CadTriangleBudgetError extends RangeError {}
+
 ﻿export interface Surface3D {
   /** Interleaved XYZ coordinates in mm. */
   vertices: Float64Array
@@ -5,6 +8,8 @@
   triangles: Uint32Array
   /** Vertices on the boundary of a prescribed material or void cell. */
   pinned?: Uint8Array
+  /** Adaptive material element that emitted each triangle. */
+  faceElements?: Uint32Array
 }
 
 export function triangleNormal(vertices: ArrayLike<number>, a: number, b: number, c: number): [number, number, number] {

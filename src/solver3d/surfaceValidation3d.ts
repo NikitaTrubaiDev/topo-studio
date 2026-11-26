@@ -57,6 +57,103 @@ function faceBounds(vertices: ArrayLike<number>, triangles: Uint32Array, face: n
   return { ...box, face }
 }
 
+type Vector = [number, number, number]
+const subtract = (a: Vector, b: Vector): Vector => [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+const cross = (a: Vector, b: Vector): Vector => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+const dot = (a: Vector, b: Vector) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+function triangleGeometry(vertices: ArrayLike<number>, triangles: Uint32Array, face: number) {
+  function point(corner: number): Vector {
+    const i = 3 * triangles[3 * face + corner]
+    return [vertices[i], vertices[i + 1], vertices[i + 2]]
+  }
+  const a = point(0), b = point(1), c = point(2)
+  const ab = subtract(b, a), ac = subtract(c, a)
+  const edges = [ab, subtract(c, b), subtract(a, c)]
+  const normal = cross(ab, ac)
+  const extent = Math.max(Math.abs(ab[0]), Math.abs(ab[1]), Math.abs(ab[2]),
+    Math.abs(ac[0]), Math.abs(ac[1]), Math.abs(ac[2]))
+  return { a, ab, ac, edges, normal, extent }
+}
+
+type TriangleGeometry = ReturnType<typeof triangleGeometry>
+
+function trianglesIntersect(p: TriangleGeometry, q: TriangleGeometry) {
+  const delta = subtract(q.a, p.a)
+  const relativeTolerance = 1e-12 * (p.extent + q.extent)
+  function separates(axis: Vector) {
+    const p1 = dot(p.ab, axis), p2 = dot(p.ac, axis)
+    const q0 = dot(delta, axis), q1 = q0 + dot(q.ab, axis), q2 = q0 + dot(q.ac, axis)
+    const tolerance = relativeTolerance * (Math.abs(axis[0]) + Math.abs(axis[1]) + Math.abs(axis[2]))
+    return Math.min(q0, q1, q2) - Math.max(0, p1, p2) > tolerance ||
+      Math.min(0, p1, p2) - Math.max(q0, q1, q2) > tolerance
+  }
+  if (separates(p.normal) || separates(q.normal)) return false
+  for (const edgeP of p.edges) for (const edgeQ of q.edges) if (separates(cross(edgeP, edgeQ))) return false
+  // Include the in-plane edge normals for coplanar triangles.
+  for (const edge of p.edges) if (separates(cross(p.normal, edge))) return false
+  for (const edge of q.edges) if (separates(cross(q.normal, edge))) return false
+  return true
+}
+
+function overlaps(a: Bounds, b: Bounds) {
+  return a.min[0] <= b.max[0] && b.min[0] <= a.max[0]
+    && a.min[1] <= b.max[1] && b.min[1] <= a.max[1]
+    && a.min[2] <= b.max[2] && b.min[2] <= a.max[2]
+}
+
+function hasNoIntersections(vertices: ArrayLike<number>, triangles: Uint32Array, rejected?: Uint8Array) {
+  const faces = Array.from({ length: triangles.length / 3 }, (_, i) => faceBounds(vertices, triangles, i))
+  const tree = boundsTree(faces)
+  const geometry: (TriangleGeometry | undefined)[] = new Array(faces.length)
+  const at = (face: number) => geometry[face] ??= triangleGeometry(vertices, triangles, face)
+  let valid = true
+  type FaceBounds = ReturnType<typeof faceBounds>
+  function compare(a: FaceBounds, b: FaceBounds) {
+    const i = 3 * a.face, j = 3 * b.face
+    const u = triangles[i], v = triangles[i + 1], w = triangles[i + 2]
+    for (let k = j; k < j + 3; k++) {
+      const node = triangles[k]
+      if (node === u || node === v || node === w) return
+    }
+    if (!overlaps(a, b) || !trianglesIntersect(at(a.face), at(b.face))) return
+    valid = false
+    if (rejected) {
+      rejected[u] = rejected[v] = rejected[w] = 1
+      for (let k = j; k < j + 3; k++) rejected[triangles[k]] = 1
+    }
+  }
+  function visit(a: BoundsTree<FaceBounds>, b: BoundsTree<FaceBounds>) {
+    if ((!valid && !rejected) || !overlaps(a, b)) return
+    if (a === b) {
+      if ('items' in a) {
+        for (let i = 0; i < a.items.length; i++) for (let j = i + 1; j < a.items.length; j++) compare(a.items[i], a.items[j])
+      } else {
+        visit(a.left, a.left)
+        visit(a.left, a.right)
+        visit(a.right, a.right)
+      }
+    } else if ('items' in a && 'items' in b) {
+      for (const left of a.items) for (const right of b.items) compare(left, right)
+    } else if ('items' in a) {
+      if (!('items' in b)) {
+        visit(a, b.left)
+        visit(a, b.right)
+      }
+    } else if ('items' in b) {
+      visit(a.left, b)
+      visit(a.right, b)
+    } else {
+      visit(a.left, b.left)
+      visit(a.left, b.right)
+      visit(a.right, b.left)
+      visit(a.right, b.right)
+    }
+  }
+  visit(tree, tree)
+  return valid
+}
+
 function rayContains(vertices: ArrayLike<number>, triangles: Uint32Array, tree: BoundsTree<ReturnType<typeof faceBounds>>,
   point: number[]) {
   let intersections = 0, ambiguous = false
@@ -242,7 +339,8 @@ export function surfaceValidator3D(triangles: Uint32Array, count: number) {
       valid = false
       for (let j = 0; j < 3; j++) rejected[triangles[i + j]] = 1
     }
-    return hasOutwardShells(vertices, triangles, shells, rejected) && valid
+    const outward = hasOutwardShells(vertices, triangles, shells, rejected)
+    return hasNoIntersections(vertices, triangles, rejected) && outward && valid
   }
 }
 

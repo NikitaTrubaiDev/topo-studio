@@ -1,14 +1,14 @@
 import { generateAdaptiveMesh3D } from './adaptiveMesh3d'
-import { unstructuredSetup3D, UnstructuredConeFilter3D, UnstructuredStiffness3D } from './unstructuredTet4'
-import { brickMasks3D, forceMagnitude3D, nodeTouchesMaterial3D, rigidRank3D, validForceMagnitude3D } from './design3d'
+import { preflightAdaptiveSolver3D, unstructuredSetup3D, UnstructuredConeFilter3D, UnstructuredStiffness3D } from './unstructuredTet4'
+import { brickMasks3D, forceMagnitude3D, nodeTouchesMaterial3D, rigidComponents3D, rigidComponentsStable3D, rigidRank3D, validForceMagnitude3D } from './design3d'
 import { elasticity3D, h8Corners, h8Stiffness, strainDisplacementH8, vonMises3D } from './elementH8'
 import { tet4Templates, tetCorners, tetVolumeFraction } from './elementT4'
 import { DensityFilter3D, projectDensity3D } from './filter3d'
 import type { Stiffness3D } from './stiffness3d'
 import { fixedDofs3D, Pcg3D } from './pcg3d'
 import {
-  cellSize, elementCount, maxCellAspectRatio3D, nodeCount, nodeIndex3D, ProblemError3D,
-  type SimpProblem3D, type Snapshot3D, type Support3D,
+  cellSize, elementCount, maxCellAspectRatio3D, nodeCount, nodeIndex3D, nodePosition, ProblemError3D,
+  type SimpProblem3D, type Snapshot3D,
 } from './types3d'
 
 const positive = (value: number) => Number.isFinite(value) && value > 0
@@ -23,27 +23,20 @@ function validateComponentSupports(problem: SimpProblem3D, voidMask: Uint8Array,
   if (!voidMask.some(Boolean)) return
   const { grid, supports } = problem
   const { nelx, nely, nelz } = grid
-  const parent = Int32Array.from(loaded, (_, node) => node)
-  function root(node: number) {
-    while (parent[node] !== node) {
-      parent[node] = parent[parent[node]]
-      node = parent[node]
-    }
-    return node
-  }
-  // All five Tet4 elements in a non-void brick inherit its mask and are connected.
-  // Union at the nodes, including bricks meeting only at an edge or corner.
-  for (let z = 0, e = 0; z < nelz; z++) for (let y = 0; y < nely; y++) for (let x = 0; x < nelx; x++, e++) {
-    if (voidMask[e]) continue
-    const first = root(nodeIndex3D(grid, x, y, z))
-    for (const [dx, dy, dz] of h8Corners) parent[root(nodeIndex3D(grid, x + dx, y + dy, z + dz))] = first
-  }
-  const byComponent = new Map<number, Support3D[]>()
-  for (let node = 0; node < loaded.length; node++) if (loaded[node]) byComponent.set(root(node), [])
-  for (const support of supports) byComponent.get(root(support.node))?.push(support)
-  for (const restraints of byComponent.values()) {
-    if (rigidRank3D(grid, restraints) < 6) throw new ProblemError3D('componentSupport3dError')
-  }
+  const layer = nelx * nely
+  const coords = (e: number) => [e % nelx, Math.floor(e / nelx) % nely, Math.floor(e / layer)]
+  // A non-void brick is rigid, including its five face-connected Tet4s.
+  const components = rigidComponents3D(voidMask, loaded.length, e => {
+    const [x, y, z] = coords(e)
+    return [x > 0 ? e - 1 : -1, x + 1 < nelx ? e + 1 : -1,
+      y > 0 ? e - nelx : -1, y + 1 < nely ? e + nelx : -1,
+      z > 0 ? e - layer : -1, z + 1 < nelz ? e + layer : -1]
+  }, e => {
+    const [x, y, z] = coords(e)
+    return h8Corners.map(([dx, dy, dz]) => nodeIndex3D(grid, x + dx, y + dy, z + dz))
+  })
+  if (!rigidComponentsStable3D(components, supports, Math.max(grid.widthMm, grid.heightMm, grid.depthMm),
+    node => nodePosition(grid, node), loaded)) throw new ProblemError3D('componentSupport3dError')
 }
 
 export function validateProblem3D(problem: SimpProblem3D) {
@@ -51,9 +44,10 @@ export function validateProblem3D(problem: SimpProblem3D) {
   const { nelx, nely, nelz } = grid
   const count = elementCount(grid)
   if (elementType === 'adaptiveTet4') {
-    validateProblem3D({ ...problem, elementType: 'hex8' })
     if (problem.adaptive && ![1, 2].includes(problem.adaptive.maxLevel)) throw new ProblemError3D('settings3dError')
-    return unstructuredSetup3D(problem, problem.mesh ?? generateAdaptiveMesh3D(problem))
+    const mesh = problem.mesh ?? generateAdaptiveMesh3D(problem)
+    validateProblem3D({ ...problem, elementType: 'hex8' })
+    return unstructuredSetup3D(problem, mesh)
   }
   if ((elementType !== 'hex8' && elementType !== 'tet4') || ![nelx, nely, nelz, params.maxIter].every(value => Number.isSafeInteger(value) && value > 0)
     || ![grid.widthMm, grid.heightMm, grid.depthMm, material.E0, material.Emin, material.yieldMPa,
@@ -239,13 +233,17 @@ export class Simp3D {
 
   readonly problem: SimpProblem3D
 
-  constructor(input: SimpProblem3D, previous?: { design: Float64Array; iteration: number }) {
-    if (input.elementType === 'adaptiveTet4' && !input.mesh) validateProblem3D({ ...input, elementType: 'hex8' })
+  readonly adaptiveBytes: number
+
+  constructor(input: SimpProblem3D, previous?: { design: Float64Array; iteration: number },
+    prepared?: ReturnType<typeof preflightAdaptiveSolver3D>) {
     this.problem = input.elementType === 'adaptiveTet4' && !input.mesh ? { ...input, mesh: generateAdaptiveMesh3D(input) } : input
     const { grid, params, elementType = 'hex8', mesh } = this.problem
     const count = mesh?.stats.elements ?? elementCount(grid, elementType)
+    const plan = mesh && (prepared ?? preflightAdaptiveSolver3D(this.problem, mesh))
+    this.adaptiveBytes = plan?.estimatedBytes ?? 0
     this.setup = validateProblem3D(this.problem)
-    this.filter = mesh ? new UnstructuredConeFilter3D(mesh.centroids, mesh.volumes, params.rmin * Math.min(...cellSize(grid)), this.setup.voidMask)
+    this.filter = mesh && plan ? new UnstructuredConeFilter3D(mesh, plan)
       : new DensityFilter3D(grid, params.rmin, this.setup.voidMask, elementType)
     this.design = new Float64Array(count)
     this.candidate = new Float64Array(count)

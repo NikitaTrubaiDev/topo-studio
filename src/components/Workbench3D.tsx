@@ -3,8 +3,8 @@ import { useTranslation } from '../i18n'
 import { materials } from '../solver/presets'
 import type { MaterialId } from '../solver/project'
 import {
-  addCase3D, boundaryHistory3D, caseColor3D, caseNumber, changeBoundary3D, deleteCase3D, deleteForce3D, directionalForce3D,
-  directions3D, editCase3D, forceMagnitude3D, maxForceMagnitude3D, minForceMagnitude3D, rigidRank3D, setForce3D, setSupport3D, validForceMagnitude3D,
+  addCase3D, boundaryHistory3D, brickMasks3D, caseColor3D, caseNumber, changeBoundary3D, deleteCase3D, deleteForce3D, directionalForce3D,
+  directions3D, editCase3D, forceMagnitude3D, maxForceMagnitude3D, minForceMagnitude3D, remapBoundary3D, rigidRank3D, setForce3D, setSupport3D, validForceMagnitude3D,
   type Boundary3D, type BoundaryHistory3D, type EditTool3D, type ForceVector3D, type SupportKind3D,
 } from '../solver3d/design3d'
 import { exportObj3D, exportStl3D } from '../solver3d/export3d'
@@ -204,7 +204,7 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
           setFrame(data.snapshot)
           setSamples(values => [...values.slice(0, -1), { iteration: data.snapshot.iteration,
             compliance: data.snapshot.compliance, volFrac: data.snapshot.volFrac }])
-          setState('paused')
+          setState(data.snapshot.done ? 'complete' : 'paused')
         } else if (data.type === 'frame') {
           const { snapshot } = data
           setFrame(snapshot)
@@ -378,7 +378,7 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
               {(Object.keys(elementLabels) as ElementType3D[]).map(value => <option key={value} value={value}>{t(elementLabels[value])}</option>)}
             </select>
           </LabeledControl>
-          <LabeledControl id="resolution-3d" name={t('resolution')} tip="hint3dResolution">
+          <LabeledControl id="resolution-3d" name={t('resolution')} tip={isAdaptive ? 'hint3dAdaptiveResolution' : 'hint3dResolution'}>
             <select id="resolution-3d" value={resolution} onChange={event => { clearRun(); resetBoundaryHistory(); setResolution(Number(event.target.value)) }}>
               {(isAdaptive ? adaptiveResolutions3D : resolutions3D).map((value, i) => {
                 const reference = isAdaptive ? adaptivePresetGrid3D(i, size) : undefined
@@ -551,8 +551,18 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
               aria-describedby="aspect-ratio-3d" aria-invalid={preview?.issue === 'aspectRatio3dError' || undefined}
               onBlur={event => {
                 const value = event.currentTarget.valueAsNumber
-                if (value >= 1 && value <= 10000 && value !== size[key]) { clearRun(); setSize(current => ({ ...current, [key]: value })) }
-                else event.currentTarget.value = String(size[key])
+                if (value >= 1 && value <= 10000 && value !== size[key]) {
+                  clearRun()
+                  const next = { ...size, [key]: value }
+                  if (isAdaptive && history) {
+                    const nextGrid = adaptivePresetGrid3D(resolution, next)
+                    if (nextGrid.nelx !== grid.nelx || nextGrid.nely !== grid.nely || nextGrid.nelz !== grid.nelz) {
+                      const nextPreset = makePreset3D(preset, nextGrid, params, materials[material], elementType)
+                      setHistory(boundaryHistory3D(remapBoundary3D(history.present, grid, nextGrid, brickMasks3D(nextPreset).voidMask)))
+                    }
+                  }
+                  setSize(next)
+                } else event.currentTarget.value = String(size[key])
               }}
               onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }} />
           </LabeledControl>)}

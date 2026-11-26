@@ -102,10 +102,12 @@ export function visitActiveCells3D(grid: Grid3D, type: ElementType3D, density: A
 
 /** Exposed oriented faces and true element edges, without triangulation diagonals on Hex8 faces. */
 export function elementSurface3D(grid: Grid3D, type: ElementType3D, density: ArrayLike<number>, threshold: number, withEdges: boolean,
-  mesh?: AdaptiveMesh3D, removed = false) {
+  mesh?: AdaptiveMesh3D, removed = false, solidEdges?: Uint32Array) {
   const count = mesh?.stats.nodes ?? nodeCount(grid)
   const triangles: number[] = [], edges: number[] = [], faceElements: number[] = []
+  const edgeKey = (a: number, b: number) => Math.min(a, b) * count + Math.max(a, b)
   const seen = withEdges ? new Set<number>() : undefined
+  if (seen && solidEdges) for (let i = 0; i < solidEdges.length; i += 2) seen.add(edgeKey(solidEdges[i], solidEdges[i + 1]))
   const positions = new Float32Array(3 * count)
   if (mesh) positions.set(mesh.positions)
   else for (let i = 0; i < count; i++) positions.set(nodePosition(grid, i), 3 * i)
@@ -120,7 +122,7 @@ export function elementSurface3D(grid: Grid3D, type: ElementType3D, density: Arr
       }
       if (seen && (!removed || other < 0)) for (let l = 0; l < corners.length; l++) {
         const m = nodes[corners[l]], n = nodes[corners[(l + 1) % corners.length]]
-        const key = Math.min(m, n) * count + Math.max(m, n)
+        const key = edgeKey(m, n)
         if (seen.has(key)) continue
         seen.add(key)
         edges.push(m, n)

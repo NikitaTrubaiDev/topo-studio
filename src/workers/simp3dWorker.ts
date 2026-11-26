@@ -1,6 +1,7 @@
 /// <reference lib="webworker" />
 
 import { generateAdaptiveMesh3D, transferAdaptiveDensity3D } from '../solver3d/adaptiveMesh3d'
+import { preflightAdaptiveSolver3D } from '../solver3d/unstructuredTet4'
 import { Simp3D, validateProblem3D } from '../solver3d/simp3d'
 import { elementCount, ProblemError3D, type SimpProblem3D } from '../solver3d/types3d'
 import type { Preview3D, TimedSnapshot3D, WorkerCommand3D, WorkerEvent3D } from './protocol3d'
@@ -93,18 +94,18 @@ function refine(threshold?: number) {
   stop()
   const mesh = generateAdaptiveMesh3D(solver.problem, { mesh: previous, density: latest.density, vonMises: latest.vonMises, threshold })
   if (mesh === previous) {
-    finished = false
-    send({ type: 'paused' })
+    send({ type: finished ? 'done' : 'paused' })
     return
   }
   const start = performance.now()
+  const plan = preflightAdaptiveSolver3D(solver.problem, mesh, solver.adaptiveBytes)
   const design = transferAdaptiveDensity3D(mesh, previous, solver.designDensity)
-  const next = new Simp3D({ ...solver.problem, mesh }, { design, iteration: latest.iteration })
-  const snapshot = { ...next.step(false), iterMs: performance.now() - start }
+  const next = new Simp3D({ ...solver.problem, mesh }, { design, iteration: latest.iteration }, plan)
+  const snapshot = { ...next.step(false), done: latest.iteration >= next.problem.params.maxIter, iterMs: performance.now() - start }
   solver = next
   problem = next.problem
   latest = { iteration: snapshot.iteration, density: snapshot.density.slice(), vonMises: snapshot.vonMises.slice() }
-  finished = false
+  finished = snapshot.done
   send({ type: 'refined', mesh, snapshot }, snapshotBuffers(snapshot))
 }
 
@@ -161,5 +162,6 @@ scope.onmessage = ({ data }: MessageEvent<WorkerCommand3D>) => {
     }
   } catch (error) {
     report(error, data.type === 'refine')
+    if (data.type === 'refine' && finished) send({ type: 'done' })
   }
 }

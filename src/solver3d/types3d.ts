@@ -89,7 +89,7 @@ export interface Snapshot3D {
 export const maxCellAspectRatio3D = 4
 
 export type ProblemIssue3D = 'settings3dError' | 'aspectRatio3dError' | 'mask3dError' | 'support3dError' | 'load3dError'
-  | 'forceMagnitude3dError' | 'componentSupport3dError' | 'attachment3dError' | 'volume3dError' | 'solve3dError'
+  | 'forceMagnitude3dError' | 'componentSupport3dError' | 'attachment3dError' | 'volume3dError' | 'solve3dError' | 'adaptiveBudget3dError'
 
 export class ProblemError3D extends Error {
   constructor(readonly code: ProblemIssue3D, readonly relativeResidual?: number) {

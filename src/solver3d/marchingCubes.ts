@@ -1,20 +1,18 @@
 import { tetVolumeFraction } from './elementT4'
 import { h8Corners } from './elementH8'
 import { marchingTetrahedra } from './tetSurface3d'
-import { signedTriangleVolume6, triangleNormal, type Surface3D } from './surface3d'
+import { cadTriangleBudget, CadTriangleBudgetError, signedTriangleVolume6, triangleNormal, type Surface3D } from './surface3d'
 import { cellSize, elementCount, elementIndex, type ElementType3D, type Grid3D } from './types3d'
 import { surfaceValidator3D, validateSurface3D } from './surfaceValidation3d'
 import type { PassiveMasks } from '../solver/types'
 
 import type { AdaptiveMesh3D } from './adaptiveMesh3d'
 
-export { signedTriangleVolume6, triangleNormal, type Surface3D } from './surface3d'
+export { cadTriangleBudget, CadTriangleBudgetError, signedTriangleVolume6, triangleNormal, type Surface3D } from './surface3d'
 export { marchingTetrahedra } from './tetSurface3d'
 
 export const maxSmoothingPasses3D = 12
 const cadRefinementBudget = 20_000
-export const cadTriangleBudget = 250_000
-export class CadTriangleBudgetError extends RangeError {}
 
 const edges = [
   [0, 1], [1, 3], [3, 2], [2, 0], [4, 5], [5, 7], [7, 6], [6, 4], [0, 4], [1, 5], [3, 7], [2, 6],
@@ -361,7 +359,6 @@ export function prepareSurface3D(density: ArrayLike<number>, grid: Grid3D, thres
   if (elementType === 'adaptiveTet4' && !mesh) throw new RangeError('Adaptive mesh required')
   const surface = elementType === 'hex8' ? marchingCubes(density, grid, threshold, passive)
     : marchingTetrahedra(density, grid, threshold, passive, mesh)
-  if (mesh && surface.triangles.length / 3 > cadTriangleBudget) throw new CadTriangleBudgetError('Adaptive Tet4 triangle budget exceeded')
   return smoothSurface(surface, grid, passes, 0.5, -0.53, mesh ? 0.35 : 0.08)
 }
 

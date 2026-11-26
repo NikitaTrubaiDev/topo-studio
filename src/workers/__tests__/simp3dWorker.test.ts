@@ -122,3 +122,69 @@ it('generates adaptive geometry before solving and continues the same iteration 
   send({ type: 'preview', problem, requestId: 73 })
   expect(events.at(-1)).toMatchObject({ type: 'preview', requestId: 73, mesh: { stats: { elements: generated.mesh.stats.elements } } })
 }, 15000)
+
+it('rejects AMR when the replacement filter exceeds its budget and keeps the existing run', async () => {
+  const events: WorkerEvent3D[] = []
+  const scope = {
+    onmessage: undefined as ((event: { data: WorkerCommand3D }) => void) | undefined,
+    postMessage(event: WorkerEvent3D, transfer: ArrayBuffer[]) {
+      events.push(structuredClone(event, { transfer }))
+    },
+  }
+  vi.stubGlobal('self', scope)
+  const { Simp3D } = await import('../../solver3d/simp3d')
+  const step = Simp3D.prototype.step
+  const uniformStress = vi.spyOn(Simp3D.prototype, 'step').mockImplementation(function (this: InstanceType<typeof Simp3D>, advance) {
+    const snapshot = step.call(this, advance)
+    snapshot.vonMises.fill(1)
+    return snapshot
+  })
+  try {
+    await import('../simp3dWorker')
+    const grid = { ...presetGrid3D([24, 12, 4]), widthMm: 120, heightMm: 60, depthMm: 20 }
+    const params = { ...defaultParams3D, rmin: 50, maxIter: 3, changeTol: 0 }
+    const problem = makePreset3D('cantilever3d', grid, params, undefined, 'adaptiveTet4')
+    problem.adaptive = { maxLevel: 1, refineLoads: false, refineFeatures: false }
+    const baseline = new Simp3D(problem)
+    const first = baseline.step()
+    const second = baseline.step()
+    const send = (data: WorkerCommand3D) => scope.onmessage!({ data })
+    send({ type: 'init', problem })
+    send({ type: 'step' })
+    expect(events.at(-2)).toMatchObject({ type: 'frame', snapshot: { iteration: 1, density: first.density } })
+    send({ type: 'refine' })
+    expect(events.at(-1)).toEqual({ type: 'error', issue: 'adaptiveBudget3dError', recoverable: true })
+    send({ type: 'step' })
+    expect(events.at(-2)).toMatchObject({ type: 'frame', snapshot: { iteration: 2, density: second.density, compliance: second.compliance } })
+  } finally {
+    uniformStress.mockRestore()
+  }
+}, 15000)
+
+it('keeps a finished run at maxIter after a no-op adaptive refinement', async () => {
+  vi.useFakeTimers()
+  const events: WorkerEvent3D[] = []
+  const scope = {
+    onmessage: undefined as ((event: { data: WorkerCommand3D }) => void) | undefined,
+    postMessage(event: WorkerEvent3D, transfer: ArrayBuffer[]) {
+      events.push(structuredClone(event, { transfer }))
+    },
+  }
+  vi.stubGlobal('self', scope)
+  await import('../simp3dWorker')
+  const grid = { ...presetGrid3D([2, 2, 2]), widthMm: 10, heightMm: 10, depthMm: 10 }
+  const problem = makePreset3D('cantilever3d', grid, { ...defaultParams3D, maxIter: 1 }, undefined, 'adaptiveTet4')
+  problem.adaptive = { maxLevel: 1, refineLoads: true, refineFeatures: false }
+  const send = (data: WorkerCommand3D) => scope.onmessage!({ data })
+  send({ type: 'preview', problem, requestId: 1 })
+  expect(events[0]).toMatchObject({ type: 'preview', mesh: { stats: { levelCounts: [0, 96, 0] } } })
+  send({ type: 'step' })
+  expect(events.at(-1)).toMatchObject({ type: 'frame', snapshot: { done: true, iteration: 1 } })
+  send({ type: 'refine' })
+  expect(events.at(-1)).toEqual({ type: 'done' })
+  send({ type: 'start' })
+  expect(vi.getTimerCount()).toBe(0)
+  send({ type: 'step' })
+  expect(events.at(-1)).toEqual({ type: 'done' })
+  expect(events.filter(event => event.type === 'frame')).toHaveLength(1)
+})

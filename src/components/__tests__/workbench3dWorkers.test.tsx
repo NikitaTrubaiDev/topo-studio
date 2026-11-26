@@ -6,6 +6,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import type { Preview3D, SurfaceEvent3D, SurfaceRequest3D, WorkerCommand3D } from '../../workers/protocol3d'
 import * as exports3D from '../../solver3d/export3d'
 import * as downloads from '../ExportDialog'
+import { nodePosition } from '../../solver3d/types3d'
 import Workbench3D from '../Workbench3D'
 
 vi.mock('../Viewport3D', () => ({ Viewport3D: () => null }))
@@ -139,4 +140,31 @@ it('cancels superseded surface jobs and downloads both formats using the cached 
   expect(serializeObj).toHaveBeenCalledExactlyOnceWith(surface, true)
   expect(download).toHaveBeenCalledTimes(2)
   expect(latest.postMessage).toHaveBeenCalledTimes(1)
+})
+
+it('keeps edited adaptive loads at the same normalized position when height changes from 60 to 80 mm', () => {
+  select('#element-type-3d', 'adaptiveTet4')
+  const loadY = mount.querySelectorAll<HTMLInputElement>('.load-list-3d input')[1]
+  act(() => {
+    loadY.focus()
+    loadY.value = '-123'
+    loadY.blur()
+  })
+  const prior = preview(ManualWorker.instances.at(-1)!).problem
+  expect(prior.loadCases[0].forces[0].fy).toBe(-123)
+  expect(button('Undo').disabled).toBe(false)
+  const height = mount.querySelector<HTMLInputElement>('#heightMm-3d')!
+  act(() => {
+    height.focus()
+    height.value = '80'
+    height.blur()
+  })
+  const next = preview(ManualWorker.instances.at(-1)!).problem
+  expect([prior.grid.nely, next.grid.nely]).toEqual([12, 16])
+  const oldLoad = prior.loadCases[0].forces[0], newLoad = next.loadCases[0].forces[0]
+  expect(newLoad.node).not.toBe(oldLoad.node)
+  expect(newLoad.fy).toBe(-123)
+  expect(nodePosition(prior.grid, oldLoad.node)).toEqual([120, 30, 20])
+  expect(nodePosition(next.grid, newLoad.node)).toEqual([120, 40, 20])
+  expect(button('Undo').disabled).toBe(true)
 })

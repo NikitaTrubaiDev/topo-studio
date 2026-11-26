@@ -11,7 +11,7 @@ scope.onmessage = ({ data }: MessageEvent<SurfaceRequest3D | FemRequest3D>) => {
   if ('type' in data) {
     const { grid, density, threshold, elementType, wireframe, mesh, ghostThreshold } = data
     const fem = elementSurface3D(grid, elementType, density, threshold, wireframe, mesh)
-    const ghost = ghostThreshold === undefined ? undefined : elementSurface3D(grid, elementType, density, ghostThreshold, true, mesh, true)
+    const ghost = ghostThreshold === undefined ? undefined : elementSurface3D(grid, elementType, density, ghostThreshold, true, mesh, true, fem.edges)
     const transfers = (g: FemGeometry3D) => [g.positions.buffer, g.triangles.buffer, g.edges.buffer, g.faceElements.buffer]
     scope.postMessage({ ...fem, ...(ghost && { ghost }) }, [...transfers(fem), ...(ghost ? transfers(ghost) : [])])
     return
@@ -21,6 +21,7 @@ scope.onmessage = ({ data }: MessageEvent<SurfaceRequest3D | FemRequest3D>) => {
   try {
     const { surface, valid } = (cad ? prepareCadSurface3D : prepareSurface3D)(density, grid, threshold, smoothing, passive, elementType, mesh)
     const transfer = [surface.vertices.buffer, surface.triangles.buffer]
+    if (surface.faceElements) transfer.push(surface.faceElements.buffer)
     if (surface.pinned) transfer.push(surface.pinned.buffer)
     const render = cad && valid.stl ? creaseGeometry3D(surface) : undefined
     if (render) transfer.push(render.positions.buffer, render.normals.buffer)

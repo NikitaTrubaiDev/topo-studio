@@ -1,15 +1,16 @@
 import { expect, it } from 'vitest'
 import { dictionaries } from '../../i18n/dictionaries'
-import { generateAdaptiveMesh3D, tetCoordinates3D, transferAdaptiveDensity3D, type AdaptiveMesh3D } from '../adaptiveMesh3d'
+import { generateAdaptiveMesh3D, locateAdaptiveTet3D, tetCoordinates3D, transferAdaptiveDensity3D, type AdaptiveMesh3D } from '../adaptiveMesh3d'
 import { elasticity3D } from '../elementH8'
 import { tetFaces } from '../elementT4'
 import { exportObj3D, exportStl3D } from '../export3d'
-import { prepareCadSurface3D, signedTriangleVolume6 } from '../marchingCubes'
+import { CadTriangleBudgetError, prepareCadSurface3D, signedTriangleVolume6 } from '../marchingCubes'
 import { elementSurface3D } from '../mesh3d'
 import { defaultParams3D, makePreset3D, presetGrid3D } from '../presets3d'
 import { Analysis3D, Simp3D, validateProblem3D } from '../simp3d'
-import { elementCount, nodeIndex3D, type Grid3D } from '../types3d'
-import { unstructuredTet4Element } from '../unstructuredTet4'
+import { elementCount, elementIndex, nodeIndex3D, nodePosition, type Grid3D } from '../types3d'
+import { marchingTetrahedra } from '../tetSurface3d'
+import { preflightAdaptiveSolver3D, unstructuredSetup3D, unstructuredTet4Element } from '../unstructuredTet4'
 
 const boltGrid = presetGrid3D([24, 12, 8])
 const smallGrid = { nelx: 12, nely: 6, nelz: 4, widthMm: 60, heightMm: 30, depthMm: 20 }
@@ -162,6 +163,12 @@ it('adapts around separate stress and density-interface zones and transfers dens
   expect(next.levels.every((v, e) => v === 0 || Math.abs(next.centroids[3 * e] - 40) > 8)).toBe(true)
   const mapped = transferAdaptiveDensity3D(next, mesh, density)
   expect(mapped.every((v, e) => v === (next.centroids[3 * e] < 80 ? 0.75 : 0.25))).toBe(true)
+  const varying = Float64Array.from(density, (_, e) => 0.5 + 0.4 * Math.sin(e))
+  const transferred = transferAdaptiveDensity3D(next, mesh, varying)
+  const integral = (m: AdaptiveMesh3D, field: Float64Array) => m.volumes.reduce((sum, v, e) => sum + v * field[e], 0)
+  expect(relative(integral(next, transferred), integral(mesh, varying))).toBeLessThan(1e-12)
+  const centroid = Float64Array.from(next.volumes, (_, e) => varying[locateAdaptiveTet3D(mesh, next.centroids, 3 * e)])
+  expect(relative(integral(next, centroid), integral(mesh, varying))).toBeGreaterThan(1e-5)
   checkConformity(next, grid)
 })
 
@@ -211,10 +218,11 @@ it('keeps adaptive controls and engineering tooltips localized in English, Germa
     'adaptiveLevelOne3d', 'adaptiveLevelTwo3d', 'generateMesh3d', 'adaptiveRefine3d', 'meshStats3d', 'meshNodes3d',
     'meshCoarse3d', 'meshMedium3d', 'meshFine3d', 'meshEdges3d', 'meshDensity3d', 'removedGhost3d', 'ghostOpacity3d',
     'hint3dAdaptiveLoads', 'hint3dAdaptiveFeatures', 'hint3dAdaptiveDepth', 'hint3dGenerateMesh', 'hint3dAdaptiveRefine',
-    'hint3dMeshStats', 'hint3dMeshDensity', 'hint3dGhost', 'hint3dGhostOpacity', 'refining'] as const
+    'hint3dMeshStats', 'hint3dMeshDensity', 'hint3dGhost', 'hint3dGhostOpacity', 'refining', 'adaptiveBudget3dError',
+    'hint3dElementType', 'hint3dResolution', 'hint3dAdaptiveResolution'] as const
   for (const key of keys) {
     const words = Object.values(dictionaries).map(entry => entry[key].trim())
-    expect(words.every(Boolean)).toBe(true)
+    expect(words.every(word => word.length > 0 && !word.includes('?'))).toBe(true)
     expect(new Set(words).size).toBe(3)
   }
 })
@@ -234,3 +242,121 @@ it('preserves both symmetry planes, passive masks and stability under multiple t
   expect(snapshot.density.every((rho, e) => rho === snapshot.density[representatives[e]]
     && (!solid[e] || rho === 1) && (!voidMask[e] || rho === 0))).toBe(true)
 })
+
+it.each([
+  { contact: 'vertex', offset: [1, 1, 1] },
+  { contact: 'edge', offset: [1, 1, 0] },
+  { contact: 'face', offset: [1, 0, 0] },
+])('checks rigid modes for two bricks touching at a $contact', ({ contact, offset: [x, y, z] }) => {
+  const grid = { nelx: 2, nely: 2, nelz: 2, widthMm: 10, heightMm: 10, depthMm: 10 }
+  const problem = makePreset3D('cantilever3d', grid, { ...defaultParams3D, volFrac: 0.2 }, undefined, 'adaptiveTet4')
+  problem.adaptive = { refineLoads: false, refineFeatures: false, maxLevel: 1 }
+  problem.passive!.void!.fill(1)
+  problem.passive!.void![0] = 0
+  problem.passive!.void![elementIndex(grid, x, y, z)] = 0
+  problem.supports = problem.supports.filter(s => {
+    const [, y, z] = nodePosition(grid, s.node)
+    return y <= 5 && z <= 5
+  })
+  problem.loadCases = [{ id: 'test', forces: [{ node: nodeIndex3D(grid, 2, y + 1, z + 1), fx: 0, fy: -10, fz: 0 }] }]
+  const mesh = generateAdaptiveMesh3D(problem)
+  if (contact === 'face') {
+    expect(() => unstructuredSetup3D(problem, mesh)).not.toThrow()
+    expect(() => validateProblem3D({ ...problem, mesh })).not.toThrow()
+  } else {
+    expect(() => unstructuredSetup3D(problem, mesh)).toThrow('componentSupport3dError')
+    expect(() => validateProblem3D({ ...problem, mesh })).toThrow('componentSupport3dError')
+    // The second body can be stabilized by its own supports.
+    for (const node of [[2, y, z], [2, y + 1, z], [2, y, z + 1]]) {
+      problem.supports = [...problem.supports, { node: nodeIndex3D(grid, node[0], node[1], node[2]), fixX: true, fixY: true, fixZ: true }]
+    }
+    expect(() => unstructuredSetup3D(problem, mesh)).not.toThrow()
+  }
+})
+
+it('keeps every adaptive stress sample on the material side of a passive-void boundary after smoothing', () => {
+  const problem = makePreset3D('cantilever3d', smallGrid, undefined, undefined, 'adaptiveTet4')
+  const voidMask = problem.passive!.void!
+  voidMask.forEach((_, e) => { voidMask[e] = Number(e % smallGrid.nelx >= smallGrid.nelx / 2) })
+  const mesh = generateAdaptiveMesh3D(problem)
+  const density = new Float64Array(mesh.stats.elements).fill(0.8)
+  const { surface, valid } = prepareCadSurface3D(density, smallGrid, 0.5, 2, problem.passive, 'adaptiveTet4', mesh)
+  expect(valid).toEqual({ obj: true, stl: true })
+  expect(surface.faceElements).toHaveLength(surface.triangles.length / 3)
+  let voidSideCorners = 0
+  surface.triangles.forEach((node, corner) => {
+    const relocated = locateAdaptiveTet3D(mesh, surface.vertices, 3 * node)
+    if (voidMask[mesh.bricks[relocated]]) voidSideCorners++
+    expect(voidMask[mesh.bricks[surface.faceElements![Math.floor(corner / 3)]]]).toBe(0)
+  })
+  expect(voidSideCorners).toBeGreaterThan(0)
+})
+
+it('bounds both the initial Tet4 extraction and the additional facets from contact trimming', () => {
+  const problem = makePreset3D('cantilever3d', smallGrid, undefined, undefined, 'adaptiveTet4')
+  const mesh = generateAdaptiveMesh3D(problem)
+  const first = new Set(mesh.tetrahedra.subarray(0, 4))
+  const other = mesh.levels.findIndex((_, e) =>
+    mesh.tetrahedra.subarray(4 * e, 4 * e + 4).filter(node => first.has(node)).length === 1)
+  expect(other).toBeGreaterThan(0)
+  const density = new Float64Array(mesh.stats.elements)
+  density[0] = density[other] = 1
+  const full = marchingTetrahedra(density, smallGrid, 0.5, undefined, mesh)
+  expect(full.triangles.length / 3).toBeGreaterThan(8)
+  expect(() => marchingTetrahedra(density, smallGrid, 0.5, undefined, mesh, 7)).toThrow(CadTriangleBudgetError)
+  expect(() => marchingTetrahedra(density, smallGrid, 0.5, undefined, mesh, 8)).toThrow(CadTriangleBudgetError)
+})
+
+it.each(['hex8', 'tet4', 'adaptiveTet4'] as const)('deduplicates shared solid and ghost %s wireframe edges', elementType => {
+  const mesh = elementType === 'adaptiveTet4'
+    ? generateAdaptiveMesh3D(makePreset3D('cantilever3d', smallGrid, undefined, undefined, elementType))
+    : undefined
+  const perBrick = elementType === 'tet4' ? 5 : 1
+  const density = Float64Array.from({ length: mesh?.stats.elements ?? elementCount(smallGrid, elementType) },
+    (_, e) => Number((mesh?.bricks[e] ?? Math.floor(e / perBrick)) % smallGrid.nelx < smallGrid.nelx / 2))
+  const solid = elementSurface3D(smallGrid, elementType, density, 0.5, true, mesh)
+  const ghost = elementSurface3D(smallGrid, elementType, density, 0.5, true, mesh, true)
+  const combined = elementSurface3D(smallGrid, elementType, density, 0.5, true, mesh, true, solid.edges)
+  function keys(edges: Uint32Array) {
+    const result = new Set<string>()
+    for (let i = 0; i < edges.length; i += 2) result.add(edges.slice(i, i + 2).sort().join(','))
+    return result
+  }
+  const solidKeys = keys(solid.edges)
+  expect([...keys(ghost.edges)].some(key => solidKeys.has(key))).toBe(true)
+  expect(keys(combined.edges)).toEqual(new Set([...keys(ghost.edges)].filter(key => !solidKeys.has(key))))
+  expect(combined.triangles).toEqual(ghost.triangles)
+})
+
+it('checks each loaded island independently of disconnected unloaded material', () => {
+  const grid = { nelx: 6, nely: 2, nelz: 2, widthMm: 30, heightMm: 10, depthMm: 10 }
+  const problem = makePreset3D('cantilever3d', grid, { ...defaultParams3D, volFrac: 0.06 }, undefined, 'adaptiveTet4')
+  problem.passive!.void!.fill(1)
+  problem.passive!.void![0] = problem.passive!.void![4] = 0
+  problem.supports = problem.supports.filter(s => {
+    const [, y, z] = nodePosition(grid, s.node)
+    return y <= 5 && z <= 5
+  })
+  const load = (x: number) => [{ id: 'test', forces: [{ node: nodeIndex3D(grid, x, 0, 0), fx: 0, fy: -10, fz: 0 }] }]
+  problem.loadCases = load(1)
+  const mesh = generateAdaptiveMesh3D(problem)
+  expect(() => unstructuredSetup3D(problem, mesh)).not.toThrow()
+  // The old grid node x=4 is already a reference-aligned mesh corner.
+  problem.loadCases = load(4)
+  expect(() => unstructuredSetup3D(problem, mesh)).toThrow('componentSupport3dError')
+})
+
+it('guards tetrahedron count and retained typed-array memory before solver allocation', () => {
+  const problem = makePreset3D('cantilever3d', smallGrid, undefined, undefined, 'adaptiveTet4')
+  expect(() => generateAdaptiveMesh3D({ ...problem, grid: { ...smallGrid, nelx: 200, nely: 200, nelz: 200 } }))
+    .toThrow('adaptiveBudget3dError')
+  const mesh = generateAdaptiveMesh3D(problem)
+  expect(() => preflightAdaptiveSolver3D(problem, mesh, 512 * 1024 ** 2)).toThrow('adaptiveBudget3dError')
+})
+
+it.each(['cantilever3d', 'boltBracket3d', 'archBridge3d', 'lBracket3d'] as const)(
+  'keeps the default coarse adaptive %s preset within budget', preset => {
+    const problem = makePreset3D(preset, boltGrid, undefined, undefined, 'adaptiveTet4')
+    const mesh = generateAdaptiveMesh3D(problem)
+    expect(() => preflightAdaptiveSolver3D(problem, mesh)).not.toThrow()
+  })

@@ -6,7 +6,6 @@ import {
 } from 'three'
 import { useTranslation } from '../i18n'
 import { brickMasks3D, caseColor3D, caseNumber, forceMagnitude3D, validForceMagnitude3D, type EditTool3D, type ForceVector3D } from '../solver3d/design3d'
-import { locateAdaptiveTet3D } from '../solver3d/adaptiveMesh3d'
 import { nodalField3D } from '../solver3d/mesh3d'
 import { cellSize, nodeIndex3D, nodePosition, type Grid3D, type SimpProblem3D } from '../solver3d/types3d'
 import type { Surface3D, creaseGeometry3D } from '../solver3d/surface3d'
@@ -222,13 +221,29 @@ function femMesh(data: FemGeometry3D, wireframe: boolean, planes: Plane[], level
 
 export function surfaceMesh(problem: SimpProblem3D, surface: Surface3D, planes: Plane[], frame?: TimedSnapshot3D,
   render?: ReturnType<typeof creaseGeometry3D>) {
+  const { faceElements, triangles, vertices } = surface
   const geometry = new BufferGeometry()
+  const stressMaterial = () => new MeshBasicMaterial({ vertexColors: true, toneMapped: false, side: FrontSide, clippingPlanes: planes })
+  if (frame && faceElements) {
+    const positions = render?.positions ?? Float32Array.from({ length: 3 * triangles.length }, (_, i) =>
+      vertices[3 * triangles[Math.floor(i / 3)] + i % 3])
+    const colors = new Float32Array(positions.length)
+    const peak = [frame.p95VonMises, frame.maxVonMises].find(value => Number.isFinite(value) && value > 0) ?? 1
+    const color = new Color()
+    faceElements.forEach((element, face) => {
+      stressColor(color, frame.vonMises[element] / peak)
+      for (let corner = 0; corner < 3; corner++) color.toArray(colors, 9 * face + 3 * corner)
+    })
+    geometry.setAttribute('position', new BufferAttribute(positions, 3))
+    geometry.setAttribute('color', new BufferAttribute(colors, 3))
+    return new Mesh(geometry, stressMaterial())
+  }
   if (!frame && render) {
     geometry.setAttribute('position', new BufferAttribute(render.positions, 3))
     geometry.setAttribute('normal', new BufferAttribute(render.normals, 3))
   } else {
-    geometry.setAttribute('position', new BufferAttribute(Float32Array.from(surface.vertices), 3))
-    geometry.setIndex(new BufferAttribute(surface.triangles, 1))
+    geometry.setAttribute('position', new BufferAttribute(Float32Array.from(vertices), 3))
+    geometry.setIndex(new BufferAttribute(triangles, 1))
     if (!frame) geometry.computeVertexNormals()
   }
   if (frame) {
@@ -238,16 +253,10 @@ export function surfaceMesh(problem: SimpProblem3D, surface: Surface3D, planes: 
     const nodal = problem.elementType === 'tet4' ? nodalField3D(grid, 'tet4', frame.vonMises, frame.density) : undefined
     const offset = nodal ? 0 : 0.5
     const maxX = nelx - 2 * offset, maxY = nely - 2 * offset, maxZ = nelz - 2 * offset
-    const { vertices } = surface
     const colors = new Float32Array(vertices.length)
     const peak = [frame.p95VonMises, frame.maxVonMises].find(value => Number.isFinite(value) && value > 0) ?? 1
     const color = new Color()
     for (let j = 0; j < vertices.length; j += 3) {
-      if (problem.mesh) {
-        const e = locateAdaptiveTet3D(problem.mesh, vertices, j)
-        stressColor(color, frame.vonMises[e] / peak).toArray(colors, j)
-        continue
-      }
       const cx = MathUtils.clamp(vertices[j] / size[0] - offset, 0, maxX)
       const cy = MathUtils.clamp(vertices[j + 1] / size[1] - offset, 0, maxY)
       const cz = MathUtils.clamp(vertices[j + 2] / size[2] - offset, 0, maxZ)
@@ -266,7 +275,7 @@ export function surfaceMesh(problem: SimpProblem3D, surface: Surface3D, planes: 
       stressColor(color, value / (weightSum || 1) / peak).toArray(colors, j)
     }
     geometry.setAttribute('color', new BufferAttribute(colors, 3))
-    return new Mesh(geometry, new MeshBasicMaterial({ vertexColors: true, toneMapped: false, side: FrontSide, clippingPlanes: planes }))
+    return new Mesh(geometry, stressMaterial())
   }
   return new Mesh(geometry, new MeshStandardMaterial({
     color: '#afc3d7', metalness: 0.37, roughness: 0.42, side: FrontSide, clippingPlanes: planes,
@@ -363,7 +372,7 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
   useEffect(() => {
     if (!active || (!femView && !showGhost) || !density) return
     const request: FemRequest3D = { type: 'fem', density, grid, threshold: femThreshold, elementType: femType,
-      wireframe: showEdges, mesh: problem.mesh, ...(showGhost && { ghostThreshold: threshold }) }
+      wireframe: femView && showEdges, mesh: problem.mesh, ...(showGhost && { ghostThreshold: threshold }) }
     let live = true
     const worker = new Worker(new URL('../workers/surface3dWorker.ts', import.meta.url), { type: 'module' })
     worker.onmessage = ({ data }: MessageEvent<FemEvent3D>) => {
@@ -381,7 +390,7 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
     disposeGroup(model)
     disposeGroup(ghost)
     const clipping = sectioned ? planes : []
-    const geometry = hasDensity && fem?.request.grid === grid && fem.request.elementType === femType && fem.request.wireframe === showEdges && fem.request.mesh === problem.mesh
+    const geometry = hasDensity && fem?.request.grid === grid && fem.request.elementType === femType && fem.request.wireframe === (femView && showEdges) && fem.request.mesh === problem.mesh
       ? fem.geometry : undefined
     const solid = femView
       ? geometry?.triangles.length && femMesh(geometry, showEdges, clipping, refinementView ? problem.mesh?.levels : undefined)

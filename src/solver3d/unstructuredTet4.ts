@@ -1,8 +1,8 @@
-import { adaptiveBoundary3D, tetCoordinates3D, type AdaptiveMesh3D } from './adaptiveMesh3d'
-import { brickMasks3D, rigidRankAt3D } from './design3d'
+import { adaptiveBoundary3D, maxAdaptiveTetrahedra3D, tetCoordinates3D, type AdaptiveMesh3D } from './adaptiveMesh3d'
+import { brickMasks3D, rigidComponents3D, rigidComponentsStable3D } from './design3d'
 import { elasticity3D } from './elementH8'
 import { tet4Stiffness } from './elementT4'
-import { ProblemError3D, type SimpProblem3D, type Support3D } from './types3d'
+import { cellSize, ProblemError3D, type SimpProblem3D } from './types3d'
 
 export function unstructuredTet4Element(positions: Float64Array, ids: ArrayLike<number>, E: number, nu: number) {
   const { rows, det } = tetCoordinates3D(positions, ids)
@@ -111,96 +111,139 @@ export class UnstructuredStiffness3D {
   }
 }
 
-/** Each row is the isotropic cone times source volume, normalized to unit sum.
- * The grid limits candidate searches to 27 bins. Work scales with the number
- * of candidate pairs, including the unavoidable neighbors in dense regions. */
+const filterChunkSize = 65_536
+const maxCachedPairs = 192 * filterChunkSize
+const maxFilterPairs = 72_000_000
+const maxCandidatePairs = 200_000_000
+const maxAdaptiveBytes = 512 * 1024 ** 2
+
+function filterWeight(centroids: Float64Array, e: number, j: number, radius: number) {
+  const a = 3 * e, b = 3 * j
+  const dx = centroids[a] - centroids[b], dy = centroids[a + 1] - centroids[b + 1], dz = centroids[a + 2] - centroids[b + 2]
+  const distance = Math.sqrt(dx * dx + dy * dy + dz * dz)
+  return distance < radius ? 1 - distance / radius : 0
+}
+
+type FilterBin = { elements: number[]; neighbors: number[][]; min: number[]; max: number[] }
+
+export function preflightAdaptiveSolver3D(problem: SimpProblem3D, mesh: AdaptiveMesh3D, retainedBytes = 0) {
+  const { elements, nodes } = mesh.stats
+  const { centroids } = mesh
+  const radius = problem.params.rmin * Math.min(...cellSize(problem.grid))
+  // Worst-case CSR blocks and unique local Jacobians, plus mesh, solver,
+  // transfer, analysis, and snapshot arrays, including per-case DOF storage.
+  const bytes = elements * (16 * 76 + (144 + 72) * 8 + 256)
+    + nodes * (256 + 3 * 8 * 4 * problem.loadCases.length)
+    + mesh.owners.byteLength + mesh.leafOffsets.byteLength
+  if (elements > maxAdaptiveTetrahedra3D || bytes + retainedBytes > maxAdaptiveBytes) {
+    throw new ProblemError3D('adaptiveBudget3dError')
+  }
+  if (!(radius > 0 && Number.isFinite(radius))) throw new ProblemError3D('settings3dError')
+  const { voidMask } = brickMasks3D(problem)
+  const buckets = new Map<string, FilterBin>()
+  const rows: (FilterBin | undefined)[] = new Array(elements)
+  const binSize = radius / 2 || radius
+  for (let e = 0; e < elements; e++) {
+    if (voidMask[mesh.bricks[e]]) continue
+    // Cap bin indices to keep adjacent-bin iteration safe even for tiny radii.
+    const key = [0, 1, 2].map(d => Math.min(Number.MAX_SAFE_INTEGER - 4, Math.floor(centroids[3 * e + d] / binSize))).join(',')
+    let bin = buckets.get(key)
+    if (!bin) {
+      bin = { elements: [], neighbors: [], min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] }
+      buckets.set(key, bin)
+    }
+    for (let d = 0; d < 3; d++) {
+      const x = centroids[3 * e + d]
+      bin.min[d] = Math.min(bin.min[d], x)
+      bin.max[d] = Math.max(bin.max[d], x)
+    }
+    bin.elements.push(e)
+    rows[e] = bin
+  }
+  let pairs = 0
+  for (const [key, bin] of buckets) {
+    const [x, y, z] = key.split(',').map(Number)
+    for (let k = z - 2; k <= z + 2; k++) for (let j = y - 2; j <= y + 2; j++) for (let i = x - 2; i <= x + 2; i++) {
+      const other = buckets.get([i, j, k].join(','))
+      if (!other) continue
+      let square = 0
+      for (let d = 0; d < 3; d++) square += Math.max(0, bin.min[d] - other.max[d], other.min[d] - bin.max[d]) ** 2
+      if (square > radius * radius) continue
+      pairs += bin.elements.length * other.elements.length
+      if (pairs > maxCandidatePairs) throw new ProblemError3D('adaptiveBudget3dError')
+      bin.neighbors.push(other.elements)
+    }
+  }
+  // Count actual neighbors only if bin occupancy cannot prove the work fits.
+  if (pairs > maxFilterPairs) {
+    pairs = 0
+    for (let e = 0; e < elements; e++) for (const bin of rows[e]?.neighbors ?? []) for (const j of bin) {
+      if (filterWeight(centroids, e, j, radius) > 0 && ++pairs > maxFilterPairs) throw new ProblemError3D('adaptiveBudget3dError')
+    }
+  }
+  const available = Math.floor((maxAdaptiveBytes - bytes - retainedBytes) / (12 * filterChunkSize))
+  const capacity = Math.min(maxCachedPairs, available * filterChunkSize, Math.ceil(pairs / filterChunkSize) * filterChunkSize)
+  return { radius, rows, capacity, estimatedBytes: bytes + 12 * capacity }
+}
+
+/** Normalize the volume-weighted cone. Rows beyond the cache limit use the
+ * preflighted spatial bins, which also bound work for both filter passes. */
 export class UnstructuredConeFilter3D {
   private readonly starts: Uint32Array
   private readonly columns: Uint32Array[] = []
   private readonly weights: Float64Array[] = []
   private readonly inverse: Float64Array
-  private readonly nearRows: (number[][] | undefined)[]
-  private cachedRows = 0
+  private readonly uncached: (number[][] | undefined)[]
+  private readonly cachedRows: number
+  private readonly radius: number
 
-  constructor(private readonly centroids: Float64Array, private readonly volumes: Float64Array,
-    private readonly rminPhys: number, voidMask: Uint8Array) {
-    const count = volumes.length
-    const starts = this.starts = new Uint32Array(count + 1)
-    this.inverse = new Float64Array(count)
-    this.nearRows = new Array(count)
-    const buckets = new Map<string, number[]>()
-    const xyz = Array.from({ length: count }, (_, e) =>
-      [0, 1, 2].map(d => Math.floor(centroids[3 * e + d] / rminPhys)))
-    for (let e = 0; e < count; e++) {
-      if (voidMask[e]) continue
-      const key = xyz[e].join(',')
-      const bucket = buckets.get(key)
-      if (bucket) bucket.push(e)
-      else buckets.set(key, [e])
-    }
-    const chunk = 65536
-    // Cap adjacency storage. Large radii reuse the same spatial bins for
-    // uncached rows instead of allocating a nearly dense matrix.
-    const capacity = 384 * chunk
-    let length = 0
-    const neighborhood = new Map<string, number[][]>()
-    for (let e = 0; e < count; e++) {
+  constructor(private readonly mesh: AdaptiveMesh3D, plan: ReturnType<typeof preflightAdaptiveSolver3D>) {
+    const { volumes } = mesh
+    const { rows, capacity } = plan
+    this.radius = plan.radius
+    const starts = this.starts = new Uint32Array(volumes.length + 1)
+    this.inverse = new Float64Array(volumes.length)
+    let cachedRows = volumes.length, length = 0
+    for (let e = 0; e < volumes.length; e++) {
       starts[e] = length
-      if (length < capacity) this.cachedRows = e + 1
-      if (voidMask[e]) continue
-      const [x, y, z] = xyz[e]
-      const key = xyz[e].join(',')
-      let near = neighborhood.get(key)
-      if (!near) {
-        near = []
-        for (let k = z - 1; k <= z + 1; k++) for (let j = y - 1; j <= y + 1; j++) for (let i = x - 1; i <= x + 1; i++) {
-          const bucket = buckets.get([i, j, k].join(','))
-          if (bucket) near.push(bucket)
-        }
-        neighborhood.set(key, near)
-      }
-      if (length >= capacity) this.nearRows[e] = near
       let sum = 0
-      for (const bucket of near) for (const j of bucket) {
+      for (const bin of rows[e]?.neighbors ?? []) for (const j of bin) {
         const weight = this.weight(e, j)
         if (!weight) continue
         sum += weight
+        if (e >= cachedRows) continue
         if (length === capacity) {
-          this.cachedRows = Math.min(this.cachedRows, e)
-          this.nearRows[e] = near
+          cachedRows = e
+          length = starts[e]
           continue
         }
-        if (length % chunk === 0) {
-          this.columns.push(new Uint32Array(chunk))
-          this.weights.push(new Float64Array(chunk))
+        if (length % filterChunkSize === 0) {
+          this.columns.push(new Uint32Array(filterChunkSize))
+          this.weights.push(new Float64Array(filterChunkSize))
         }
         this.columns[length >>> 16][length & 65535] = j
         this.weights[length >>> 16][length & 65535] = weight
         length++
       }
-      this.inverse[e] = 1 / sum
-      if (e < this.cachedRows) for (let i = starts[e]; i < length; i++) this.weights[i >>> 16][i & 65535] /= sum
+      if (sum > 0) this.inverse[e] = 1 / sum
+      for (let i = starts[e]; i < length; i++) this.weights[i >>> 16][i & 65535] /= sum
     }
-    starts[count] = length
+    starts[volumes.length] = length
+    this.cachedRows = cachedRows
+    this.uncached = rows.slice(cachedRows).map(bin => bin?.neighbors)
   }
 
   private weight(e: number, j: number) {
-    const { centroids, rminPhys, volumes } = this
-    const a = 3 * e, b = 3 * j
-    const dx = centroids[a] - centroids[b], dy = centroids[a + 1] - centroids[b + 1], dz = centroids[a + 2] - centroids[b + 2]
-    const square = dx * dx + dy * dy + dz * dz
-    return square < rminPhys * rminPhys ? volumes[j] * (rminPhys - Math.sqrt(square)) : 0
+    return this.mesh.volumes[j] * filterWeight(this.mesh.centroids, e, j, this.radius)
   }
 
   apply(input: Float64Array, output: Float64Array) {
-    const { starts, columns, weights, cachedRows, nearRows, inverse } = this
+    const { starts, columns, weights, cachedRows, uncached, inverse } = this
     for (let e = 0; e < output.length; e++) {
-      const near = nearRows[e]
       let sum = 0
-      if (e < cachedRows) {
-        for (let j = starts[e]; j < starts[e + 1]; j++) sum += weights[j >>> 16][j & 65535] * input[columns[j >>> 16][j & 65535]]
-      } else if (near) {
-        for (const bucket of near) for (const j of bucket) sum += this.weight(e, j) * input[j]
+      for (let j = starts[e]; j < starts[e + 1]; j++) sum += weights[j >>> 16][j & 65535] * input[columns[j >>> 16][j & 65535]]
+      if (e >= cachedRows) {
+        for (const bin of uncached[e - cachedRows] ?? []) for (const j of bin) sum += this.weight(e, j) * input[j]
         sum *= inverse[e]
       }
       output[e] = sum
@@ -209,16 +252,15 @@ export class UnstructuredConeFilter3D {
   }
 
   transpose(input: Float64Array, output: Float64Array) {
-    const { starts, columns, weights, cachedRows, nearRows, inverse } = this
+    const { starts, columns, weights, cachedRows, uncached, inverse } = this
     output.fill(0)
     for (let e = 0; e < input.length; e++) {
-      const value = input[e], near = nearRows[e]
+      const value = input[e]
       if (value === 0) continue
-      if (e < cachedRows) {
-        for (let j = starts[e]; j < starts[e + 1]; j++) output[columns[j >>> 16][j & 65535]] += weights[j >>> 16][j & 65535] * value
-      } else if (near) {
-        const scaled = value * inverse[e]
-        for (const bucket of near) for (const j of bucket) output[j] += this.weight(e, j) * scaled
+      for (let j = starts[e]; j < starts[e + 1]; j++) output[columns[j >>> 16][j & 65535]] += weights[j >>> 16][j & 65535] * value
+      if (e >= cachedRows) {
+        const scaled = inverse[e] * value
+        for (const bin of uncached[e - cachedRows] ?? []) for (const j of bin) output[j] += this.weight(e, j) * scaled
       }
     }
     return output
@@ -231,45 +273,24 @@ export function unstructuredSetup3D(problem: SimpProblem3D, mesh: AdaptiveMesh3D
   const voidMask = Uint8Array.from(mesh.bricks, e => brickMasks.voidMask[e])
   const { supports, loadCases } = adaptiveBoundary3D(problem, mesh)
   const { nodes, elements } = mesh.stats
-  const parent = Int32Array.from({ length: nodes }, (_, i) => i)
-  const live = new Uint8Array(nodes)
-  function root(i: number) {
-    while (parent[i] !== i) {
-      parent[i] = parent[parent[i]]
-      i = parent[i]
-    }
-    return i
-  }
+  const { neighbors, tetrahedra, positions } = mesh
+  const components = rigidComponents3D(voidMask, nodes, e => neighbors.subarray(4 * e, 4 * e + 4),
+    e => tetrahedra.subarray(4 * e, 4 * e + 4))
+  const live = components.firstBody
   let allowed = 0
-  for (let e = 0; e < elements; e++) {
-    if (voidMask[e]) continue
-    allowed += mesh.volumes[e]
-    const first = root(mesh.tetrahedra[4 * e])
-    for (let j = 0; j < 4; j++) {
-      const node = mesh.tetrahedra[4 * e + j]
-      live[node] = 1
-      parent[root(node)] = first
-    }
-  }
-  const fixed = Uint8Array.from({ length: 3 * nodes }, (_, d) => 1 - live[Math.floor(d / 3)])
-  const components = new Map<number, Support3D[]>()
-  for (let node = 0; node < nodes; node++) if (live[node] && root(node) === node) components.set(node, [])
+  for (let e = 0; e < elements; e++) if (!voidMask[e]) allowed += mesh.volumes[e]
+  const fixed = Uint8Array.from({ length: 3 * nodes }, (_, d) => Number(live[Math.floor(d / 3)] < 0))
   for (const s of supports) {
-    if (!live[s.node]) continue
-    components.get(root(s.node))!.push(s)
+    if (live[s.node] < 0) continue
     for (const [d, flag] of [s.fixX, s.fixY, s.fixZ].entries()) if (flag) fixed[3 * s.node + d] = 1
   }
-  const { widthMm, heightMm, depthMm } = problem.grid
-  for (const restrained of components.values()) {
-    if (rigidRankAt3D(restrained, nodes, Math.max(widthMm, heightMm, depthMm), n => mesh.positions.subarray(3 * n, 3 * n + 3)) < 6) {
-      throw new ProblemError3D('componentSupport3dError')
-    }
-  }
+  const loaded = new Uint8Array(nodes)
   const forces = loadCases.map(({ forces }) => {
     const rhs = new Float64Array(fixed.length)
     for (const { node, fx, fy, fz } of forces) {
       if (!(fx || fy || fz)) continue
-      if (!live[node]) throw new ProblemError3D('attachment3dError')
+      if (!(live[node] >= 0)) throw new ProblemError3D('attachment3dError')
+      loaded[node] = 1
       if (!fixed[3 * node]) rhs[3 * node] += fx
       if (!fixed[3 * node + 1]) rhs[3 * node + 1] += fy
       if (!fixed[3 * node + 2]) rhs[3 * node + 2] += fz
@@ -277,6 +298,9 @@ export function unstructuredSetup3D(problem: SimpProblem3D, mesh: AdaptiveMesh3D
     return rhs
   })
   if (!forces.some(rhs => rhs.some(value => value !== 0))) throw new ProblemError3D('load3dError')
+  const { widthMm, heightMm, depthMm } = problem.grid
+  if (!rigidComponentsStable3D(components, supports, Math.max(widthMm, heightMm, depthMm),
+    n => positions.subarray(3 * n, 3 * n + 3), loaded)) throw new ProblemError3D('componentSupport3dError')
   const representatives = Int32Array.from(mesh.levels, (_, e) => e)
   const sy = problem.params.symmetry?.includes('y'), sz = problem.params.symmetry?.includes('z')
   if (sy || sz) {

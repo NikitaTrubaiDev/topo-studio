@@ -2,7 +2,7 @@ import type { AdaptiveMesh3D } from './adaptiveMesh3d'
 import { h8Corners } from './elementH8'
 import { tetFaces } from './elementT4'
 import { visitActiveCells3D } from './mesh3d'
-import type { Surface3D } from './surface3d'
+import { cadTriangleBudget, CadTriangleBudgetError, type Surface3D } from './surface3d'
 import { elementCount, nodeCount, nodeIndex3D, nodePosition, type Grid3D } from './types3d'
 import type { PassiveMasks } from '../solver/types'
 
@@ -87,18 +87,28 @@ function trimContact(faces: ClipFace[], distance: (point: number[]) => number): 
 
 /** Extract the solid Tet4 boundary. Face-connected material is preserved. At edge-
  * or vertex-only contacts, trim the singular feature locally to make a manifold. */
-export function marchingTetrahedra(density: ArrayLike<number>, grid: Grid3D, threshold = 0.5, passive?: PassiveMasks, mesh?: AdaptiveMesh3D): Surface3D {
+export function marchingTetrahedra(density: ArrayLike<number>, grid: Grid3D, threshold = 0.5, passive?: PassiveMasks, mesh?: AdaptiveMesh3D,
+  triangleBudget = cadTriangleBudget): Surface3D {
   if (density.length !== (mesh?.stats.elements ?? elementCount(grid, 'tet4')) || !(threshold > 0 && threshold < 1)) {
     throw new RangeError('Invalid Tet4 isosurface input')
   }
   for (let e = 0; e < density.length; e++) if (!Number.isFinite(density[e])) throw new RangeError('Non-finite density')
 
+  // Prescribed voids cannot emit material faces, even if the input is stale.
+  if (mesh && passive?.void?.some(Boolean)) density = Float64Array.from(density, (value, e) => passive.void![mesh.bricks[e]] ? 0 : value)
   const count = mesh?.stats.nodes ?? nodeCount(grid)
   const elementType = mesh ? 'adaptiveTet4' : 'tet4'
   const edgeKey = (a: number, b: number) => Math.min(a, b) * count + Math.max(a, b)
-  const exposedTriangles: number[] = []
-  visitActiveCells3D(grid, elementType, density, threshold, (nodes, exposed) => {
-    for (const { corners: [a, b, c] } of exposed) exposedTriangles.push(nodes[a], nodes[b], nodes[c])
+  const exposedTriangles: number[] = [], exposedElements = mesh ? [] as number[] : undefined
+  function checkBudget(count: number) {
+    if (count > triangleBudget) throw new CadTriangleBudgetError('CAD surface exceeds the triangle budget')
+  }
+  visitActiveCells3D(grid, elementType, density, threshold, (nodes, exposed, _, element) => {
+    checkBudget(exposedTriangles.length / 3 + exposed.length)
+    for (const { corners: [a, b, c] } of exposed) {
+      exposedTriangles.push(nodes[a], nodes[b], nodes[c])
+      exposedElements?.push(element)
+    }
   }, true, mesh)
   const { singularEdges, singularNodes } = findContacts(exposedTriangles, count, edgeKey)
   const { nelx, nely, nelz } = grid
@@ -136,14 +146,21 @@ export function marchingTetrahedra(density: ArrayLike<number>, grid: Grid3D, thr
     return nodesToVertices[node]
   }
 
+  let faceElements = exposedElements
+  function emit(a: number, b: number, c: number, element: number) {
+    triangles.push(a, b, c)
+    faceElements?.push(element)
+  }
   if (!singularNodes.some(Boolean)) {
     for (const node of exposedTriangles) triangles.push(atNode(node))
   } else {
+    faceElements = mesh ? [] : undefined
     const cutVertices = new Map<string, number>()
-    visitActiveCells3D(grid, elementType, density, threshold, (nodes, exposed, brickCorners) => {
+    visitActiveCells3D(grid, elementType, density, threshold, (nodes, exposed, brickCorners, element) => {
       const ids = brickCorners.map(corner => nodes[corner])
       if (!ids.some(id => singularNodes[id])) {
-        for (const { corners: [a, b, c] } of exposed) triangles.push(atNode(nodes[a]), atNode(nodes[b]), atNode(nodes[c]))
+        checkBudget(triangles.length / 3 + exposed.length)
+        for (const { corners: [a, b, c] } of exposed) emit(atNode(nodes[a]), atNode(nodes[b]), atNode(nodes[c]), element)
         return
       }
       // Faces are stored in opposite-vertex order, including interior faces needed to close the cut polygons.
@@ -160,6 +177,7 @@ export function marchingTetrahedra(density: ArrayLike<number>, grid: Grid3D, thr
       }
       for (const { points, exposed } of faces) {
         if (!exposed) continue
+        checkBudget(triangles.length / 3 + points.length - 2)
         const polygon = points.map(weights => {
           const support = weights.flatMap((weight, i) => weight ? [{ id: ids[i], weight }] : []).sort((a, b) => a.id - b.id)
           if (support.length === 1) return atNode(support[0].id)
@@ -175,10 +193,11 @@ export function marchingTetrahedra(density: ArrayLike<number>, grid: Grid3D, thr
           }
           return index
         })
-        for (let i = 1; i + 1 < polygon.length; i++) triangles.push(polygon[0], polygon[i], polygon[i + 1])
+        for (let i = 1; i + 1 < polygon.length; i++) emit(polygon[0], polygon[i], polygon[i + 1], element)
       }
     }, false, mesh)
   }
   return { vertices: Float64Array.from(vertices), triangles: Uint32Array.from(triangles),
+    ...(faceElements && { faceElements: Uint32Array.from(faceElements) }),
     ...(prescribed && { pinned: Uint8Array.from(pins) }) }
 }

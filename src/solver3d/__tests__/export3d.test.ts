@@ -229,3 +229,14 @@ it('rejects a wall move through a cavity while smoothing an independent shell', 
   expect(local.vertices.slice(vertices.length)).not.toEqual(combined.vertices.slice(vertices.length))
   expect(isWatertight(local, true)).toBe(true)
 })
+
+it('rejects closed tetrahedral shells with crossing or coplanar overlapping faces', () => {
+  const first = [0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 2]
+  const faces = [1, 2, 3, 0, 3, 2, 0, 1, 3, 0, 2, 1]
+  const triangles = Uint32Array.from([...faces, ...faces.map(v => v + 4)])
+  for (const offset of [[0.75, 0.25, 0.25], [0.75, 0.25, 0], [3, 0, 0]]) {
+    const vertices = Float64Array.from([...first, ...first.map((v, i) => v + offset[i % 3])])
+    expect(isWatertight({ vertices, triangles })).toBe(offset[0] === 3)
+    expect(isWatertight({ vertices, triangles }, true)).toBe(offset[0] === 3)
+  }
+})
