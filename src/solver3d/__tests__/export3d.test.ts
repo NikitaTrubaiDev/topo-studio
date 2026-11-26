@@ -196,7 +196,7 @@ it('keeps seed-23 Tet4 material exportable before and after smoothing', () => {
   }
 })
 
-it('keeps the last valid surface when smoothing would move an outer wall through a cavity', () => {
+it('rejects a wall move through a cavity while smoothing an independent shell', () => {
   const vertices = Float64Array.of(
     1, 1, 1, 5, 1, 1, 1, 5, 1, 5, 5, 1,
     1, 1, 5, 5, 1, 5, 1, 5, 5, 5, 5, 5,
@@ -217,4 +217,15 @@ it('keeps the last valid surface when smoothing would move an outer wall through
   const limits = { nelx: 10, nely: 10, nelz: 10, widthMm: 10, heightMm: 10, depthMm: 10 }
   const smooth = taubinSmooth(mesh, limits, 1, 0.5, 0)
   expect(smooth.vertices).toEqual(mesh.vertices)
+
+  const other = marchingCubes(Float64Array.of(1), { nelx: 1, nely: 1, nelz: 1, widthMm: 1, heightMm: 1, depthMm: 1 })
+  const combined = {
+    vertices: Float64Array.from([...vertices, ...other.vertices.map(value => 7 + value)]),
+    triangles: Uint32Array.from([...triangles, ...other.triangles.map(vertex => vertex + vertices.length / 3)]),
+    pinned: Uint8Array.from([...pinned, ...new Uint8Array(other.vertices.length / 3)]),
+  }
+  const local = taubinSmooth(combined, limits, 1, 0.5, 0)
+  expect(local.vertices.slice(0, vertices.length)).toEqual(vertices)
+  expect(local.vertices.slice(vertices.length)).not.toEqual(combined.vertices.slice(vertices.length))
+  expect(isWatertight(local, true)).toBe(true)
 })

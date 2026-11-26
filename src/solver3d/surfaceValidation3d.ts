@@ -26,7 +26,7 @@ function findShells(opposite: Int32Array) {
   return shells
 }
 
-function hasOutwardShells(vertices: ArrayLike<number>, triangles: Uint32Array, components: number[][]) {
+function hasOutwardShells(vertices: ArrayLike<number>, triangles: Uint32Array, components: number[][], rejected?: Uint8Array) {
   const shells: Shell[] = []
   for (const faces of components) {
     const shell: Shell = { faces, min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity], volume: 0 }
@@ -40,7 +40,6 @@ function hasOutwardShells(vertices: ArrayLike<number>, triangles: Uint32Array, c
         shell.max[d] = Math.max(shell.max[d], value)
       }
     }
-    if (!Number.isFinite(shell.volume) || shell.volume === 0) return false
     shells.push(shell)
   }
 
@@ -66,6 +65,17 @@ function hasOutwardShells(vertices: ArrayLike<number>, triangles: Uint32Array, c
   }
 
   const netVolumes = new Map<Shell, number>()
+  let valid = true
+  function reject(shell: Shell) {
+    valid = false
+    if (!rejected) return
+    // A nesting change can come from either wall. Localize it to shells
+    // sharing the affected region, leaving independent components untouched.
+    for (const other of shells) {
+      if (!other.min.every((min, axis) => min <= shell.max[axis] && shell.min[axis] <= other.max[axis])) continue
+      for (const face of other.faces) for (let j = 0; j < 3; j++) rejected[triangles[3 * face + j]] = 1
+    }
+  }
   for (const shell of shells) {
     let depth = 0, outermost = shell
     for (const other of shells) {
@@ -74,10 +84,11 @@ function hasOutwardShells(vertices: ArrayLike<number>, triangles: Uint32Array, c
       if (outermost === shell || Math.abs(other.volume) > Math.abs(outermost.volume)) outermost = other
     }
     // Material boundaries point outward at even depth, cavity walls inward at odd depth.
-    if ((shell.volume > 0) !== (depth % 2 === 0)) return false
+    if (!Number.isFinite(shell.volume) || shell.volume === 0 || (shell.volume > 0) !== (depth % 2 === 0)) reject(shell)
     netVolumes.set(outermost, (netVolumes.get(outermost) ?? 0) + shell.volume)
   }
-  return [...netVolumes.values()].every(volume => Number.isFinite(volume) && volume > 0)
+  for (const [shell, volume] of netVolumes) if (!(Number.isFinite(volume) && volume > 0)) reject(shell)
+  return valid
 }
 
 /** Prepare the common topology once and check geometry at each format's precision. */
@@ -114,19 +125,28 @@ export function surfaceValidator3D(triangles: Uint32Array, count: number) {
     if (degree !== incident[v]) return undefined
   }
   const shells = findShells(opposite)
-  return (vertices: ArrayLike<number>) => {
-    const vertexKeys = new Set<string>()
+  return (vertices: ArrayLike<number>, rejected?: Uint8Array) => {
+    let valid = true
+    const vertexKeys = new Map<string, number>()
     for (let i = 0; i < vertices.length; i += 3) {
       const a = vertices[i], b = vertices[i + 1], c = vertices[i + 2]
       if (!Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(c)) return false
       const key = a + ',' + b + ',' + c
-      if (vertexKeys.has(key)) return false
-      vertexKeys.add(key)
+      const prior = vertexKeys.get(key)
+      if (prior !== undefined) {
+        if (!rejected) return false
+        valid = false
+        rejected[prior] = rejected[i / 3] = 1
+      }
+      vertexKeys.set(key, i / 3)
     }
     for (let i = 0; i < triangles.length; i += 3) {
-      if (!triangleNormal(vertices, triangles[i], triangles[i + 1], triangles[i + 2]).some(Boolean)) return false
+      if (triangleNormal(vertices, triangles[i], triangles[i + 1], triangles[i + 2]).some(Boolean)) continue
+      if (!rejected) return false
+      valid = false
+      for (let j = 0; j < 3; j++) rejected[triangles[i + j]] = 1
     }
-    return hasOutwardShells(vertices, triangles, shells)
+    return hasOutwardShells(vertices, triangles, shells, rejected) && valid
   }
 }
 

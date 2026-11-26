@@ -2,10 +2,15 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode }
 import { useTranslation } from '../i18n'
 import { materials } from '../solver/presets'
 import type { MaterialId } from '../solver/project'
+import {
+  addCase3D, boundaryHistory3D, caseColor3D, caseNumber, changeBoundary3D, deleteCase3D, deleteForce3D, directionalForce3D,
+  directions3D, editCase3D, forceMagnitude3D, rigidRank3D, setForce3D, setSupport3D,
+  type Boundary3D, type BoundaryHistory3D, type EditTool3D, type ForceVector3D, type SupportKind3D,
+} from '../solver3d/design3d'
 import { exportObj3D, exportStl3D } from '../solver3d/export3d'
 import { maxSmoothingPasses3D } from '../solver3d/marchingCubes'
 import { defaultParams3D, makePreset3D, presetGrid3D, presets3D, resolutions3D, type Preset3D } from '../solver3d/presets3d'
-import { cellSize, elementCount, maxCellAspectRatio3D, type ElementType3D, type Grid3D, type SimpProblem3D, type ProblemIssue3D, type SimpParams3D, type Symmetry3D } from '../solver3d/types3d'
+import { cellSize, elementCount, maxCellAspectRatio3D, nodeCount, nodePosition, type ElementType3D, type Grid3D, type SimpProblem3D, type ProblemIssue3D, type SimpParams3D, type Symmetry3D } from '../solver3d/types3d'
 import type { Preview3D, SurfaceEvent3D, SurfaceInput3D, SurfaceRequest3D, TimedSnapshot3D, WorkerCommand3D, WorkerEvent3D } from '../workers/protocol3d'
 import { ConvergenceChart, type Sample } from './ConvergenceChart'
 import { download } from './ExportDialog'
@@ -35,6 +40,29 @@ function LabeledControl({ id, name, tip, children }: { id: string; name: string;
     <Tooltip message={tip} info={name}><label htmlFor={id}>{name}</label></Tooltip>
     {children}
   </div>
+}
+
+const labelComponent = (axis: string) => `F${axis[1]}`
+const forceComponents = ['fx', 'fy', 'fz'] as const
+const supportKinds = {
+  fixed: 'fixedSupport3d', pin: 'pinSupport3d',
+  fixX: 'rollerSupportX3d', fixY: 'rollerSupportY3d', fixZ: 'rollerSupportZ3d',
+} as const
+
+function ForceInput3D({ label, value, setValue, magnitude = false }: {
+  label: string; value: number; setValue: (value: number) => void; magnitude?: boolean
+}) {
+  return <Tooltip message={magnitude ? 'hint3dMagnitude' : 'hint3dComponent'}>
+    <label className="force-input-3d">{label}
+      <input key={value} className="field-input" type="number" step="any" min={magnitude ? 0 : undefined} defaultValue={value}
+        onBlur={event => {
+          const next = event.currentTarget.valueAsNumber
+          if (Number.isFinite(next) && (!magnitude || next >= 0)) setValue(next)
+          else event.currentTarget.value = String(value)
+        }}
+        onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }} />
+    </label>
+  </Tooltip>
 }
 
 function ExportDialog3D({ result, pending, elementType, settings, change, close }: {
@@ -98,6 +126,12 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
   const [preset, setPreset] = useState<Preset3D>('cantilever3d')
   const [elementType, setElementType] = useState<ElementType3D>('hex8')
   const [resolution, setResolution] = useState(0)
+  const [history, setHistory] = useState<BoundaryHistory3D>()
+  const [selectedCase, selectCase] = useState('')
+  const [tool, setTool] = useState<EditTool3D>('orbit')
+  const [supportKind, setSupportKind] = useState<SupportKind3D>('fixed')
+  const [force, setForce] = useState<ForceVector3D>({ fx: 0, fy: -100, fz: 0 })
+  const nextCase = useRef(2)
   const [size, setSize] = useState<Pick<Grid3D, Dimension>>({ widthMm: 120, heightMm: 60, depthMm: 40 })
   const [material, setMaterial] = useState<MaterialId>('steel')
   const [params, setParams] = useState(defaultParams3D)
@@ -115,9 +149,14 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
   const [previewResult, setPreviewResult] = useState<{
     problem: SimpProblem3D; restart: number; preview?: Preview3D; failed?: boolean
   }>()
-  const [surfaceResult, setSurfaceResult] = useState<{ input: SurfaceInput3D; result: SurfaceEvent3D }>()
+  const [surfaceResult, setSurfaceResult] = useState<{ input: SurfaceInput3D; result: SurfaceEvent3D; frame?: TimedSnapshot3D }>()
   const grid = useMemo(() => ({ ...presetGrid3D(resolutions3D[resolution]), ...size }), [resolution, size])
-  const problem = useMemo(() => makePreset3D(preset, grid, params, materials[material], elementType), [preset, grid, params, material, elementType])
+  const presetProblem = useMemo(() => makePreset3D(preset, grid, params, materials[material], elementType), [preset, grid, params, material, elementType])
+  const design = history?.present ?? presetProblem
+  const problem = useMemo(() => ({ ...presetProblem, supports: design.supports, loadCases: design.loadCases }), [presetProblem, design])
+  const activeCase = problem.loadCases.find(load => load.id === selectedCase) ?? problem.loadCases[0]
+  const stable = useMemo(() => rigidRank3D(grid, design.supports) === 6, [grid, design.supports])
+  const magnitude = forceMagnitude3D(force)
   const currentPreview = previewResult?.problem === problem && previewResult.restart === restart ? previewResult : undefined
   const preview = currentPreview?.preview
   const pendingPreview = !currentPreview
@@ -126,9 +165,16 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
   const buildSurface = active && (view !== 'voxels' || exportOpen)
   const passive = preview?.passive
   const surfaceInput = useMemo<SurfaceInput3D | undefined>(() => density &&
-    { density, grid, ...settings, passive, elementType }, [density, grid, settings, passive, elementType])
+    { density, grid, ...settings, passive, elementType, cad: true }, [density, grid, settings, passive, elementType])
   const exported = surfaceResult && surfaceResult.input === surfaceInput ? surfaceResult.result : undefined
-  const surface = exported?.type === 'surface' ? exported.surface : undefined
+  // Preserve the last surface for this run while a newer worker result is
+  // pending. Keep stress colors tied to the frame that produced the geometry.
+  const matchingSurface = frame && surfaceResult?.frame && surfaceResult.input.grid === grid
+    && surfaceResult.input.elementType === elementType && surfaceResult.input.passive === passive
+    && surfaceResult.input.threshold === settings.threshold && surfaceResult.input.smoothing === settings.smoothing
+  const display = exported || matchingSurface ? surfaceResult : undefined
+  const renderData = display?.result.type === 'surface' ? display.result.render : undefined
+  const surface = display?.result.type === 'surface' ? display.result.surface : undefined
 
   useEffect(() => {
     const requestId = ++previewRequest.current
@@ -181,7 +227,7 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
     let instance: Worker | undefined
     function receive(result: SurfaceEvent3D) {
       if (requestId === surfaceRequest.current && result.requestId === requestId) {
-        setSurfaceResult({ input, result })
+        setSurfaceResult({ input, result, frame })
       }
     }
     try {
@@ -196,7 +242,7 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
       surfaceRequest.current++
       instance?.terminate()
     }
-  }, [buildSurface, surfaceInput, exported])
+  }, [buildSurface, surfaceInput, exported, frame])
 
   useEffect(() => {
     if (!active && state === 'running') {
@@ -222,8 +268,22 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
     setParams(current => ({ ...current, [key]: value }))
   }
 
+  function resetBoundaryHistory() {
+    setHistory(undefined)
+    selectCase('')
+    nextCase.current = 2
+  }
+
+  function changeBoundary(next: Boundary3D | 'undo' | 'redo') {
+    clearRun()
+    setHistory(current => changeBoundary3D(current ?? boundaryHistory3D({
+      supports: presetProblem.supports, loadCases: presetProblem.loadCases,
+    }), next))
+  }
+
   function selectPreset(next: Preset3D) {
     clearRun()
+    resetBoundaryHistory()
     setPreset(next)
     setParams(current => incompatibleSymmetry(next, current.symmetry) ? { ...current, symmetry: 'none' } : current)
   }
@@ -239,7 +299,7 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
     }
   }
 
-  const issue = preview?.issue ?? error?.issue ?? (currentPreview?.failed ? 'workerError' : undefined)
+  const issue = !stable ? 'support3dError' : preview?.issue ?? error?.issue ?? (currentPreview?.failed ? 'workerError' : undefined)
   const canRun = !pendingPreview && !issue && (state === 'ready' || state === 'paused')
   const issueText = issue && t(issue).replace('{limit}', number(maxCellAspectRatio3D))
   const filterRadiusMm = params.rmin * Math.min(...cellSize(grid))
@@ -278,10 +338,14 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
             </select>
           </LabeledControl>
           <LabeledControl id="resolution-3d" name={t('resolution')} tip="hint3dResolution">
-            <select id="resolution-3d" value={resolution} onChange={event => { clearRun(); setResolution(Number(event.target.value)) }}>
+            <select id="resolution-3d" value={resolution} onChange={event => { clearRun(); resetBoundaryHistory(); setResolution(Number(event.target.value)) }}>
               {resolutions3D.map((value, i) => <option key={i} value={i}>{value.join(' × ')}</option>)}
             </select>
           </LabeledControl>
+          <Tooltip message="hint3dFrameMemory"><output className="resolution-badge-3d">
+            {number(elementCount(grid, elementType))} {t('elements')} · {t('frameMemory3d').replace('{size}',
+              fixed((16 * elementCount(grid, elementType) + 24 * nodeCount(grid) * problem.loadCases.length) / 2 ** 20, 1))}
+          </output></Tooltip>
         </section>
         <section>
           <LabeledControl id="material-3d" name={t('material')} tip="tipMaterial">
@@ -315,6 +379,89 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
           </LabeledControl>
           {preset === 'lBracket3d' && <p id="symmetry-note-3d" className="hint">{t('lBracketSymmetry3d')}</p>}
         </section>
+        <section className="boundary-editor-3d">
+          <h3>{t('cases')}</h3>
+          <LabeledControl id="case-3d" name={t('activeCase')} tip="hint3dCase">
+            <div className="case-select-3d">
+              <span aria-hidden="true" style={{ background: caseColor3D(caseNumber(activeCase.id) - 1) }} />
+              <select id="case-3d" value={activeCase.id} onChange={event => selectCase(event.target.value)}>
+                {problem.loadCases.map(load => <option key={load.id} value={load.id}>
+                  {t('case')} {number(caseNumber(load.id))}
+                </option>)}
+              </select>
+            </div>
+          </LabeledControl>
+          <div className="action-row boundary-actions-3d">
+            <Tooltip message="hint3dAddCase"><button className="tool-button" type="button" onClick={() => {
+              const id = `case-${nextCase.current++}`
+              changeBoundary(addCase3D(design, id))
+              selectCase(id)
+            }}>{t('addCase')}</button></Tooltip>
+            <Tooltip message="hint3dRemoveCase"><button className="tool-button" type="button" disabled={problem.loadCases.length < 2}
+              onClick={() => changeBoundary(deleteCase3D(design, activeCase.id))}>{t('remove')}</button></Tooltip>
+          </div>
+          <div className="segmented force-directions-3d" role="group" aria-label={t('forceDirections')}>
+            {directions3D.map(([label, key, axis, sign]) => <Tooltip key={key} message="hint3dDirection">
+              <button type="button" aria-label={t(key)} onClick={() => setForce(directionalForce3D(axis, sign, magnitude || 100))}>
+                {label}
+              </button>
+            </Tooltip>)}
+          </div>
+          <ForceInput3D magnitude label={`${t('forceMagnitude')} (${t('N')})`} value={magnitude} setValue={value => {
+            if (value === magnitude) return
+            setForce(magnitude ? { fx: force.fx / magnitude * value, fy: force.fy / magnitude * value, fz: force.fz / magnitude * value }
+              : directionalForce3D('fy', -1, value))
+          }} />
+          <div className="force-components-3d">
+            {forceComponents.map(axis => <ForceInput3D key={axis} label={`${labelComponent(axis)} (${t('N')})`}
+              value={force[axis]} setValue={value => setForce(prior => ({ ...prior, [axis]: value }))} />)}
+          </div>
+          <h3>{t('nodalLoads')}</h3>
+          {!activeCase.forces.length && <p className="hint">{t('noLoads')}</p>}
+          <ul className="load-list-3d">
+            {activeCase.forces.map((load, index) => {
+              const xyz = nodePosition(grid, load.node).map(value => significant(value)).join(', ')
+              const coordinates = `(${xyz}) ${t('mm')}`
+              return <li key={`${activeCase.id}-${load.node}-${index}`}>
+                <div className="load-row-3d">
+                  <span>{t('node')} {coordinates}</span>
+                  <Tooltip message="hint3dDeleteForce"><button type="button" className="tool-button"
+                    aria-label={t('deleteForce').replace('{node}', coordinates)}
+                    onClick={() => changeBoundary(deleteForce3D(design, activeCase.id, index))}>×</button></Tooltip>
+                </div>
+                <div className="force-components-3d">{forceComponents.map(axis => <ForceInput3D key={axis}
+                  label={`${labelComponent(axis)} (${t('N')})`} value={load[axis]} setValue={value => {
+                    if (value === load[axis]) return
+                    const updated = { ...load, [axis]: value }
+                    if (Number.isFinite(forceMagnitude3D(updated))) changeBoundary(setForce3D(design, activeCase.id, load.node, updated))
+                  }} />)}</div>
+              </li>
+            })}
+          </ul>
+          <Tooltip message="hint3dClearLoads"><button type="button" className="tool-button" disabled={!activeCase.forces.length}
+            onClick={() => changeBoundary(editCase3D(design, activeCase.id, () => []))}>{t('clearCaseLoads3d')}</button></Tooltip>
+          <h3>{t('supports')}</h3>
+          <LabeledControl id="support-type-3d" name={t('support')} tip="hint3dSupportType">
+            <select id="support-type-3d" value={supportKind} onChange={event => setSupportKind(event.target.value as SupportKind3D)}>
+              {(Object.keys(supportKinds) as SupportKind3D[]).map(kind =>
+                <option key={kind} value={kind}>{t(supportKinds[kind])}</option>)}
+            </select>
+          </LabeledControl>
+          <div className="action-row boundary-actions-3d">
+            <Tooltip message="hint3dClearSupports"><button type="button" className="tool-button" disabled={!problem.supports.length}
+              onClick={() => changeBoundary({ ...design, supports: [] })}>{t('clearSupports')}</button></Tooltip>
+            <Tooltip message="hint3dUndo"><button type="button" className="tool-button" disabled={!history?.past.length}
+              onClick={() => changeBoundary('undo')}>{t('undo')}</button></Tooltip>
+            <Tooltip message="hint3dRedo"><button type="button" className="tool-button" disabled={!history?.future.length}
+              onClick={() => changeBoundary('redo')}>{t('redo')}</button></Tooltip>
+            <Tooltip message="hint3dResetPreset"><button type="button" className="tool-button"
+              disabled={design.supports === presetProblem.supports && design.loadCases === presetProblem.loadCases}
+              onClick={() => {
+                selectCase('')
+                changeBoundary({ supports: presetProblem.supports, loadCases: presetProblem.loadCases })
+              }}>{t('resetPreset3d')}</button></Tooltip>
+          </div>
+        </section>
         <section>
           <h3>{t('geometry')}</h3>
           {dimensions.map(([key, label]) => <LabeledControl key={key} id={`${key}-3d`} name={`${t(label)} (${t('mm')})`} tip="hint3dDimensions">
@@ -344,7 +491,15 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
         {issueText && <p className="error" role="alert">{issueText}{error?.relativeResidual !== undefined &&
           ` ${t('solveResidual3d').replace('{residual}', significant(error.relativeResidual))}`} {error && t('resetError')}</p>}
         <Viewport3D active={active} problem={problem} density={density} mode={mode} setMode={setMode}
-          view={mode === 'auto' && !surface?.triangles.length ? 'voxels' : view} surface={surface} frame={frame}
+          view={mode === 'auto' && !surface?.triangles.length ? 'voxels' : view} surface={surface} frame={view === 'stress' ? display?.frame : frame} renderData={renderData}
+          editor={{ tool, setTool, force, caseId: activeCase.id,
+            place: node => {
+              if (tool === 'support') changeBoundary(setSupport3D(design, node, supportKind))
+              else if (magnitude > 0 && Number.isFinite(magnitude)) changeBoundary(setForce3D(design, activeCase.id, node, force))
+            },
+            remove: node => changeBoundary(tool === 'support' ? setSupport3D(design, node)
+              : setForce3D(design, activeCase.id, node)),
+          }}
           threshold={settings.threshold} setThreshold={threshold => setSettings(current => ({ ...current, threshold }))} />
         {exportOpen && <ExportDialog3D result={exported}
           pending={pendingPreview || (!!density && !exported)} elementType={elementType}

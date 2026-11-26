@@ -24,6 +24,7 @@ export function createCamera3D(canvas: HTMLCanvasElement, camera: PerspectiveCam
   const offset = new Vector3(), right = new Vector3(), up = new Vector3()
   const spherical = new Spherical()
   let mode: CameraMode3D = 'nx'
+  let editing = false
   let isFitted = false
   let drag: { id: number; x: number; y: number; gesture: NonNullable<ReturnType<typeof cameraGesture>> } | undefined
 
@@ -62,7 +63,7 @@ export function createCamera3D(canvas: HTMLCanvasElement, camera: PerspectiveCam
   }
 
   function down(event: PointerEvent) {
-    const gesture = cameraGesture(mode, event.button, event.shiftKey, event.ctrlKey, event.pointerType === 'touch')
+    const gesture = cameraGesture(editing ? 'nx' : mode, event.button, event.shiftKey, event.ctrlKey, event.pointerType === 'touch')
     if (!gesture || drag) return
     event.preventDefault()
     canvas.focus({ preventScroll: true })
@@ -129,6 +130,7 @@ export function createCamera3D(canvas: HTMLCanvasElement, camera: PerspectiveCam
 
   return {
     fit, resize,
+    setEditing(value: boolean) { editing = value },
     setMode(value: CameraMode3D) { mode = value; canvas.dataset.camera = value },
     dispose() {
       canvas.removeEventListener('pointerdown', down)

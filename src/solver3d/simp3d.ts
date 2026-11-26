@@ -1,10 +1,11 @@
+import { rigidRank3D } from './design3d'
 import { elasticity3D, h8Corners, h8Stiffness, strainDisplacementH8, vonMises3D } from './elementH8'
 import { tet4Templates, tetCorners, tetVolumeFraction } from './elementT4'
 import { DensityFilter3D, projectDensity3D } from './filter3d'
 import { fixedDofs3D, Pcg3D } from './pcg3d'
 import {
-  cellSize, elementCount, elementIndex, maxCellAspectRatio3D, nodeCount, nodeIndex3D, nodePosition, ProblemError3D,
-  type Grid3D, type SimpProblem3D, type Snapshot3D,
+  cellSize, elementCount, elementIndex, maxCellAspectRatio3D, nodeCount, nodeIndex3D, ProblemError3D,
+  type SimpProblem3D, type Snapshot3D,
 } from './types3d'
 
 const positive = (value: number) => Number.isFinite(value) && value > 0
@@ -13,26 +14,6 @@ function dot(a: Float64Array, b: Float64Array) {
   let value = 0
   for (let i = 0; i < a.length; i++) value += a[i] * b[i]
   return value
-}
-
-function rigidRank(grid: Grid3D, fixed: Uint8Array) {
-  const scale = Math.max(grid.widthMm, grid.heightMm, grid.depthMm)
-  const basis: number[][] = []
-  for (let d = 0; d < fixed.length; d++) {
-    if (!fixed[d]) continue
-    const [x, y, z] = nodePosition(grid, Math.floor(d / 3)).map(value => value / scale - 0.5)
-    // Rows of the six rigid modes: Tx, Ty, Tz, Rx, Ry, Rz.
-    const row = d % 3 === 0 ? [1, 0, 0, 0, z, -y]
-      : d % 3 === 1 ? [0, 1, 0, -z, 0, x] : [0, 0, 1, y, -x, 0]
-    for (const direction of basis) {
-      const projection = row.reduce((total, value, i) => total + value * direction[i], 0)
-      for (let i = 0; i < 6; i++) row[i] -= projection * direction[i]
-    }
-    const length = Math.hypot(...row)
-    if (length > 1e-10) basis.push(row.map(value => value / length))
-    if (basis.length === 6) break
-  }
-  return basis.length
 }
 
 export function validateProblem3D(problem: SimpProblem3D) {
@@ -84,7 +65,7 @@ export function validateProblem3D(problem: SimpProblem3D) {
     if ((support.fixX || support.fixY || support.fixZ) && !attached[support.node]) throw new ProblemError3D('attachment3dError')
   }
   const fixed = fixedDofs3D(grid, supports)
-  if (rigidRank(grid, fixed) < 6) throw new ProblemError3D('support3dError')
+  if (rigidRank3D(grid, supports) < 6) throw new ProblemError3D('support3dError')
   const ids = new Set<string>()
   const forces = loadCases.map(load => {
     if (!load.id || ids.has(load.id)) throw new ProblemError3D('load3dError')

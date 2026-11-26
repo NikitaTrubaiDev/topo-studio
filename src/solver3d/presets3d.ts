@@ -5,7 +5,7 @@ import {
   type ElementType3D, type SimpParams3D, type SimpProblem3D, type Support3D,
 } from './types3d'
 
-export const resolutions3D = [[24, 12, 8], [36, 18, 12], [48, 24, 16], [64, 32, 20]] as const
+export const resolutions3D = [[24, 12, 8], [36, 18, 12], [48, 24, 16], [64, 32, 20], [80, 40, 24]] as const
 export const presets3D = ['cantilever3d', 'boltBracket3d', 'archBridge3d', 'lBracket3d'] as const
 export type Preset3D = typeof presets3D[number]
 export const defaultParams3D: SimpParams3D = {

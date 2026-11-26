@@ -1,3 +1,4 @@
+import { tetVolumeFraction } from './elementT4'
 import { h8Corners } from './elementH8'
 import { marchingTetrahedra } from './tetSurface3d'
 import { signedTriangleVolume6, triangleNormal, type Surface3D } from './surface3d'
@@ -63,7 +64,9 @@ export function marchingCubes(density: ArrayLike<number>, grid: Grid3D, threshol
     const axis = hi - lo === 1 ? 0 : hi - lo === nx ? 1 : 2
     const key = lo * 3 + axis
     if (vertexCache[key] >= 0) return vertexCache[key]
-    const t = ghost[lo] || ghost[hi] ? 0.5 : field[ids[a]] / (field[ids[a]] - field[ids[b]])
+    const fraction = field[ids[a]] / (field[ids[a]] - field[ids[b]])
+    // Keep crossings distinct after rounding to GPU/STL precision.
+    const t = ghost[lo] || ghost[hi] ? 0.5 : Math.max(1e-4, Math.min(1 - 1e-4, fraction))
     const p = h8Corners[a], q = h8Corners[b]
     const index = vertices.length / 3
     const coordinate = (cell: number, max: number, side: number, d: number) => {
@@ -142,12 +145,80 @@ export function marchingCubes(density: ArrayLike<number>, grid: Grid3D, threshol
     ...(prescribed && { pinned: Uint8Array.from(pinned) }) }
 }
 
+/** Resample the continuous, cell-centered density field at twice the display resolution.
+ * Tet4 values are restricted by physical volume, independent of brick parity. */
+export function prepareCadSurface3D(density: ArrayLike<number>, grid: Grid3D, threshold: number, passes: number,
+  passive?: PassiveMasks, elementType: ElementType3D = 'hex8') {
+  const { nelx, nely, nelz } = grid
+  const count = elementCount(grid)
+  if (density.length !== elementCount(grid, elementType)) throw new RangeError('Invalid CAD density input')
+  const brick = new Float64Array(count)
+  const peak = elementType === 'tet4' ? new Float64Array(count) : brick
+  for (let e = 0; e < count; e++) {
+    if (elementType === 'hex8') {
+      brick[e] = density[e]
+      continue
+    }
+    for (let t = 0; t < 5; t++) {
+      const value = density[5 * e + t]
+      brick[e] += value * tetVolumeFraction(t)
+      peak[e] = Math.max(peak[e], value)
+    }
+  }
+  const refined = { ...grid, nelx: 2 * nelx, nely: 2 * nely, nelz: 2 * nelz }
+  const samples = new Float64Array(elementCount(refined))
+  const pins = new Uint8Array(samples.length)
+  // Keep near-threshold isolated members at least one sample wide. Protected
+  // geometry uses the unmodified field so bore crossings retain their diameter.
+  const floor = new Float64Array(count)
+  for (let z = 0, e = 0; z < nelz; z++) for (let y = 0; y < nely; y++) for (let x = 0; x < nelx; x++, e++) {
+    if (!Number.isFinite(brick[e])) throw new RangeError('Non-finite density')
+    if (peak[e] < threshold || passive?.void?.[e] || passive?.solid?.[e]) continue
+    const area = nelx * nely
+    const neighbors = [
+      x > 0 && peak[e - 1] >= threshold, x + 1 < nelx && peak[e + 1] >= threshold,
+      y > 0 && peak[e - nelx] >= threshold, y + 1 < nely && peak[e + nelx] >= threshold,
+      z > 0 && peak[e - area] >= threshold, z + 1 < nelz && peak[e + area] >= threshold,
+    ]
+    const narrow = !(neighbors[0] || neighbors[1]) && !(neighbors[2] || neighbors[3])
+      || !(neighbors[0] || neighbors[1]) && !(neighbors[4] || neighbors[5])
+      || !(neighbors[2] || neighbors[3]) && !(neighbors[4] || neighbors[5])
+    if (narrow) floor[e] = threshold + Math.min((1 - threshold) * 0.5, 0.025 + 0.1 * (peak[e] - threshold))
+  }
+  const stencils = [nelx, nely, nelz].map(n => Array.from({ length: 2 * n }, (_, i) => {
+    const position = i / 2 - 0.25
+    const low = Math.floor(position)
+    return { lo: Math.max(0, low), hi: Math.min(n - 1, low + 1), mix: position - low }
+  }))
+  for (let z = 0, i = 0; z < refined.nelz; z++) for (let y = 0; y < refined.nely; y++) {
+    const sz = stencils[2][z], sy = stencils[1][y]
+    for (let x = 0; x < refined.nelx; x++, i++) {
+      const sx = stencils[0][x]
+      const owner = elementIndex(grid, x >> 1, y >> 1, z >> 1)
+      let value = 0, protectedSample = false, voidNeighbor = false
+      for (let k = 0; k < 2; k++) for (let j = 0; j < 2; j++) for (let d = 0; d < 2; d++) {
+        const e = elementIndex(grid, d ? sx.hi : sx.lo, j ? sy.hi : sy.lo, k ? sz.hi : sz.lo)
+        const weight = (d ? sx.mix : 1 - sx.mix) * (j ? sy.mix : 1 - sy.mix) * (k ? sz.mix : 1 - sz.mix)
+        value += brick[e] * weight
+        protectedSample ||= !!(passive?.void?.[e] || passive?.solid?.[e])
+        voidNeighbor ||= !!passive?.void?.[e]
+      }
+      pins[i] = Number(protectedSample)
+      samples[i] = voidNeighbor ? value : Math.max(value, floor[owner])
+    }
+  }
+  // Larger grids already have fine physical sampling. Keep the same 2? field
+  // and bound smoothing displacement by the refined cell size.
+  const surface = marchingCubes(samples, refined, threshold, { solid: pins })
+  return smoothSurface(surface, refined, passes, 0.5, -0.53, 0.35)
+}
+
 export function taubinSmooth(mesh: Surface3D, grid: Grid3D, passes: number, lambda = 0.5, mu = -0.53): Surface3D {
   if (passes < 1 || !mesh.triangles.length) return mesh
   return smoothSurface(mesh, grid, passes, lambda, mu).surface
 }
 
-function smoothSurface(mesh: Surface3D, grid: Grid3D, passes: number, lambda = 0.5, mu = -0.53) {
+function smoothSurface(mesh: Surface3D, grid: Grid3D, passes: number, lambda = 0.5, mu = -0.53, offsetCells = 0.08) {
   if (passes < 1 || !mesh.triangles.length) return { surface: mesh, valid: validateSurface3D(mesh) }
   const { triangles, pinned } = mesh
   const validate = surfaceValidator3D(triangles, mesh.vertices.length / 3)
@@ -159,7 +230,7 @@ function smoothSurface(mesh: Surface3D, grid: Grid3D, passes: number, lambda = 0
   const rounded = new Float32Array(vertices.length)
   const limits = [grid.widthMm, grid.heightMm, grid.depthMm]
   const boundary = Uint8Array.from(vertices, (value, i) => Number(!!pinned?.[Math.floor(i / 3)] || value === 0 || value === limits[i % 3]))
-  const maxOffset = Math.min(...cellSize(grid)) * 0.08 / Math.sqrt(3)
+  const maxOffset = Math.min(...cellSize(grid)) * offsetCells / Math.sqrt(3)
   const adjacency = Array.from({ length: vertices.length / 3 }, () => new Set<number>())
   for (let i = 0; i < triangles.length; i += 3) {
     for (let j = 0; j < 3; j++) {
@@ -168,6 +239,14 @@ function smoothSurface(mesh: Surface3D, grid: Grid3D, passes: number, lambda = 0
       adjacency[w].add(v)
     }
   }
+  const ranges = Float64Array.from(adjacency, (neighbors, vertex) => {
+    let limit = maxOffset
+    for (const neighbor of neighbors) {
+      const a = 3 * vertex, b = 3 * neighbor
+      limit = Math.min(limit, 0.3 * Math.hypot(vertices[a] - vertices[b], vertices[a + 1] - vertices[b + 1], vertices[a + 2] - vertices[b + 2]))
+    }
+    return limit
+  })
   function pass(input: Float64Array, output: Float64Array, weight: number) {
     for (let i = 0; i < input.length; i++) {
       const d = i % 3
@@ -175,18 +254,31 @@ function smoothSurface(mesh: Surface3D, grid: Grid3D, passes: number, lambda = 0
       let delta = 0
       for (const neighbor of neighbors) delta += input[3 * neighbor + d] - input[i]
       const value = input[i] + weight * delta / (neighbors.size || 1)
-      const original = mesh.vertices[i]
-      output[i] = boundary[i] ? original : Math.min(limits[d], original + maxOffset, Math.max(0, original - maxOffset, value))
+      const original = mesh.vertices[i], range = ranges[(i - d) / 3]
+      output[i] = boundary[i] ? original : Math.min(limits[d], original + range, Math.max(0, original - range, value))
     }
-    rounded.set(output)
-    // Reject a pass that reverses a facet or collapses it at STL precision.
-    for (let i = 0; i < triangles.length; i += 3) {
-      const a = triangles[i], b = triangles[i + 1], c = triangles[i + 2]
-      const before = triangleNormal(input, a, b, c)
-      const after = triangleNormal(rounded, a, b, c)
-      if (before[0] * after[0] + before[1] * after[1] + before[2] * after[2] <= 0) return false
-    }
-    return true
+    keepOrientations(input, output)
+  }
+  function keepOrientations(input: Float64Array, output: Float64Array) {
+    // A failing facet freezes only its incident vertices. Repeat because
+    // reverting a shared vertex can change the orientation of its neighbors.
+    let changed: boolean
+    do {
+      changed = false
+      rounded.set(output)
+      for (let i = 0; i < triangles.length; i += 3) {
+        const a = triangles[i], b = triangles[i + 1], c = triangles[i + 2]
+        const before = triangleNormal(input, a, b, c)
+        const after = triangleNormal(rounded, a, b, c)
+        if (before[0] * after[0] + before[1] * after[1] + before[2] * after[2] > 0) continue
+        for (const vertex of [a, b, c]) for (let d = 0; d < 3; d++) {
+          const coordinate = 3 * vertex + d
+          if (output[coordinate] === input[coordinate]) continue
+          output[coordinate] = input[coordinate]
+          changed = true
+        }
+      }
+    } while (changed)
   }
   function volume6(points: Float64Array) {
     let volume = 0
@@ -197,12 +289,19 @@ function smoothSurface(mesh: Surface3D, grid: Grid3D, passes: number, lambda = 0
   }
   const minimumVolume = 0.97 * volume6(vertices)
   for (let i = 0; i < Math.min(maxSmoothingPasses3D, Math.floor(passes)); i++) {
-    // Keep the last export-valid mesh if even a damped pass would collapse a
-    // feature, change cavity nesting, or lose too much volume.
     let weight = 1
-    while (weight >= 1 / 64 &&
-      !(pass(vertices, smoothed, lambda * weight) && pass(smoothed, expanded, mu * weight)
-        && volume6(expanded) >= minimumVolume && validate(rounded) && validate(expanded))) weight *= 0.5
+    for (; weight >= 1 / 64; weight *= 0.5) {
+      pass(vertices, smoothed, lambda * weight)
+      pass(smoothed, expanded, mu * weight)
+      const rejected = new Uint8Array(vertices.length / 3)
+      const validObject = validate(expanded, rejected)
+      const validFloat = validate(rounded, rejected)
+      if (!validObject || !validFloat) {
+        for (let v = 0; v < rejected.length; v++) if (rejected[v]) expanded.set(vertices.subarray(3 * v, 3 * v + 3), 3 * v)
+        keepOrientations(vertices, expanded)
+      }
+      if (volume6(expanded) >= minimumVolume && ((validObject && validFloat) || (validate(expanded) && validate(rounded)))) break
+    }
     if (weight < 1 / 64) break
     const previous = vertices
     vertices = expanded

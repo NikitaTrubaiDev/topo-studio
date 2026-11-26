@@ -50,7 +50,7 @@ type ElementFace = { corners: readonly number[]; offset: readonly number[]; othe
 
 /** Visit active cells and their oriented boundary faces in solver element order. */
 export function visitActiveCells3D(grid: Grid3D, type: ElementType3D, density: ArrayLike<number>, threshold: number,
-  visit: (nodes: Int32Array, exposed: readonly ElementFace[], corners: readonly number[]) => void) {
+  visit: (nodes: Int32Array, exposed: readonly ElementFace[], corners: readonly number[]) => void, boundaryOnly = false) {
   const { nelx, nely, nelz } = grid
   const nodes = new Int32Array(8)
   const exposed: ElementFace[] = []
@@ -59,10 +59,7 @@ export function visitActiveCells3D(grid: Grid3D, type: ElementType3D, density: A
     const parity = (x + y + z) & 1
     const templates = type === 'tet4' ? tetBoundary[parity] : hexBoundary
     const corners = type === 'tet4' ? tetCorners[parity] : hex
-    for (let c = 0; c < 8; c++) {
-      const [dx, dy, dz] = h8Corners[c]
-      nodes[c] = nodeIndex3D(grid, x + dx, y + dy, z + dz)
-    }
+    let hasNodes = false
     for (let t = 0; t < templates.length; t++) {
       if (!(density[e++] >= threshold)) continue
       exposed.length = 0
@@ -72,6 +69,14 @@ export function visitActiveCells3D(grid: Grid3D, type: ElementType3D, density: A
         if (i >= 0 && i < nelx && j >= 0 && j < nely && k >= 0 && k < nelz &&
           density[((k * nely + j) * nelx + i) * templates.length + other] >= threshold) continue
         exposed.push(face)
+      }
+      if (boundaryOnly && !exposed.length) continue
+      if (!hasNodes) {
+        for (let c = 0; c < 8; c++) {
+          const [dx, dy, dz] = h8Corners[c]
+          nodes[c] = nodeIndex3D(grid, x + dx, y + dy, z + dz)
+        }
+        hasNodes = true
       }
       visit(nodes, exposed, corners[t])
     }
@@ -98,6 +103,6 @@ export function elementSurface3D(grid: Grid3D, type: ElementType3D, density: Arr
         edges.push(m, n)
       }
     }
-  })
+  }, true)
   return { positions, triangles: Uint32Array.from(triangles), edges: Uint32Array.from(edges) }
 }
