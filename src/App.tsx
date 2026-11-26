@@ -6,22 +6,18 @@ import { LanguageContext, useTranslation } from './i18n'
 import { dictionaries, languages, type Language } from './i18n/dictionaries'
 import { Viewport, type ViewMode } from './components/Viewport'
 import { LoadCases } from './components/LoadCases'
+import { Tooltip } from './components/Tooltip'
 import { download, ExportDialog, type ContourSettings } from './components/ExportDialog'
 import { extractContours } from './solver/contour'
 import { initialPhysicalDensity } from './solver/density'
-import { addLoadCase, attachmentError, hasFreeLoad, loadCaseIndex, supportError } from './solver/design'
+import { addLoadCase, attachmentError, hasFreeLoad, loadCaseIndex, recordDesign, redoDesign, replaceLoadCase, supportError, undoDesign, type Design, type DesignHistory } from './solver/design'
 import { defaultParams, makePreset, materials, printableBellcrankPivot } from './solver/presets'
 import { getDiagnostic, type Diagnostic } from './solver/diagnostics'
-import { loadProject, projectGrid, saveProject, type Design, type Settings } from './solver/project'
+import { loadProject, projectGrid, saveProject, type Settings } from './solver/project'
 import { ManufacturingDensity } from './solver/manufacturing'
 import type { TimedSnapshot, WorkerCommand, WorkerEvent } from './workers/protocol'
 
-interface History {
-  past: Design[]
-  present?: Design
-  future: Design[]
-}
-const initialHistory: History = { past: [], future: [] }
+const initialHistory: DesignHistory = { past: [], future: [] }
 
 type RunState = 'ready' | 'running' | 'pausing' | 'paused' | 'stepping' | 'complete' | 'error'
 
@@ -64,6 +60,7 @@ function Workbench({ language, setLanguage }: { language: Language; setLanguage:
   // Preserve the requested case when it is absent from the current history entry.
   const [selectedCaseId, setSelectedCaseId] = useState<string>()
   const [mode, setMode] = useState<ViewMode>('density')
+  const [setupVisible, setSetupVisible] = useState(true)
   const [exportOpen, setExportOpen] = useState(false)
   const [contour, setContour] = useState<ContourSettings>({ threshold: 0.5, smoothing: 3 })
   const workerRef = useRef<Worker | null>(null)
@@ -166,36 +163,21 @@ function Workbench({ language, setLanguage }: { language: Language; setLanguage:
     }
   }
 
-  function edit({ supports, loadCases, passive }: Design) {
+  function edit(next: Design) {
     reset()
-    const { supports: oldSupports, loadCases: oldLoads, passive: oldMasks } = problem
-    setHistory(current => ({
-      past: [...current.past.slice(-79), { supports: oldSupports, loadCases: oldLoads, passive: oldMasks }],
-      present: { supports, loadCases, passive },
-      future: [],
-    }))
+    setHistory(current => recordDesign(current, presetProblem, next))
   }
 
   function undo() {
-    const previous = history.past.at(-1)
-    if (!previous) return
+    if (!history.past.length) return
     reset()
-    setHistory({
-      past: history.past.slice(0, -1),
-      present: previous,
-      future: [history.present ?? presetProblem, ...history.future],
-    })
+    setHistory(current => undoDesign(current, presetProblem))
   }
 
   function redo() {
-    const next = history.future[0]
-    if (!next) return
+    if (!history.future.length) return
     reset()
-    setHistory({
-      past: [...history.past, history.present ?? presetProblem],
-      present: next,
-      future: history.future.slice(1),
-    })
+    setHistory(current => redoDesign(current, presetProblem))
   }
 
   function send(type: 'start' | 'pause' | 'step') {
@@ -252,14 +234,15 @@ function Workbench({ language, setLanguage }: { language: Language; setLanguage:
 
   const canRun = !constraint && (runState === 'ready' || runState === 'paused')
   const metrics = [
-    { label: t('iteration'), value: number(frame?.iteration), unit: '' },
-    { label: t('compliance'), value: significant(frame?.compliance), unit: `${t('N')}·${t('mm')}` },
-    { label: t('volume'), value: fixed(frame && frame.volFrac * 100, 1), unit: '%' },
-    { label: t('change'), value: fixed(frame?.change, 4), unit: '' },
-    { label: t('time'), value: fixed(frame?.iterMs, 1), unit: t('ms') },
-    { label: t('peakStress'), value: significant(frame?.maxVonMises), unit: t('MPa') },
-  ]
-  if (params.heaviside) metrics.push({ label: 'β', value: number(frame?.beta ?? 1), unit: '' })
+    { label: t('iteration'), tip: 'tipIteration', value: number(frame?.iteration), unit: '' },
+    { label: t('compliance'), tip: 'tipCompliance', value: significant(frame?.compliance), unit: `${t('N')}·${t('mm')}` },
+    { label: t('volume'), tip: 'tipVolume', value: fixed(frame && frame.volFrac * 100, 1), unit: '%' },
+    { label: t('change'), tip: 'tipChange', value: fixed(frame?.change, 4), unit: '' },
+    { label: t('time'), tip: 'tipTime', value: fixed(frame?.iterMs, 1), unit: t('ms') },
+    { label: t('peakStress'), tip: 'tipPeakStress', value: significant(frame?.maxVonMises), unit: t('MPa') },
+  ] as const
+  const telemetry = params.heaviside
+    ? [...metrics, { label: 'β', tip: 'tipHeaviside' as const, value: number(frame?.beta ?? 1), unit: '' }] : metrics
 
   return (
     <div className="min-h-screen antialiased">
@@ -279,9 +262,10 @@ function Workbench({ language, setLanguage }: { language: Language; setLanguage:
             onClick={() => setLanguage(value)}>{value.toUpperCase()}</button>)}
         </div>
       </header>
-      <main className="workspace">
-        <Controls settings={settings} setSettings={changeSettings}>
-          <LoadCases cases={problem.loadCases} active={activeCase} onSelect={setSelectedCaseId}
+      <main className={`workspace${setupVisible ? '' : ' workspace-expanded'}`}>
+        <Controls settings={settings} setSettings={changeSettings} hidden={!setupVisible}>
+          <LoadCases grid={grid} cases={problem.loadCases} active={activeCase} onSelect={setSelectedCaseId}
+            onChange={next => { if (next !== activeCase) edit(replaceLoadCase(problem, next)) }}
             onAdd={() => {
               const loadCases = addLoadCase(problem.loadCases)
               edit({ ...problem, loadCases })
@@ -300,6 +284,8 @@ function Workbench({ language, setLanguage }: { language: Language; setLanguage:
             <h2>{t(settings.preset)}</h2>
             <div className="action-row result-actions">
               <span className={`status status-${runState}`} role="status"><i />{t(runState)}</span>
+              <button className="tool-button" type="button" aria-expanded={setupVisible} aria-controls="simulation-setup"
+                onClick={() => setSetupVisible(value => !value)}>{t(setupVisible ? 'hideSetup' : 'showSetup')}</button>
               <button className="tool-button" type="button" disabled={!history.past.length} onClick={undo}>{t('undo')}</button>
               <button className="tool-button" type="button" disabled={!history.future.length} onClick={redo}>{t('redo')}</button>
               <button className="tool-button" type="button" onClick={() => {
@@ -342,8 +328,8 @@ function Workbench({ language, setLanguage }: { language: Language; setLanguage:
           {exportOpen && <ExportDialog loops={loops} grid={problem.grid} settings={contour}
             setSettings={setContour} onClose={() => setExportOpen(false)} />}
           <section className="panel telemetry" aria-label={t('telemetry')}>
-            <dl>{metrics.map(({ label, value, unit }) => (
-              <div key={label}><dt>{label}</dt><dd>{value}{unit && <span>{unit}</span>}</dd></div>
+            <dl>{telemetry.map(({ label, tip, value, unit }) => (
+              <div key={tip}><dt><Tooltip message={tip} info={label}>{label}</Tooltip></dt><dd>{value}{unit && <span>{unit}</span>}</dd></div>
             ))}</dl>
           </section>
           {!preview.conflict && <Engineering problem={problem} effectivePassive={preview.passive} density={density} frame={frame} />}

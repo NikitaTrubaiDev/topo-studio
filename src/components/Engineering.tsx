@@ -1,5 +1,6 @@
 import { useMemo } from 'react'
 import { useTranslation } from '../i18n'
+import { Tooltip } from './Tooltip'
 import { engineeringMetrics } from '../solver/engineering'
 import type { IterationSnapshot, PassiveMasks, SimpProblem } from '../solver/types'
 
@@ -13,12 +14,12 @@ export function Engineering({ problem, density, frame, effectivePassive }: {
     <section className="panel engineering" aria-label={t('engineering')}>
       <h2>{t('engineering')}</h2>
       <dl>
-        <div><dt>{t('mass')}</dt><dd>{format(initialMass)} → {format(mass)} {t('g')}</dd>
+        <div><dt><Tooltip message="tipMass" info={t('mass')}>{t('mass')}</Tooltip></dt><dd>{format(initialMass)} → {format(mass)} {t('g')}</dd>
           <small>{format(saved)}% {t('saved')}</small></div>
-        <div><dt>{t('deflection')}</dt><dd>{format(maxDeflection)} {t('mm')}</dd></div>
-        <div title={t('safetyBasis')}><dt>{t('safety')}</dt><dd className={status}>{format(safetyFactor)}</dd>
-          <small title={t('p95SafetyBasis')}>{t('p95Safety')} · {format(p95SafetyFactor)}</small>
-          <small>{t('peakStress')} · {format(peak)} {t('MPa')}</small></div>
+        <div><dt><Tooltip message="tipDeflection" info={t('deflection')}>{t('deflection')}</Tooltip></dt><dd>{format(maxDeflection)} {t('mm')}</dd></div>
+        <div><dt><Tooltip message="tipSafety" info={t('safety')}>{t('safety')}</Tooltip></dt><dd className={status}>{format(safetyFactor)}</dd>
+          <small><Tooltip message="tipP95Safety" info={t('p95Safety')}>{t('p95Safety')} · {format(p95SafetyFactor)}</Tooltip></small>
+          <small><Tooltip message="tipPeakStress" info={t('peakStress')}>{t('peakStress')} · {format(peak)} {t('MPa')}</Tooltip></small></div>
       </dl>
     </section>
   )

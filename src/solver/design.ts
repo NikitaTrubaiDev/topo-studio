@@ -6,7 +6,46 @@ export type SupportKind = NonNullable<Support['kind']>
 export type SupportAction = SupportKind | 'cycle' | 'remove'
 const supportKinds: SupportKind[] = ['fixed', 'pin', 'roller-x', 'roller-y']
 
+export type Design = Pick<SimpProblem, 'supports' | 'loadCases' | 'passive'>
+export interface DesignHistory {
+  past: Design[]
+  present?: Design
+  future: Design[]
+}
+
+export function recordDesign(history: DesignHistory, preset: Design, design: Design): DesignHistory {
+  const { supports, loadCases, passive } = design
+  const { supports: previousSupports, loadCases: previousCases, passive: previousPassive } = history.present ?? preset
+  return {
+    past: [...history.past.slice(-79), { supports: previousSupports, loadCases: previousCases, passive: previousPassive }],
+    present: { supports, loadCases, passive },
+    future: [],
+  }
+}
+
+export function undoDesign(history: DesignHistory, preset: Design): DesignHistory {
+  const previous = history.past.at(-1)
+  if (!previous) return history
+  return { past: history.past.slice(0, -1), present: previous, future: [history.present ?? preset, ...history.future] }
+}
+
+export function redoDesign(history: DesignHistory, preset: Design): DesignHistory {
+  const [next, ...future] = history.future
+  if (!next) return history
+  return { past: [...history.past, history.present ?? preset], present: next, future }
+}
+
 export const MAX_NODAL_FORCE = 1e12
+export type ForceVector = Omit<NodalForce, 'node'>
+export type ForceDirection = 'down' | 'up' | 'right' | 'left'
+const forceDirections: Record<ForceDirection, ForceVector> = {
+  down: { fx: 0, fy: -1 }, up: { fx: 0, fy: 1 }, right: { fx: 1, fy: 0 }, left: { fx: -1, fy: 0 },
+}
+
+export function directionVector(direction: ForceDirection, magnitude: number): ForceVector {
+  const { fx, fy } = forceDirections[direction]
+  return { fx: fx ? fx * magnitude : 0, fy: fy ? fy * magnitude : 0 }
+}
 
 export function isValidForce(fx: number, fy: number): boolean {
   return Math.hypot(fx, fy) <= MAX_NODAL_FORCE
@@ -103,10 +142,22 @@ export function paintMask(
   return changed ? { solid, void: voidMask } : passive
 }
 
-export function setForce(loadCase: LoadCase, node: number, value: Omit<NodalForce, 'node'> | null): LoadCase {
+export function setForce(loadCase: LoadCase, node: number, value: ForceVector | null): LoadCase {
+  const index = loadCase.forces.findIndex(force => force.node === node)
   const forces = loadCase.forces.filter(force => force.node !== node)
-  if (value && (value.fx || value.fy)) return { ...loadCase, forces: [...forces, { node, ...value }] }
-  return forces.length === loadCase.forces.length ? loadCase : { ...loadCase, forces }
+  if (!value || (!value.fx && !value.fy)) return index < 0 ? loadCase : { ...loadCase, forces }
+  const existing = loadCase.forces[index]
+  if (existing?.fx === value.fx && existing.fy === value.fy && forces.length + 1 === loadCase.forces.length) return loadCase
+  forces.splice(index < 0 ? forces.length : index, 0, { node, ...value })
+  return { ...loadCase, forces }
+}
+
+export function clearLoads(loadCase: LoadCase): LoadCase {
+  return loadCase.forces.length ? { ...loadCase, forces: [] } : loadCase
+}
+
+export function replaceLoadCase(design: Design, replacement: LoadCase): Design {
+  return { ...design, loadCases: design.loadCases.map(load => load.id === replacement.id ? replacement : load) }
 }
 
 let nextCaseId = 1

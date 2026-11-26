@@ -1,11 +1,12 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import { expect, it } from 'vitest'
 import { formatSignificant, LanguageContext, translateDiagnostic } from '../../i18n'
-import { languages } from '../../i18n/dictionaries'
+import { dictionaries, languages, type Message } from '../../i18n/dictionaries'
 import { makePreset } from '../../solver/presets'
 import { Simp2D } from '../../solver/simp2d'
 import { Engineering } from '../Engineering'
 import { ExportDialog, type ContourSettings } from '../ExportDialog'
+import { LoadCases } from '../LoadCases'
 
 it('renders the peak yield failure in red and displays the P95 factor separately', () => {
   const problem = makePreset('cantilever', { nelx: 12, nely: 4 })
@@ -49,4 +50,32 @@ it.each(languages)('formats telemetry and interpolates diagnostic parameters in 
       settings={{ threshold: 0.5, smoothing: 3 }} setSettings={() => {}} onClose={() => {}} />
   </LanguageContext.Provider>)
   expect(dialog).toContain(language === 'en' ? '0.50</output>' : '0,50</output>')
+})
+
+it.each(languages)('provides the full set of localized engineering tooltips in %s', language => {
+  const messages = dictionaries[language]
+  const expectedTips = [
+    'tipResolution', 'tipWidth', 'tipThickness', 'tipMaterial', 'tipVolumeFraction', 'tipRadius',
+    'tipSimpPenalty', 'tipHeaviside', 'tipSymmetry', 'tipOverhang', 'tipDirection',
+    'tipDensity', 'tipCad', 'tipStress', 'tipDeformed', 'tipDeformation',
+    'tipCompliance', 'tipSafety', 'tipP95Safety', 'tipDeflection', 'tipMass', 'tipChange',
+    'tipIteration', 'tipVolume', 'tipTime', 'tipPeakStress',
+    'tipInspect', 'tipVoid', 'tipSolid', 'tipBolt', 'tipErase', 'tipSupports', 'tipLoads',
+  ] satisfies Message[]
+  expect(Object.keys(messages).sort()).toEqual(Object.keys(dictionaries.en).sort())
+  expect(Object.keys(messages).filter(key => key.startsWith('tip')).sort()).toEqual(expectedTips.sort())
+  for (const key of expectedTips) {
+    expect(messages[key].trim().length).toBeGreaterThan(30)
+    if (language !== 'en') expect(messages[key]).not.toBe(dictionaries.en[key])
+  }
+})
+
+it('lists preset nodal force components and offers single-node and case-wide deletion', () => {
+  const { grid, loadCases } = makePreset('mbb', { nelx: 48, nely: 16 })
+  const html = renderToStaticMarkup(<LoadCases grid={grid} cases={loadCases} active={loadCases[0]}
+    onSelect={() => {}} onAdd={() => {}} onRemove={() => {}} onRename={() => {}} onChange={() => {}} />)
+  expect(html).toContain('Fx 0 · Fy -100')
+  expect(html).toContain('Edit load at (0, 16)')
+  expect(html).toContain('Delete load at (0, 16)')
+  expect(html).toContain('Clear loads')
 })

@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest'
-import { addLoadCase, attachmentError, editSupport, hasFreeLoad, loadCaseIndex, paintMask, setForce, supportError } from '../design'
+import { addLoadCase, attachmentError, clearLoads, directionVector, editSupport, hasFreeLoad, loadCaseIndex, paintMask, recordDesign, redoDesign, replaceLoadCase, setForce, supportError, undoDesign, type DesignHistory } from '../design'
 import { ManufacturingDensity } from '../manufacturing'
 import { makePreset } from '../presets'
 import { Simp2D } from '../simp2d'
@@ -118,4 +118,45 @@ it('looks up the same case across deletion, undo, and redo by ID', () => {
   expect(replacement.name).toBe(selected.name)
   expect(replacement.id).not.toBe(selected.id)
   expect(loadCaseIndex([first, second, replacement], selected.id)).toBe(-1)
+})
+
+it('undoes and redoes deleting a preset load, clearing its case, and removing a support', () => {
+  const preset = makePreset('bridge', { nelx: 30, nely: 10 })
+  const otherCase = makePreset('cantilever', preset.grid).loadCases[0]
+  const base = { ...preset, loadCases: [...preset.loadCases, otherCase] }
+  const active = base.loadCases[0]
+  const removed = active.forces[1]
+  expect(active.forces.length).toBeGreaterThan(2)
+  const afterDelete = replaceLoadCase(base, setForce(active, removed.node, null))
+  const afterClear = replaceLoadCase(afterDelete, clearLoads(afterDelete.loadCases[0]))
+  const afterSupport = { ...afterClear, supports: editSupport(afterClear.supports, base.supports[0].node, 'remove') }
+
+  let history: DesignHistory = { past: [], future: [] }
+  history = recordDesign(history, base, afterDelete)
+  expect(history.present?.loadCases[0].forces).toEqual(active.forces.filter(force => force !== removed))
+  history = recordDesign(history, base, afterClear)
+  expect(history.present?.loadCases[0].forces).toEqual([])
+  expect(history.present?.loadCases[1]).toBe(otherCase)
+  history = recordDesign(history, base, afterSupport)
+  expect(history.present?.supports).toEqual(base.supports.slice(1))
+
+  history = undoDesign(history, base)
+  expect(history.present?.supports).toBe(base.supports)
+  expect(history.present?.loadCases[0].forces).toEqual([])
+  history = undoDesign(history, base)
+  expect(history.present?.loadCases[0].forces).toBe(afterDelete.loadCases[0].forces)
+  history = undoDesign(history, base)
+  expect(history.present?.loadCases[0].forces).toBe(active.forces)
+
+  for (const expected of [afterDelete, afterClear, afterSupport]) {
+    history = redoDesign(history, base)
+    expect(history.present?.loadCases).toBe(expected.loadCases)
+    expect(history.present?.supports).toBe(expected.supports)
+  }
+})
+
+it.each([
+  ['down', 0, -125], ['up', 0, 125], ['right', 125, 0], ['left', -125, 0],
+] as const)('uses engineering axes for a %s force', (direction, fx, fy) => {
+  expect(directionVector(direction, 125)).toEqual({ fx, fy })
 })

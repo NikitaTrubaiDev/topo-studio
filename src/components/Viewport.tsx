@@ -3,19 +3,23 @@ import type { Diagnostic } from '../solver/diagnostics'
 import type { ContourLoop } from '../solver/contour'
 import { useTranslation } from '../i18n'
 import { buildLabels } from './Controls'
+import { ForceSettings } from './ForceSettings'
+import { Tooltip } from './Tooltip'
+import { aimedForce, boundaryMarkers, canvasLayout, canvasPoint, gridPoint, hitBoundaryMarker, nearestNode, nodePoint, type CanvasLayout, type Marker, type Point } from './viewportGeometry'
 import { OverhangFilter } from '../solver/overhang'
-import { brushExtent, editSupport, isValidForce, loadCaseIndex, MAX_NODAL_FORCE, paintMask, setForce, supportKind, type MaskTool, type SupportAction } from '../solver/design'
-import { nodeIndex, type Grid, type LoadCase, type PassiveMasks, type SimpProblem } from '../solver/types'
+import { brushExtent, directionVector, editSupport, loadCaseIndex, paintMask, replaceLoadCase, setForce, supportKind, type Design, type ForceVector, type MaskTool, type SupportAction } from '../solver/design'
+import type { LoadCase, PassiveMasks, SimpProblem } from '../solver/types'
 import { DEFORMED_DENSITY_THRESHOLD, deformedNodes, hitTestDeformedMesh, quadNodes } from './deformedMesh'
 import { caseColor } from './LoadCases'
 import type { TimedSnapshot } from '../workers/protocol'
 
 export type ViewMode = 'density' | 'stress' | 'deformed' | 'cad'
 type Overlays = { supports: boolean; forces: boolean; passive: boolean; smooth: boolean }
-type Point = [number, number]
 type Raster = { canvas: HTMLCanvasElement; image?: ImageData }
 
-const modes = ['density', 'stress', 'deformed', 'cad'] as const
+const modes = [
+  ['density', 'tipDensity'], ['stress', 'tipStress'], ['deformed', 'tipDeformed'], ['cad', 'tipCad'],
+] as const
 const densityStops = [[20, 32, 41], [32, 95, 104], [131, 233, 219]]
 const stressStops = [[24, 40, 64], [18, 123, 168], [60, 195, 156], [244, 213, 104], [248, 107, 96]]
 
@@ -84,9 +88,9 @@ function paint(
   canvas: HTMLCanvasElement, raster: Raster, problem: SimpProblem, density: Float32Array,
   mode: ViewMode, overlays: Overlays, positions: Float64Array | undefined, stressLimit: number,
   stress: Float32Array | undefined, loops: ContourLoop[], activeCase: number, resultCase: number,
+  width: number, height: number, layout: CanvasLayout, markers: Marker[], highlighted?: Marker, aimed?: { node: number; vector: ForceVector },
   attachmentIssue?: Extract<Diagnostic, { code: 'detachedNodes' }>, blockedCells?: readonly number[],
 ) {
-  const { clientWidth: width, clientHeight: height } = canvas
   const ratio = window.devicePixelRatio || 1
   const backingWidth = Math.round(width * ratio)
   const backingHeight = Math.round(height * ratio)
@@ -94,18 +98,15 @@ function paint(
   if (canvas.height !== backingHeight) canvas.height = backingHeight
   const ctx = canvas.getContext('2d')
   if (!ctx || !width || !height) return
-  ctx.setTransform(ratio, 0, 0, ratio, 0, 0)
+  ctx.setTransform(backingWidth / width, 0, 0, backingHeight / height, 0, 0)
   ctx.clearRect(0, 0, width, height)
 
-  const { grid, passive, supports, loadCases } = problem
+  const { grid, passive } = problem
   const { nelx, nely } = grid
-  const { cell, left, bottom } = canvasLayout(width, height, grid)
+  const { cell, left, bottom } = layout
   const top = bottom - nely * cell
-  const point = (x: number, y: number): Point => [left + x * cell, bottom - y * cell]
-  const nodePoint = (node: number, deform = false) => {
-    if (deform && positions) return point(positions[2 * node], positions[2 * node + 1])
-    return point(node % (nelx + 1), Math.floor(node / (nelx + 1)))
-  }
+  const point = (x: number, y: number) => canvasPoint(layout, x, y)
+  const deformedPoint = (node: number) => nodePoint(layout, grid, node, positions)
   const palette = stress || mode === 'stress' ? stressPalette : densityPalette
   const valueAt = (e: number) => {
     if (stress) return Number.isFinite(stress[e]) ? stress[e] / (stressLimit || 1) : 0
@@ -147,10 +148,10 @@ function paint(
         ctx.strokeStyle = '#0e3339'
         ctx.lineWidth = 0.65
         ctx.beginPath()
-        ctx.moveTo(...nodePoint(a, true))
-        ctx.lineTo(...nodePoint(b, true))
-        ctx.lineTo(...nodePoint(c, true))
-        ctx.lineTo(...nodePoint(d, true))
+        ctx.moveTo(...deformedPoint(a))
+        ctx.lineTo(...deformedPoint(b))
+        ctx.lineTo(...deformedPoint(c))
+        ctx.lineTo(...deformedPoint(d))
         ctx.closePath()
         ctx.fill()
         ctx.stroke()
@@ -228,50 +229,45 @@ function paint(
     }
   }
 
-  if (overlays.supports) {
-    ctx.strokeStyle = '#7ac4fb'
-    ctx.lineWidth = 1.3
-    for (const support of supports) {
-      const { node, fixedX, fixedY } = support
-      if (fixedX || fixedY) drawSupport(ctx, nodePoint(node), fixedX, fixedY, supportKind(support) === 'fixed')
+  for (const marker of markers) {
+    if (marker.kind === 'support') {
+      const { fixedX, fixedY } = marker.support
+      ctx.strokeStyle = '#7ac4fb'
+      ctx.lineWidth = 1.3
+      drawSupport(ctx, marker.point, fixedX, fixedY, supportKind(marker.support) === 'fixed')
+    } else if (marker.drawn) {
+      ctx.lineWidth = 1.4
+      ctx.strokeStyle = caseColor(marker.caseIndex)
+      ctx.globalAlpha = marker.caseIndex === activeCase || marker.caseIndex === resultCase ? 1 : 0.73
+      drawForce(ctx, marker.point, marker.force.fx, marker.force.fy, marker.length)
+      ctx.globalAlpha = 1
     }
   }
-  if (overlays.forces) {
-    ctx.lineWidth = 1.4
-    const visibleCase = mode === 'stress' || mode === 'deformed' ? resultCase : -1
-    const casesAtNode = new Map<number, number[]>()
-    if (visibleCase < 0 && loadCases.length > 1) {
-      loadCases.forEach(({ forces }, index) => {
-        for (const { node, fx, fy } of forces) {
-          if (fx === 0 && fy === 0) continue
-          const cases = casesAtNode.get(node)
-          if (!cases) casesAtNode.set(node, [index])
-          else if (cases.at(-1) !== index) cases.push(index)
-        }
-      })
+
+  if (highlighted) {
+    const { point } = highlighted
+    ctx.strokeStyle = '#fff0b2'
+    ctx.lineWidth = 2.5
+    if (highlighted.kind === 'load') {
+      const { fx, fy } = highlighted.force
+      drawForce(ctx, point, fx, fy, highlighted.length)
+    } else {
+      const { fixedX, fixedY } = highlighted.support
+      drawSupport(ctx, point, fixedX, fixedY, supportKind(highlighted.support) === 'fixed')
     }
-    loadCases.forEach(({ forces }, index) => {
-      if (visibleCase >= 0 && index !== visibleCase) return
-      ctx.strokeStyle = caseColor(index)
-      ctx.globalAlpha = index === activeCase || resultCase === index ? 1 : 0.73
-      const peak = forces.reduce((max, { fx, fy }) => isValidForce(fx, fy) ? Math.max(max, Math.hypot(fx, fy)) : max, 1)
-      const stride = Math.max(1, Math.ceil(12 / cell))
-      for (let i = 0; i < forces.length; i++) {
-        if (forces.length > nelx && i % stride !== 0 && i !== forces.length - 1) continue
-        const { node, fx, fy } = forces[i]
-        const magnitude = Math.hypot(fx, fy)
-        if (!magnitude || !isValidForce(fx, fy)) continue
-        const point = nodePoint(node, true)
-        const cases = casesAtNode.get(node)
-        if (cases && cases.length > 1) {
-          const shift = (cases.indexOf(index) - (cases.length - 1) / 2) * 4
-          point[0] += fy * shift / magnitude
-          point[1] += fx * shift / magnitude
-        }
-        drawForce(ctx, point, fx, fy, 12 + 20 * magnitude / peak)
-      }
-    })
-    ctx.globalAlpha = 1
+    ctx.beginPath()
+    ctx.arc(...point, 6, 0, 2 * Math.PI)
+    ctx.stroke()
+  }
+
+  if (aimed) {
+    const { fx, fy } = aimed.vector
+    const [x, y] = nodePoint(layout, grid, aimed.node)
+    const length = 32
+    const magnitude = Math.hypot(fx, fy)
+    ctx.strokeStyle = caseColor(activeCase)
+    ctx.lineWidth = 2.5
+    drawForce(ctx, [x + (fx / magnitude) * length, y - (fy / magnitude) * length], fx, fy, length)
   }
 
   if (blockedCells?.length) {
@@ -309,49 +305,18 @@ function paint(
   ctx.fillText('X', 44, height - 17)
 }
 
-const tools = ['inspect', 'void', 'solid', 'erase', 'bolt', 'supports', 'loads'] as const
-type Tool = typeof tools[number]
+const tools = [
+  ['inspect', 'tipInspect'], ['void', 'tipVoid'], ['solid', 'tipSolid'], ['erase', 'tipErase'],
+  ['bolt', 'tipBolt'], ['supports', 'tipSupports'], ['loads', 'tipLoads'],
+] as const
+type Tool = typeof tools[number][0]
 const overlaysList = ['supports', 'forces', 'passive', 'smooth'] as const
 const arrows = { '+Y': '↑', '-Y': '↓', '+X': '→', '-X': '←' }
 
-function canvasLayout(width: number, height: number, { nelx, nely }: Grid) {
-  const cell = Math.min(Math.max(10, width - 72) / nelx, Math.max(10, height - 82) / nely)
-  return { cell, left: (width - nelx * cell) / 2, bottom: (height + nely * cell) / 2 + 6 }
-}
-
-function gridPoint(event: PointerEvent<HTMLCanvasElement>, grid: Grid): Point {
+function pointerPosition(event: { currentTarget: HTMLCanvasElement; clientX: number; clientY: number }) {
   const rect = event.currentTarget.getBoundingClientRect()
-  const { cell, left, bottom } = canvasLayout(rect.width, rect.height, grid)
-  return [(event.clientX - rect.left - left) / cell, (bottom - event.clientY + rect.top) / cell]
-}
-
-function ForceEditor({ node, problem, activeCase, onChange }: {
-  node: number; problem: SimpProblem; activeCase: LoadCase; onChange: (problem: SimpProblem) => void
-}) {
-  const { t, caseName, significant } = useTranslation()
-  const [invalid, setInvalid] = useState(false)
-  const force = activeCase.forces.find(force => force.node === node)
-  const width = problem.grid.nelx + 1
-  function change(value: { fx: number; fy: number } | null) {
-    const next = setForce(activeCase, node, value)
-    if (next !== activeCase) onChange({ ...problem, loadCases: problem.loadCases.map(item => item.id === activeCase.id ? next : item) })
-  }
-  return (
-    <form className="force-editor" onChange={() => setInvalid(false)} onSubmit={event => {
-      event.preventDefault()
-      const data = new FormData(event.currentTarget)
-      const fx = Number(data.get('fx')), fy = Number(data.get('fy'))
-      if (isValidForce(fx, fy)) change({ fx, fy })
-      else setInvalid(true)
-    }}>
-      <span>{t('node')} ({node % width}, {Math.floor(node / width)}) · {caseName(activeCase)}</span>
-      <label>Fx ({t('N')}) <input type="number" className="field-input" required name="fx" step="any" defaultValue={force?.fx ?? 0} /></label>
-      <label>Fy ({t('N')}) <input type="number" className="field-input" required name="fy" step="any" defaultValue={force?.fy ?? -100} /></label>
-      <button className="tool-button" type="submit">{t('applyForce')}</button>
-      <button className="tool-button" type="button" disabled={!force} onClick={() => change(null)}>{t('removeForce')}</button>
-      {invalid && <span role="alert">{t('forceLimit').replace('{limit}', significant(MAX_NODAL_FORCE))}</span>}
-    </form>
-  )
+  const point: Point = [event.clientX - rect.left, event.clientY - rect.top]
+  return { point, width: rect.width, height: rect.height }
 }
 
 export function Viewport({
@@ -369,18 +334,19 @@ export function Viewport({
   mode: ViewMode
   setMode: (mode: ViewMode) => void
   activeCase: LoadCase
-  onChange: (problem: SimpProblem) => void
+  onChange: (design: Design) => void
 }) {
   const { t, caseName, number, significant, fixed } = useTranslation()
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const rasterRef = useRef<Raster | null>(null)
   const stroke = useRef<{ problem: SimpProblem; original: SimpProblem; last: Point; nodes: Set<number> } | null>(null)
+  const aiming = useRef<{ original: SimpProblem; caseId: string; pointerId: number; node: number; start: Point; force: ForceVector } | null>(null)
   const [draft, setDraft] = useState<SimpProblem>()
   const [drawingTool, setTool] = useState<Tool>('inspect')
   const tool = mode === 'density' ? drawingTool : 'inspect'
   const [radius, setRadius] = useState(2)
   const [supportAction, setSupportAction] = useState<SupportAction>('cycle')
-  const [selectedNode, setSelectedNode] = useState<number>()
+  const [force, setForceVector] = useState(() => directionVector('down', 100))
   const [hover, setHover] = useState<Point>()
   const [resultCaseId, setResultCaseId] = useState<string>()
   const [deformationPercent, setDeformationPercent] = useState(50)
@@ -445,6 +411,14 @@ export function Viewport({
     return { stressLimit: sample[Math.ceil(0.95 * sample.length) - 1] || maxStress, maxStress }
   }, [stress, previewFrame, stressMode, caseIndex])
 
+  const layout = useMemo(() => canvasLayout(size.width, size.height, grid), [size, grid])
+  const markers = useMemo(() => boundaryMarkers(preview, layout, positions, overlays, stressMode ? caseIndex : -1),
+    [preview, layout, positions, overlays, stressMode, caseIndex])
+  const aim = aiming.current
+  const aimVector = aim && hover && aim.original === problem && aim.caseId === activeCase.id
+    ? aimedForce(aim.start, hover, aim.force) : undefined
+  const highlighted = hover && !aim && !draft ? hitBoundaryMarker(markers, hover, layout.cell, activeCaseIndex, tool) : undefined
+
   useLayoutEffect(() => {
     const canvas = canvasRef.current!
     const observer = new ResizeObserver(([entry]) => {
@@ -460,15 +434,22 @@ export function Viewport({
       rasterRef.current ??= { canvas: document.createElement('canvas') }
       paint(canvasRef.current, rasterRef.current, preview, previewDensity, mode, overlays, positions,
         stressLimit, stressMode ? stress : undefined, loops, activeCaseIndex, caseIndex,
+        size.width, size.height, layout, markers, highlighted, aim && aimVector ? { node: aim.node, vector: aimVector } : undefined,
         draft ? undefined : attachmentIssue, draft ? undefined : blockedCells)
     }
-  }, [preview, previewDensity, mode, overlays, positions, stressLimit, size, stressMode, stress, loops, activeCaseIndex, caseIndex, draft, attachmentIssue, blockedCells])
+  }, [preview, previewDensity, mode, overlays, positions, stressLimit, size, stressMode, stress, loops, activeCaseIndex, caseIndex,
+    layout, markers, highlighted, aim, aimVector, draft, attachmentIssue, blockedCells])
 
   const toggle = (key: keyof Overlays) => setOverlays(current => ({ ...current, [key]: !current[key] }))
   const isBrush = tool === 'void' || tool === 'solid' || tool === 'erase' || tool === 'bolt'
   const inside = (point: Point, padding = 0) => point[0] >= -padding && point[0] <= nelx + padding
     && point[1] >= -padding && point[1] <= nely + padding
-  const nearest = ([x, y]: Point) => nodeIndex(grid, Math.max(0, Math.min(nelx, Math.round(x))), Math.max(0, Math.min(nely, Math.round(y))))
+  const nearest = (point: Point) => nearestNode(grid, point)
+
+  function eventGridPoint(event: PointerEvent<HTMLCanvasElement>) {
+    const { point, width, height } = pointerPosition(event)
+    return gridPoint(canvasLayout(width, height, grid), point)
+  }
 
   function dab(point: Point) {
     const current = stroke.current
@@ -502,13 +483,15 @@ export function Viewport({
 
   function pointerDown(event: PointerEvent<HTMLCanvasElement>) {
     if (event.button !== 0 || !event.isPrimary || tool === 'inspect' || mode !== 'density') return
-    const point = gridPoint(event, grid)
+    const point = eventGridPoint(event)
     if (!inside(point, isBrush ? 0 : 0.6)) return
+    event.currentTarget.setPointerCapture(event.pointerId)
     if (tool === 'loads') {
-      setSelectedNode(nearest(point))
+      const { point: start } = pointerPosition(event)
+      aiming.current = { original: problem, caseId: activeCase.id, pointerId: event.pointerId, node: nearest(point), start, force }
+      setHover(start)
       return
     }
-    event.currentTarget.setPointerCapture(event.pointerId)
     stroke.current = { problem, original: problem, last: point, nodes: new Set() }
     dab(point)
   }
@@ -520,28 +503,42 @@ export function Viewport({
     if (commit && current?.original === problem && current.problem !== problem) onChange(current.problem)
   }
 
+  function finishAim(event: PointerEvent<HTMLCanvasElement>, commit: boolean) {
+    const current = aiming.current
+    if (!current || current.pointerId !== event.pointerId) return
+    aiming.current = null
+    const { point } = pointerPosition(event)
+    setHover(commit ? point : undefined)
+    if (!commit || current.original !== problem || current.caseId !== activeCase.id || tool !== 'loads') return
+    const vector = aimedForce(current.start, point, current.force) ?? current.force
+    if (!vector.fx && !vector.fy) return
+    const next = setForce(activeCase, current.node, vector)
+    if (next !== activeCase) onChange(replaceLoadCase(problem, next))
+  }
+
+  const hoverGrid = hover && gridPoint(layout, hover)
   let inspectIndex = null
-  if (tool === 'inspect' && hover) {
-    if (positions) inspectIndex = hitTestDeformedMesh(grid, positions, previewDensity, hover)
-    else if (inside(hover)) {
-      inspectIndex = Math.min(nelx - 1, Math.floor(hover[0])) + nelx * Math.min(nely - 1, Math.floor(hover[1]))
+  if (tool === 'inspect' && hoverGrid) {
+    if (positions) inspectIndex = hitTestDeformedMesh(grid, positions, previewDensity, hoverGrid)
+    else if (inside(hoverGrid)) {
+      inspectIndex = Math.min(nelx - 1, Math.floor(hoverGrid[0])) + nelx * Math.min(nely - 1, Math.floor(hoverGrid[1]))
     }
   }
   const hoverDensity = inspectIndex === null ? undefined : previewDensity[inspectIndex]
   const hoverStress = inspectIndex === null ? undefined : stress?.[inspectIndex]
-  const hoverLayout = canvasLayout(size.width, size.height, grid)
-  const hoverNode = hover && inside(hover, 0.6) && (tool === 'supports' || tool === 'loads') ? nearest(hover) : undefined
-  const selectedForce = activeCase.forces.find(force => force.node === selectedNode)
+  const hoverNode = hoverGrid && inside(hoverGrid, 0.6) && (tool === 'supports' || tool === 'loads') ? nearest(hoverGrid) : undefined
+  const cursorNode = aim?.node ?? hoverNode
+  const cursorPoint = cursorNode === undefined ? undefined : nodePoint(layout, grid, cursorNode)
 
   return (
     <section className="viewport panel" aria-label={t('viewport')}>
       <div className="viewport-tools">
         <div className="segmented" role="group" aria-label={t('resultView')}>
-          {modes.map(id => (
-            <button key={id} type="button" aria-pressed={mode === id} onClick={() => {
+          {modes.map(([id, tip]) => (
+            <Tooltip key={id} message={tip}><button type="button" aria-pressed={mode === id} onClick={() => {
               setMode(id)
               if (id !== 'density') setTool('inspect')
-            }}>{t(id)}</button>
+            }}>{t(id)}</button></Tooltip>
           ))}
         </div>
         <div className="overlay-controls" role="group" aria-label={t('overlays')}>
@@ -555,11 +552,11 @@ export function Viewport({
       </div>
       <div className="viewport-tools designer-tools">
         <div className="segmented" role="group" aria-label={t('drawTools')}>
-          {tools.map(id => (
-            <button key={id} type="button" aria-pressed={tool === id} title={t(`${id}Hint`)} onClick={() => {
+          {tools.map(([id, tip]) => (
+            <Tooltip key={id} message={tip}><button type="button" aria-pressed={tool === id} onClick={() => {
               setTool(id)
               if (id !== 'inspect') setMode('density')
-            }}>{t(id)}</button>
+            }}>{t(id)}</button></Tooltip>
           ))}
         </div>
         {isBrush && <label className="compact-input">{t('brushRadius')}
@@ -567,64 +564,80 @@ export function Viewport({
             onChange={event => setRadius(event.target.valueAsNumber)} />
           <output>{radius} {t('elementShort')}</output>
         </label>}
-        {tool === 'supports' && <label className="compact-input">{t('support')}
-          <select className="field-input" value={supportAction} onChange={event => setSupportAction(event.target.value as SupportAction)}>
-            <option value="cycle">{t('cycle')}</option><option value="fixed">{t('fixed')}</option><option value="pin">{t('pin')}</option>
-            <option value="roller-x">{t('rollerX')}</option><option value="roller-y">{t('rollerY')}</option>
-            <option value="remove">{t('removeSupport')}</option>
-          </select>
-        </label>}
+        {tool === 'supports' && <div className="action-row">
+          <label className="compact-input">{t('support')}
+            <select className="field-input" value={supportAction} onChange={event => setSupportAction(event.target.value as SupportAction)}>
+              <option value="cycle">{t('cycle')}</option><option value="fixed">{t('fixed')}</option><option value="pin">{t('pin')}</option>
+              <option value="roller-x">{t('rollerX')}</option><option value="roller-y">{t('rollerY')}</option>
+              <option value="remove">{t('removeSupport')}</option>
+            </select>
+          </label>
+          <button className="tool-button clear-button" type="button" disabled={!problem.supports.length}
+            onClick={() => onChange({ ...problem, supports: [] })}>{t('clearSupports')}</button>
+        </div>}
         {stressMode && <label className="compact-input">{t('resultCase')}
           <select className="field-input" value={caseIndex < 0 ? '' : resultCaseId} onChange={event => setResultCaseId(event.target.value || undefined)}>
             <option value="">{t('envelope')}</option>
             {problem.loadCases.map(load => <option key={load.id} value={load.id}>{caseName(load)}</option>)}
           </select>
         </label>}
-        {tool === 'loads' && selectedNode !== undefined && (
-          <ForceEditor key={`${activeCase.id}:${selectedNode}:${selectedForce?.fx}:${selectedForce?.fy}`} node={selectedNode}
-            problem={problem} activeCase={activeCase} onChange={onChange} />
-        )}
+        {tool === 'loads' && <ForceSettings force={force} onChange={setForceVector} />}
       </div>
-      <p className="context-hint" title={t(`${tool}Hint`)}>{t(`${tool}Hint`)}</p>
+      <p className="context-hint">{t(`${tool}Hint`)}</p>
       <div className="canvas-field">
         {build && <div className="build-indicator" data-direction={build} title={t(buildLabels[build])}>
           <span aria-hidden="true">{arrows[build]}</span> {build} · {t(buildLabels[build])}
         </div>}
         <canvas ref={canvasRef} aria-label={`${t(mode)} · ${nelx} ${t('by')} ${nely} ${t('elements')}`} role="img" data-tool={tool}
+          onContextMenu={event => {
+            event.preventDefault()
+            if (aiming.current || stroke.current) return
+            const { point, width, height } = pointerPosition(event)
+            const hitLayout = canvasLayout(width, height, grid)
+            const hitMarkers = width === size.width && height === size.height ? markers
+              : boundaryMarkers(preview, hitLayout, positions, overlays, stressMode ? caseIndex : -1)
+            const target = hitBoundaryMarker(hitMarkers, point, hitLayout.cell, activeCaseIndex, tool)
+            if (!target) return
+            if (target.kind === 'support') {
+              const supports = editSupport(problem.supports, target.support.node, 'remove')
+              onChange({ ...problem, supports })
+            } else {
+              const loadCase = problem.loadCases[target.caseIndex]
+              onChange(replaceLoadCase(problem, setForce(loadCase, target.force.node, null)))
+            }
+          }}
           onPointerDown={pointerDown} onPointerMove={event => {
-            const point = gridPoint(event, grid)
+            const { point, width, height } = pointerPosition(event)
             setHover(point)
-            if (event.isPrimary && stroke.current && tool !== 'bolt') dab(point)
+            if (event.isPrimary && stroke.current && tool !== 'bolt') dab(gridPoint(canvasLayout(width, height, grid), point))
           }} onPointerLeave={() => setHover(undefined)}
           onPointerUp={event => {
-            if (!event.isPrimary) return
-            if (stroke.current && tool !== 'bolt') dab(gridPoint(event, grid))
+            if (!event.isPrimary || event.button !== 0) return
+            finishAim(event, true)
+            if (stroke.current && tool !== 'bolt') dab(eventGridPoint(event))
             finish(true)
           }}
-          onPointerCancel={() => finish(false)} onLostPointerCapture={() => finish(false)} />
+          onPointerCancel={event => { finishAim(event, false); finish(false) }}
+          onLostPointerCapture={event => { finishAim(event, false); finish(false) }} />
         <div className="field-caption">{number(nelx)} × {number(nely)} {t('elements')} · {significant(nelx * (grid.cellSizeMm ?? 1), 5)} × {significant(nely * (grid.cellSizeMm ?? 1), 5)} {t('mm')}</div>
-        {isBrush && hover && inside(hover) && (tool === 'bolt' ? [brushExtent('bolt', radius), radius] : [radius])
+        {isBrush && hover && hoverGrid && inside(hoverGrid) && (tool === 'bolt' ? [brushExtent('bolt', radius), radius] : [radius])
           .map((ring, index) => <div key={index} className={`brush-cursor brush-${tool}`} style={{
-            left: hoverLayout.left + hover[0] * hoverLayout.cell, top: hoverLayout.bottom - hover[1] * hoverLayout.cell,
-            width: ring * hoverLayout.cell * 2, height: ring * hoverLayout.cell * 2,
+            left: hover[0], top: hover[1],
+            width: ring * layout.cell * 2, height: ring * layout.cell * 2,
           }} />)}
-        {hoverNode !== undefined && <div className="node-cursor node-preview" style={{
-          left: hoverLayout.left + (hoverNode % (nelx + 1)) * hoverLayout.cell,
-          top: hoverLayout.bottom - Math.floor(hoverNode / (nelx + 1)) * hoverLayout.cell,
-        }} />}
-        {tool === 'loads' && selectedNode !== undefined && <div className="node-cursor" style={{
-          left: hoverLayout.left + (selectedNode % (nelx + 1)) * hoverLayout.cell,
-          top: hoverLayout.bottom - Math.floor(selectedNode / (nelx + 1)) * hoverLayout.cell,
-          borderColor: caseColor(activeCaseIndex),
+        {cursorPoint && <div className={`node-cursor${aim ? '' : ' node-preview'}`} style={{
+          left: cursorPoint[0], top: cursorPoint[1], borderColor: aim ? caseColor(activeCaseIndex) : undefined,
         }} />}
         {tool === 'inspect' && hoverDensity !== undefined && (
           <div className="inspect-readout">ρ {fixed(hoverDensity, 3)} · σ<sub>VM</sub> {hoverStress !== undefined && Number.isFinite(hoverStress) ? `${significant(hoverStress)} ${t('MPa')}` : '—'}</div>
         )}
         {mode === 'deformed' && (
           <div className="magnification">
-            <label htmlFor="deformation-percent">{t('deformation')}</label>
-            <input id="deformation-percent" type="range" min="0" max="200" value={deformationPercent}
-              aria-valuetext={`${deformationPercent}% ${t('autoScale')}`} onChange={event => setDeformationPercent(event.target.valueAsNumber)} />
+            <Tooltip message="tipDeformation" info={t('deformation')}>
+              <label htmlFor="deformation-percent">{t('deformation')}</label>
+              <input id="deformation-percent" type="range" min="0" max="200" value={deformationPercent}
+                aria-valuetext={`${deformationPercent}% ${t('autoScale')}`} onChange={event => setDeformationPercent(event.target.valueAsNumber)} />
+            </Tooltip>
             <output>{displacement ? `${significant(magnification, 3)}×` : '—'}</output>
             {caseIndex < 0 && deformation && <span>{t('shape')} · {caseName(problem.loadCases[deformation.index])}</span>}
           </div>

@@ -1,7 +1,7 @@
 import { DiagnosticError } from './diagnostics'
-import { isValidForce } from './design'
+import { isValidForce, type Design } from './design'
 import { materials, presets, type PresetId } from './presets'
-import type { Grid, LoadCase, PassiveMasks, SimpParams, SimpProblem, Support } from './types'
+import type { Grid, LoadCase, PassiveMasks, SimpParams, Support } from './types'
 
 export type MaterialId = keyof typeof materials
 
@@ -24,7 +24,7 @@ export interface Settings {
   params: SimpParams
 }
 
-export type Design = Pick<SimpProblem, 'supports' | 'loadCases' | 'passive'>
+export type { Design } from './design'
 
 export function projectGrid({ resolution, widthMm, thicknessMm }: Settings): Grid {
   const grid = resolutions[resolution]
