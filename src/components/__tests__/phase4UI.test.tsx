@@ -7,7 +7,9 @@ import { LanguageContext } from '../../i18n'
 import { dictionaries, languages } from '../../i18n/dictionaries'
 import { marchingCubes } from '../../solver3d/marchingCubes'
 import { makePreset3D, presetGrid3D } from '../../solver3d/presets3d'
-import { Simp3D } from '../../solver3d/simp3d'
+import { Simp3D, validateProblem3D } from '../../solver3d/simp3d'
+import { ProblemError3D } from '../../solver3d/types3d'
+import type { Preview3D, WorkerCommand3D } from '../../workers/protocol3d'
 import { Tooltip } from '../Tooltip'
 import { surfaceMesh } from '../Viewport3D'
 import Workbench3D from '../Workbench3D'
@@ -17,6 +19,20 @@ let root: Root
 
 beforeEach(() => {
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true)
+  vi.stubGlobal('Worker', class {
+    onmessage?: (event: { data: Preview3D }) => void
+    postMessage(command: WorkerCommand3D) {
+      if (command.type !== 'preview') return
+      const data: Preview3D = { type: 'preview', requestId: command.requestId, density: new Float64Array() }
+      try {
+        validateProblem3D(command.problem)
+      } catch (error) {
+        data.issue = error instanceof ProblemError3D ? error.code : 'workerError'
+      }
+      this.onmessage?.({ data })
+    }
+    terminate() {}
+  })
   mount = document.body.appendChild(document.createElement('div'))
   root = createRoot(mount)
 })
@@ -132,4 +148,8 @@ it.each(languages)('shows both element modes, the high resolution, and mesh cont
     expect(dictionary[key].length).toBeGreaterThan(20)
     if (language !== 'en') expect(dictionary[key]).not.toBe(dictionaries.en[key])
   }
+})
+
+it('names the English Hex8 option Bricks for rectangular cells', () => {
+  expect(dictionaries.en.hex8Elements3d).toBe('Hex8 (Bricks)')
 })

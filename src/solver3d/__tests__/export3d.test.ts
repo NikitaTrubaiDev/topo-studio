@@ -149,3 +149,72 @@ it('preserves the inside diameter of all four prescribed bolt bores at 12 passes
     expect(boreDiameter(smooth, 6.25, y - 0.25, z)).toBeCloseTo(10, 10)
   }
 })
+
+it.each([0, undefined])('preserves a connected one-cell Tet4 strut at %s smoothing passes', passes => {
+  const strutGrid = { nelx: 14, nely: 3, nelz: 3, widthMm: 14, heightMm: 3, depthMm: 3 }
+  const density = new Float64Array(elementCount(strutGrid, 'tet4'))
+  for (let x = 1; x <= 12; x++) {
+    const e = 5 * elementIndex(strutGrid, x, 1, 1)
+    density.fill(1, e, e + 5)
+  }
+  const mesh = extractSurface3D(density, strutGrid, 0.5, passes, undefined, 'tet4')
+  expect(mesh.triangles.length / 3).toBe(100)
+  const links = Array.from({ length: mesh.vertices.length / 3 }, () => new Set<number>())
+  for (let i = 0; i < mesh.triangles.length; i += 3) {
+    const face = mesh.triangles.subarray(i, i + 3)
+    for (const a of face) for (const b of face) links[a].add(b)
+  }
+  const reached = new Set([0])
+  for (const vertex of reached) for (const neighbor of links[vertex]) reached.add(neighbor)
+  expect(reached.size).toBe(links.length)
+  expect(isWatertight(mesh, true)).toBe(true)
+  expect(new DataView(exportStl3D(mesh)).getUint32(80, true)).toBe(100)
+  expect(exportObj3D(mesh).match(/^f /gm)).toHaveLength(100)
+})
+
+it('keeps all four outward faces of a single Tet4 exactly at the threshold', () => {
+  const cell = { nelx: 1, nely: 1, nelz: 1, widthMm: 2, heightMm: 3, depthMm: 4 }
+  const mesh = extractSurface3D(Float64Array.of(0.5, 0, 0, 0, 0), cell, 0.5, 0, undefined, 'tet4')
+  expect(mesh.vertices).toHaveLength(12)
+  expect(mesh.triangles).toHaveLength(12)
+  expect(isWatertight(mesh, true)).toBe(true)
+})
+
+it('keeps seed-23 Tet4 material exportable before and after smoothing', () => {
+  const randomGrid = { nelx: 12, nely: 8, nelz: 8, widthMm: 24, heightMm: 24, depthMm: 32 }
+  let seed = 23
+  const density = Float64Array.from({ length: elementCount(randomGrid, 'tet4') }, () => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
+    return seed / 2 ** 32
+  })
+  for (const passes of [0, 1, 4]) {
+    const mesh = extractSurface3D(density, randomGrid, 0.5, passes, undefined, 'tet4')
+    const count = mesh.triangles.length / 3
+    expect(count).toBeGreaterThan(0)
+    expect(new DataView(exportStl3D(mesh)).getUint32(80, true)).toBe(count)
+    expect(exportObj3D(mesh).match(/^f /gm)).toHaveLength(count)
+  }
+})
+
+it('keeps the last valid surface when smoothing would move an outer wall through a cavity', () => {
+  const vertices = Float64Array.of(
+    1, 1, 1, 5, 1, 1, 1, 5, 1, 5, 5, 1,
+    1, 1, 5, 5, 1, 5, 1, 5, 5, 5, 5, 5,
+    1.001, 1.1, 1.18, 1.003, 1.1, 1.18, 1.001, 1.11, 1.18, 1.001, 1.1, 1.19,
+  )
+  const triangles = Uint32Array.of(
+    0, 2, 3, 0, 3, 1, 4, 5, 7, 4, 7, 6,
+    0, 1, 5, 0, 5, 4, 2, 6, 7, 2, 7, 3,
+    0, 4, 6, 0, 6, 2, 1, 3, 7, 1, 7, 5,
+    9, 11, 10, 8, 10, 11, 8, 11, 9, 8, 9, 10,
+  )
+  const pinned = Uint8Array.from({ length: 12 }, (_, i) => Number(i !== 0))
+  const mesh = { vertices, triangles, pinned }
+  const proposed = vertices.slice()
+  proposed.fill(1.015, 0, 3)
+  expect(isWatertight({ ...mesh, vertices: proposed }, true)).toBe(false)
+  expect(isWatertight(mesh, true)).toBe(true)
+  const limits = { nelx: 10, nely: 10, nelz: 10, widthMm: 10, heightMm: 10, depthMm: 10 }
+  const smooth = taubinSmooth(mesh, limits, 1, 0.5, 0)
+  expect(smooth.vertices).toEqual(mesh.vertices)
+})

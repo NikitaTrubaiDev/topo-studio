@@ -46,40 +46,58 @@ function tetNeighbor(parity: number, tet: number, face: readonly number[]) {
 const tetBoundary = tetCorners.map((templates, p) => templates.map((_, t) => tetFaces.map(face => tetNeighbor(p, t, face))))
 const hexBoundary = [hexFaces.map((corners, i) => ({ corners, offset: hexNeighbors[i], other: 0 }))]
 
-/** Exposed oriented faces and true element edges, without triangulation diagonals on Hex8 faces. */
-export function elementSurface3D(grid: Grid3D, type: ElementType3D, density: ArrayLike<number>, threshold: number, withEdges: boolean) {
+type ElementFace = { corners: readonly number[]; offset: readonly number[]; other: number }
+
+/** Visit active cells and their oriented boundary faces in solver element order. */
+export function visitActiveCells3D(grid: Grid3D, type: ElementType3D, density: ArrayLike<number>, threshold: number,
+  visit: (nodes: Int32Array, exposed: readonly ElementFace[], corners: readonly number[]) => void) {
   const { nelx, nely, nelz } = grid
-  const count = nodeCount(grid)
-  const triangles: number[] = [], edges: number[] = []
-  const seen = withEdges ? new Set<number>() : undefined
-  const positions = new Float32Array(3 * count)
   const nodes = new Int32Array(8)
-  for (let i = 0; i < count; i++) positions.set(nodePosition(grid, i), 3 * i)
+  const exposed: ElementFace[] = []
   let e = 0
   for (let z = 0; z < nelz; z++) for (let y = 0; y < nely; y++) for (let x = 0; x < nelx; x++) {
-    const templates = type === 'tet4' ? tetBoundary[(x + y + z) & 1] : hexBoundary
+    const parity = (x + y + z) & 1
+    const templates = type === 'tet4' ? tetBoundary[parity] : hexBoundary
+    const corners = type === 'tet4' ? tetCorners[parity] : hex
     for (let c = 0; c < 8; c++) {
       const [dx, dy, dz] = h8Corners[c]
       nodes[c] = nodeIndex3D(grid, x + dx, y + dy, z + dz)
     }
-    for (const faces of templates) {
+    for (let t = 0; t < templates.length; t++) {
       if (!(density[e++] >= threshold)) continue
-      for (const { corners, offset, other } of faces) {
+      exposed.length = 0
+      for (const face of templates[t]) {
+        const { offset, other } = face
         const i = x + offset[0], j = y + offset[1], k = z + offset[2]
         if (i >= 0 && i < nelx && j >= 0 && j < nely && k >= 0 && k < nelz &&
           density[((k * nely + j) * nelx + i) * templates.length + other] >= threshold) continue
-        const a = nodes[corners[0]], b = nodes[corners[1]], c = nodes[corners[2]]
-        triangles.push(a, b, c)
-        if (corners.length === 4) triangles.push(a, c, nodes[corners[3]])
-        if (seen) for (let l = 0; l < corners.length; l++) {
-          const m = nodes[corners[l]], n = nodes[corners[(l + 1) % corners.length]]
-          const key = Math.min(m, n) * count + Math.max(m, n)
-          if (seen.has(key)) continue
-          seen.add(key)
-          edges.push(m, n)
-        }
+        exposed.push(face)
       }
+      visit(nodes, exposed, corners[t])
     }
   }
+}
+
+/** Exposed oriented faces and true element edges, without triangulation diagonals on Hex8 faces. */
+export function elementSurface3D(grid: Grid3D, type: ElementType3D, density: ArrayLike<number>, threshold: number, withEdges: boolean) {
+  const count = nodeCount(grid)
+  const triangles: number[] = [], edges: number[] = []
+  const seen = withEdges ? new Set<number>() : undefined
+  const positions = new Float32Array(3 * count)
+  for (let i = 0; i < count; i++) positions.set(nodePosition(grid, i), 3 * i)
+  visitActiveCells3D(grid, type, density, threshold, (nodes, exposed) => {
+    for (const { corners } of exposed) {
+      const a = nodes[corners[0]], b = nodes[corners[1]], c = nodes[corners[2]]
+      triangles.push(a, b, c)
+      if (corners.length === 4) triangles.push(a, c, nodes[corners[3]])
+      if (seen) for (let l = 0; l < corners.length; l++) {
+        const m = nodes[corners[l]], n = nodes[corners[(l + 1) % corners.length]]
+        const key = Math.min(m, n) * count + Math.max(m, n)
+        if (seen.has(key)) continue
+        seen.add(key)
+        edges.push(m, n)
+      }
+    }
+  })
   return { positions, triangles: Uint32Array.from(triangles), edges: Uint32Array.from(edges) }
 }

@@ -67,3 +67,24 @@ it('reports the final true relative residual when PCG fails', async () => {
     solve.mockRestore()
   }
 })
+
+it('transfers the tagged nonlinear Tet4 starting field and reuses solver state for Step', async () => {
+  const events: WorkerEvent3D[] = []
+  const scope = {
+    onmessage: undefined as ((event: { data: WorkerCommand3D }) => void) | undefined,
+    postMessage(event: WorkerEvent3D, transfer: ArrayBuffer[]) {
+      if (event.type === 'preview') expect(transfer).toEqual([event.density.buffer])
+      events.push(structuredClone(event, { transfer }))
+    },
+  }
+  vi.stubGlobal('self', scope)
+  const { Simp3D } = await import('../../solver3d/simp3d')
+  const problem = makePreset3D('archBridge3d', presetGrid3D([12, 6, 4]),
+    { ...defaultParams3D, rmin: 4, heaviside: true }, undefined, 'tet4')
+  const expected = new Simp3D(problem)
+  await import('../simp3dWorker')
+  scope.onmessage!({ data: { type: 'preview', problem, requestId: 41 } })
+  expect(events[0]).toMatchObject({ type: 'preview', requestId: 41, density: expected.initialDensity(), passive: expected.passiveMasks })
+  scope.onmessage!({ data: { type: 'step' } })
+  expect(events[1]).toMatchObject({ type: 'frame', snapshot: { iteration: 1, density: expected.step().density } })
+})

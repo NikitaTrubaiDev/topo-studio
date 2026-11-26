@@ -193,7 +193,7 @@ export function surfaceMesh(problem: SimpProblem3D, surface: Surface3D, planes: 
 export function Viewport3D({ active, problem, density, mode, setMode, view, surface, frame, threshold, setThreshold }: {
   active: boolean
   problem: SimpProblem3D
-  density: Float64Array
+  density: Float64Array | undefined
   mode: ViewMode3D
   setMode: (mode: ViewMode3D) => void
   view: 'cad' | 'voxels' | 'stress'
@@ -252,7 +252,7 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
     if (!current) return
     const { model, planes, render } = current
     disposeGroup(model)
-    if (view === 'voxels') model.add(femMesh(problem, density, mode === 'auto' ? Math.min(0.12, threshold) : threshold, wireframe, planes))
+    if (view === 'voxels' && density) model.add(femMesh(problem, density, mode === 'auto' ? Math.min(0.12, threshold) : threshold, wireframe, planes))
     else if (surface?.triangles.length) model.add(surfaceMesh(problem, surface, planes, view === 'stress' ? frame : undefined))
     render()
   }, [active, problem, density, view, surface, frame, threshold, wireframe, mode])
@@ -296,8 +296,8 @@ export function Viewport3D({ active, problem, density, mode, setMode, view, surf
         </div>
         <p id="camera-hint-3d" className="camera-hint-3d">{t(cameraMode === 'nx' ? 'nxHint3d' : 'standardHint3d')}</p>
         {failed && <p role="alert" className="viewport-notice-3d">{t('webglError3d')}</p>}
-        {!failed && (view === 'voxels' ? mode === 'voxels' && !density.some(value => value >= threshold)
-          : !surface?.triangles.length) &&
+        {!failed && (view === 'voxels' ? mode === 'voxels' && density && !density.some(value => value >= threshold)
+          : surface && !surface.triangles.length) &&
           <p className="viewport-notice-3d">{t('noMaterial')} {t('helpThreshold')}</p>}
         {view === 'stress' && frame && <div className="scale stress-legend-3d">
           <div>{t('stress')} · {t('MPa')}</div>

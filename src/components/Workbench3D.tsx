@@ -2,12 +2,11 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode }
 import { useTranslation } from '../i18n'
 import { materials } from '../solver/presets'
 import type { MaterialId } from '../solver/project'
-import { exportObj3D, exportStl3D, isWatertight } from '../solver3d/export3d'
-import { extractSurface3D, maxSmoothingPasses3D, type Surface3D } from '../solver3d/marchingCubes'
+import { exportObj3D, exportStl3D } from '../solver3d/export3d'
+import { maxSmoothingPasses3D } from '../solver3d/marchingCubes'
 import { defaultParams3D, makePreset3D, presetGrid3D, presets3D, resolutions3D, type Preset3D } from '../solver3d/presets3d'
-import { Simp3D, validateProblem3D } from '../solver3d/simp3d'
-import { ProblemError3D, cellSize, elementCount, maxCellAspectRatio3D, type ElementType3D, type Grid3D, type ProblemIssue3D, type SimpParams3D, type Symmetry3D } from '../solver3d/types3d'
-import type { TimedSnapshot3D, WorkerCommand3D, WorkerEvent3D } from '../workers/protocol3d'
+import { cellSize, elementCount, maxCellAspectRatio3D, type ElementType3D, type Grid3D, type SimpProblem3D, type ProblemIssue3D, type SimpParams3D, type Symmetry3D } from '../solver3d/types3d'
+import type { Preview3D, SurfaceEvent3D, SurfaceInput3D, SurfaceRequest3D, TimedSnapshot3D, WorkerCommand3D, WorkerEvent3D } from '../workers/protocol3d'
 import { ConvergenceChart, type Sample } from './ConvergenceChart'
 import { download } from './ExportDialog'
 import { Tooltip, type TooltipMessage } from './Tooltip'
@@ -38,8 +37,9 @@ function LabeledControl({ id, name, tip, children }: { id: string; name: string;
   </div>
 }
 
-function ExportDialog3D({ surface, elementType, settings, change, close }: {
-  surface: Surface3D | undefined
+function ExportDialog3D({ result, pending, elementType, settings, change, close }: {
+  result: SurfaceEvent3D | undefined
+  pending: boolean
   elementType: ElementType3D
   settings: SurfaceSettings
   change: (next: SurfaceSettings) => void
@@ -48,13 +48,14 @@ function ExportDialog3D({ surface, elementType, settings, change, close }: {
   const { t, number, fixed } = useTranslation()
   const dialog = useRef<HTMLDialogElement>(null)
   const [exportError, setExportError] = useState(false)
-  const valid = useMemo(() => ({ obj: !!surface && isWatertight(surface), stl: !!surface && isWatertight(surface, true) }), [surface])
+  const surface = result?.type === 'surface' ? result.surface : undefined
+  const valid = result?.type === 'surface' ? result.valid : undefined
   useLayoutEffect(() => { dialog.current?.showModal() }, [])
   const triangles = (surface?.triangles.length ?? 0) / 3
   function save(format: 'stl' | 'obj') {
-    if (!surface || !valid[format]) return
+    if (!surface || !valid?.[format]) return
     try {
-      const data = format === 'stl' ? exportStl3D(surface) : exportObj3D(surface)
+      const data = format === 'stl' ? exportStl3D(surface, true) : exportObj3D(surface, true)
       download(data, format, format === 'stl' ? 'model/stl' : 'model/obj', 'topostudio-3d')
     } catch {
       setExportError(true)
@@ -81,13 +82,13 @@ function ExportDialog3D({ surface, elementType, settings, change, close }: {
     </div>
     <input id="taubin-3d" type="range" min={0} max={maxSmoothingPasses3D} value={settings.smoothing}
       onChange={event => adjust({ ...settings, smoothing: event.target.valueAsNumber })} />
-    <p className="contour-summary" aria-live="polite">{t('meshSummary3d')
+    <p className="contour-summary" aria-live="polite">{pending ? t('computingSurface3d') : surface && t('meshSummary3d')
       .replace('{vertices}', number((surface?.vertices.length ?? 0) / 3)).replace('{triangles}', number(triangles))}</p>
-    {!triangles && <p className="hint">{t('noMaterial')} {t('helpThreshold')}</p>}
-    {(exportError || (triangles > 0 && (!valid.obj || !valid.stl))) && <p className="error" role="alert">{t('meshError3d')}</p>}
+    {surface && !triangles && <p className="hint">{t('noMaterial')} {t('helpThreshold')}</p>}
+    {(exportError || result?.type === 'error' || (triangles > 0 && (!valid?.obj || !valid?.stl))) && <p className="error" role="alert">{t('meshError3d')}</p>}
     <div className="action-row export-actions">
-      <Tooltip message="hint3dStl"><button type="button" className="tool-button" disabled={!valid.stl} onClick={() => save('stl')}>{t('download').replace('{format}', '.STL')}</button></Tooltip>
-      <Tooltip message="hint3dObj"><button type="button" className="tool-button" disabled={!valid.obj} onClick={() => save('obj')}>{t('download').replace('{format}', '.OBJ')}</button></Tooltip>
+      <Tooltip message="hint3dStl"><button type="button" className="tool-button" disabled={!valid?.stl} onClick={() => save('stl')}>{t('download').replace('{format}', '.STL')}</button></Tooltip>
+      <Tooltip message="hint3dObj"><button type="button" className="tool-button" disabled={!valid?.obj} onClick={() => save('obj')}>{t('download').replace('{format}', '.OBJ')}</button></Tooltip>
     </div>
   </dialog>
 }
@@ -108,37 +109,94 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
   const [exportOpen, setExportOpen] = useState(false)
   const [settings, setSettings] = useState<SurfaceSettings>({ threshold: 0.5, smoothing: 4 })
   const worker = useRef<Worker | null>(null)
+  const previewRequest = useRef(0)
+  const surfaceRequest = useRef(0)
+  const [restart, setRestart] = useState(0)
+  const [previewResult, setPreviewResult] = useState<{
+    problem: SimpProblem3D; restart: number; preview?: Preview3D; failed?: boolean
+  }>()
+  const [surfaceResult, setSurfaceResult] = useState<{ input: SurfaceInput3D; result: SurfaceEvent3D }>()
   const grid = useMemo(() => ({ ...presetGrid3D(resolutions3D[resolution]), ...size }), [resolution, size])
   const problem = useMemo(() => makePreset3D(preset, grid, params, materials[material], elementType), [preset, grid, params, material, elementType])
-  const preview = useMemo(() => {
-    try {
-      // With no prescribed solids the exact starting field is constant on the allowed elements.
-      if (!problem.passive?.solid?.some(Boolean)) {
-        const setup = validateProblem3D(problem)
-        const value = params.volFrac * elementCount(grid) / setup.allowed
-        return { density: Float64Array.from(setup.voidMask, mask => mask ? 0 : value), passive: setup.brickMasks }
-      }
-      const solver = new Simp3D(problem)
-      return { density: solver.initialDensity(), passive: solver.passiveMasks }
-    } catch (cause) {
-      return { density: Float64Array.from({ length: elementCount(grid, elementType) }, (_, e) => {
-        const brick = elementType === 'tet4' ? Math.floor(e / 5) : e
-        return problem.passive?.void?.[brick] ? 0 : problem.passive?.solid?.[brick] ? 1 : params.volFrac
-      }),
-      passive: problem.passive, issue: cause instanceof ProblemError3D ? cause.code : 'workerError' as const }
-    }
-  }, [problem, grid, params, elementType])
-  const density = frame?.density ?? preview.density
+  const currentPreview = previewResult?.problem === problem && previewResult.restart === restart ? previewResult : undefined
+  const preview = currentPreview?.preview
+  const pendingPreview = !currentPreview
+  const density = frame?.density ?? preview?.density
   const view = mode === 'auto' ? frame && (state === 'paused' || state === 'complete') ? 'cad' : 'voxels' : mode
   const buildSurface = active && (view !== 'voxels' || exportOpen)
-  const surface = useMemo(() => buildSurface
-    ? extractSurface3D(density, problem.grid, settings.threshold, settings.smoothing, preview.passive, elementType)
-    : undefined, [density, problem.grid, settings, buildSurface, preview.passive, elementType])
+  const passive = preview?.passive
+  const surfaceInput = useMemo<SurfaceInput3D | undefined>(() => density &&
+    { density, grid, ...settings, passive, elementType }, [density, grid, settings, passive, elementType])
+  const exported = surfaceResult && surfaceResult.input === surfaceInput ? surfaceResult.result : undefined
+  const surface = exported?.type === 'surface' ? exported.surface : undefined
 
-  useEffect(() => () => {
-    worker.current?.terminate()
-    worker.current = null
-  }, [])
+  useEffect(() => {
+    const requestId = ++previewRequest.current
+    let instance: Worker | undefined
+    try {
+      instance = new Worker(new URL('../workers/simp3dWorker.ts', import.meta.url), { type: 'module' })
+      worker.current = instance
+      instance.onmessage = ({ data }: MessageEvent<WorkerEvent3D>) => {
+        if (instance !== worker.current || requestId !== previewRequest.current) return
+        if (data.type === 'preview') {
+          if (data.requestId === requestId) setPreviewResult({ problem, restart, preview: data })
+        } else if (data.type === 'frame') {
+          const { snapshot } = data
+          setFrame(snapshot)
+          setSamples(values => [...values, { iteration: snapshot.iteration, compliance: snapshot.compliance, volFrac: snapshot.volFrac }])
+          if (snapshot.done) {
+            setState('complete')
+            instance?.terminate()
+            worker.current = null
+          }
+        } else if (data.type === 'paused') setState('paused')
+        else if (data.type === 'done') setState('complete')
+        else {
+          setError(data)
+          setState('error')
+        }
+      }
+      instance.onerror = () => {
+        if (instance !== worker.current || requestId !== previewRequest.current) return
+        setPreviewResult(previous => previous?.problem === problem && previous.restart === restart
+          ? previous : { problem, restart, failed: true })
+        setError({ issue: 'workerError' })
+        setState('error')
+      }
+      instance.postMessage({ type: 'preview', requestId, problem } satisfies WorkerCommand3D)
+    } catch {
+      setPreviewResult({ problem, restart, failed: true })
+      setState('error')
+    }
+    return () => {
+      if (worker.current === instance) worker.current = null
+      instance?.terminate()
+    }
+  }, [problem, restart])
+
+  useEffect(() => {
+    if (!buildSurface || !surfaceInput || exported) return
+    const input = surfaceInput
+    const requestId = ++surfaceRequest.current
+    let instance: Worker | undefined
+    function receive(result: SurfaceEvent3D) {
+      if (requestId === surfaceRequest.current && result.requestId === requestId) {
+        setSurfaceResult({ input, result })
+      }
+    }
+    try {
+      instance = new Worker(new URL('../workers/surface3dWorker.ts', import.meta.url), { type: 'module' })
+      instance.onmessage = ({ data }: MessageEvent<SurfaceEvent3D>) => receive(data)
+      instance.onerror = () => receive({ type: 'error', requestId })
+      instance.postMessage({ ...input, requestId } satisfies SurfaceRequest3D)
+    } catch {
+      receive({ type: 'error', requestId })
+    }
+    return () => {
+      surfaceRequest.current++
+      instance?.terminate()
+    }
+  }, [buildSurface, surfaceInput, exported])
 
   useEffect(() => {
     if (!active && state === 'running') {
@@ -147,74 +205,42 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
     }
   }, [active, state])
 
-  function stopWorker() {
-    worker.current?.terminate()
-    worker.current = null
-  }
-
-  function reset() {
-    stopWorker()
+  function clearRun() {
     setFrame(undefined)
     setSamples([])
     setError(undefined)
     setState('ready')
   }
 
+  function reset() {
+    clearRun()
+    setRestart(current => current + 1)
+  }
+
   function setParam(key: keyof SimpParams3D, value: SimpParams3D[keyof SimpParams3D]) {
-    reset()
+    clearRun()
     setParams(current => ({ ...current, [key]: value }))
   }
 
   function selectPreset(next: Preset3D) {
-    reset()
+    clearRun()
     setPreset(next)
     setParams(current => incompatibleSymmetry(next, current.symmetry) ? { ...current, symmetry: 'none' } : current)
   }
 
   function send(type: 'start' | 'pause' | 'step') {
+    if (!worker.current) return
     try {
-      if (!worker.current) {
-        const instance = new Worker(new URL('../workers/simp3dWorker.ts', import.meta.url), { type: 'module' })
-        worker.current = instance
-        instance.onmessage = ({ data }: MessageEvent<WorkerEvent3D>) => {
-          if (instance !== worker.current) return
-          if (data.type === 'frame') {
-            const { snapshot } = data
-            setFrame(snapshot)
-            setSamples(values => [...values, { iteration: snapshot.iteration, compliance: snapshot.compliance, volFrac: snapshot.volFrac }])
-            if (snapshot.done) {
-              setState('complete')
-              stopWorker()
-            }
-          } else if (data.type === 'paused') setState('paused')
-          else if (data.type === 'done') {
-            setState('complete')
-            stopWorker()
-          } else {
-            setError(data)
-            setState('error')
-            stopWorker()
-          }
-        }
-        instance.onerror = () => {
-          if (instance !== worker.current) return
-          setError({ issue: 'workerError' })
-          setState('error')
-          stopWorker()
-        }
-        instance.postMessage({ type: 'init', problem } satisfies WorkerCommand3D)
-      }
       setState(type === 'start' ? 'running' : type === 'pause' ? 'pausing' : 'stepping')
       worker.current.postMessage({ type } satisfies WorkerCommand3D)
     } catch {
       setError({ issue: 'workerError' })
       setState('error')
-      stopWorker()
     }
   }
 
-  const canRun = !preview.issue && (state === 'ready' || state === 'paused')
-  const issue = preview.issue ?? error?.issue
+  const issue = preview?.issue ?? error?.issue ?? (currentPreview?.failed ? 'workerError' : undefined)
+  const canRun = !pendingPreview && !issue && (state === 'ready' || state === 'paused')
   const issueText = issue && t(issue).replace('{limit}', number(maxCellAspectRatio3D))
   const filterRadiusMm = params.rmin * Math.min(...cellSize(grid))
   const metrics = [
@@ -246,20 +272,20 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
           </LabeledControl>
           <p className="hint">{t(`${preset}Detail`)}</p>
           <LabeledControl id="element-type-3d" name={t('elementType3d')} tip="hint3dElementType">
-            <select id="element-type-3d" value={elementType} onChange={event => { reset(); setElementType(event.target.value as ElementType3D) }}>
+            <select id="element-type-3d" value={elementType} onChange={event => { clearRun(); setElementType(event.target.value as ElementType3D) }}>
               <option value="hex8">{t('hex8Elements3d')}</option>
               <option value="tet4">{t('tet4Elements3d')}</option>
             </select>
           </LabeledControl>
           <LabeledControl id="resolution-3d" name={t('resolution')} tip="hint3dResolution">
-            <select id="resolution-3d" value={resolution} onChange={event => { reset(); setResolution(Number(event.target.value)) }}>
+            <select id="resolution-3d" value={resolution} onChange={event => { clearRun(); setResolution(Number(event.target.value)) }}>
               {resolutions3D.map((value, i) => <option key={i} value={i}>{value.join(' × ')}</option>)}
             </select>
           </LabeledControl>
         </section>
         <section>
           <LabeledControl id="material-3d" name={t('material')} tip="tipMaterial">
-            <select id="material-3d" value={material} onChange={event => { reset(); setMaterial(event.target.value as MaterialId) }}>
+            <select id="material-3d" value={material} onChange={event => { clearRun(); setMaterial(event.target.value as MaterialId) }}>
               {materialIds.map(value => <option key={value} value={value}>{t(value)}</option>)}
             </select>
           </LabeledControl>
@@ -293,10 +319,10 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
           <h3>{t('geometry')}</h3>
           {dimensions.map(([key, label]) => <LabeledControl key={key} id={`${key}-3d`} name={`${t(label)} (${t('mm')})`} tip="hint3dDimensions">
             <input id={`${key}-3d`} className="field-input" type="number" min={1} max={10000} step="any" defaultValue={size[key]}
-              aria-describedby="aspect-ratio-3d" aria-invalid={preview.issue === 'aspectRatio3dError' || undefined}
+              aria-describedby="aspect-ratio-3d" aria-invalid={preview?.issue === 'aspectRatio3dError' || undefined}
               onBlur={event => {
                 const value = event.currentTarget.valueAsNumber
-                if (value >= 1 && value <= 10000 && value !== size[key]) { reset(); setSize(current => ({ ...current, [key]: value })) }
+                if (value >= 1 && value <= 10000 && value !== size[key]) { clearRun(); setSize(current => ({ ...current, [key]: value })) }
                 else event.currentTarget.value = String(size[key])
               }}
               onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }} />
@@ -308,7 +334,7 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
         <div className="result-header">
           <h2>{t(preset)}</h2>
           <div className="action-row result-actions">
-            <span className={`status status-${state}`} role="status"><i />{t(state)}</span>
+            <span className={`status status-${state}`} role="status"><i />{pendingPreview ? t('computingPreview3d') : t(state)}</span>
             <Tooltip message="hint3dExport"><button type="button" className="tool-button export-trigger" onClick={() => {
               if (state === 'running') send('pause')
               setExportOpen(true)
@@ -320,7 +346,9 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
         <Viewport3D active={active} problem={problem} density={density} mode={mode} setMode={setMode}
           view={mode === 'auto' && !surface?.triangles.length ? 'voxels' : view} surface={surface} frame={frame}
           threshold={settings.threshold} setThreshold={threshold => setSettings(current => ({ ...current, threshold }))} />
-        {exportOpen && <ExportDialog3D surface={surface} elementType={elementType} settings={settings} change={setSettings} close={() => setExportOpen(false)} />}
+        {exportOpen && <ExportDialog3D result={exported}
+          pending={pendingPreview || (!!density && !exported)} elementType={elementType}
+          settings={settings} change={setSettings} close={() => setExportOpen(false)} />}
         <section className="panel telemetry" aria-label={t('telemetry')}>
           <dl>{metrics.map(([label, tip, value, unit]) => (
             <div key={label}><dt><Tooltip message={tip} info={t(label)}>{t(label)}</Tooltip></dt><dd>{value}{unit && <span>{unit}</span>}</dd></div>
