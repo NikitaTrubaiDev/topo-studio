@@ -3,7 +3,7 @@
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import type { Preview3D, SurfaceEvent3D, SurfaceRequest3D, WorkerCommand3D } from '../../workers/protocol3d'
+import type { Preview3D, SurfaceEvent3D, SurfaceRequest3D, WorkerCommand3D, WorkerEvent3D } from '../../workers/protocol3d'
 import * as exports3D from '../../solver3d/export3d'
 import * as downloads from '../ExportDialog'
 import { nodePosition } from '../../solver3d/types3d'
@@ -13,7 +13,7 @@ vi.mock('../Viewport3D', () => ({ Viewport3D: () => null }))
 
 class ManualWorker {
   static instances: ManualWorker[] = []
-  onmessage?: (event: { data: Preview3D | SurfaceEvent3D }) => void
+  onmessage?: (event: { data: WorkerEvent3D | SurfaceEvent3D }) => void
   postMessage = vi.fn<(command: WorkerCommand3D | SurfaceRequest3D) => void>()
   terminate = vi.fn()
   constructor() { ManualWorker.instances.push(this) }
@@ -106,6 +106,31 @@ it('keeps controls responsive during high-resolution nonlinear Tet4 preview and 
   expect(mount.textContent).not.toContain('Preparing 3D preview')
   act(() => button('Play').click())
   expect(latest.postMessage).toHaveBeenLastCalledWith({ type: 'start' })
+})
+
+it.each(['hex8', 'tet4'])('keeps the solver engine control active after completing %s', elementType => {
+  if (elementType === 'tet4') select('#element-type-3d', elementType)
+  const worker = ManualWorker.instances.at(-1)!
+  preview(worker)
+  const receive = (data: WorkerEvent3D) => act(() => worker.onmessage?.({ data }))
+  receive({ type: 'engine', engine: 'wasm' })
+  act(() => button('Play').click())
+  receive({ type: 'frame', snapshot: {
+    iteration: 1, density: Float64Array.of(0.4), vonMises: Float64Array.of(1), displacements: [],
+    compliance: 12, volFrac: 0.4, change: 0.01, maxVonMises: 1, p95VonMises: 1, done: true, iterMs: 5,
+    metrics: { mass: 4, initialMass: 10, saved: 60, maxDeflection: 1 },
+  } })
+  expect(worker.terminate).not.toHaveBeenCalled()
+  const engine = mount.querySelector<HTMLButtonElement>('#solver-engine-3d')!
+  expect(engine.disabled).toBe(false)
+  act(() => engine.click())
+  expect(worker.postMessage).toHaveBeenLastCalledWith({ type: 'engine', engine: 'js' })
+  receive({ type: 'engine', engine: 'js' })
+  expect(engine.dataset.engine).toBe('js')
+  act(() => engine.click())
+  expect(worker.postMessage).toHaveBeenLastCalledWith({ type: 'engine', engine: 'wasm' })
+  receive({ type: 'engine', engine: 'wasm' })
+  expect(engine.dataset.engine).toBe('wasm')
 })
 
 it('cancels superseded surface jobs and downloads both formats using the cached validation', () => {

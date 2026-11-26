@@ -214,13 +214,7 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
           const { snapshot } = data
           setFrame(snapshot)
           setSamples(values => [...values, { iteration: snapshot.iteration, compliance: snapshot.compliance, volFrac: snapshot.volFrac }])
-          if (snapshot.done) {
-            setState('complete')
-            if (!isAdaptive) {
-              instance?.terminate()
-              worker.current = null
-            }
-          }
+          if (snapshot.done) setState('complete')
         } else if (data.type === 'paused') setState('paused')
         else if (data.type === 'done') setState('complete')
         else {
@@ -244,7 +238,7 @@ export default function Workbench3D({ active, header }: { active: boolean; heade
       if (worker.current === instance) worker.current = null
       instance?.terminate()
     }
-  }, [problem, restart, isAdaptive])
+  }, [problem, restart])
 
   useEffect(() => {
     if (!buildSurface || !surfaceInput || exported) return

@@ -178,9 +178,11 @@ export class Analysis3D {
   get engine(): SolverEngine3D { return this.backend ? 'wasm' : 'js' }
 
   setBackend(backend?: WasmBackend3D) {
-    this.wasm?.dispose()
+    if (this.backend === backend) return
+    const previous = this.wasm
     this.wasm = undefined
     this.backend = backend
+    previous?.dispose()
     if (backend) this.pcg = undefined
   }
 
@@ -211,14 +213,15 @@ export class Analysis3D {
     pcg?: Pcg3D<Stiffness3D | UnstructuredStiffness3D>) {
     const { B, D, stress, strain, vonMises, gradient, displacementNodes, matrices, width } = this
     const { E0, Emin } = this.problem.material
-    const nodes = wasm?.nodes, dofs = pcg?.dofs
-    const templateIndex = wasm?.templates ?? pcg!.stiffness.templateIndex
-    const modulus = wasm?.modulus ?? pcg!.modulus
+    const dofs = pcg?.dofs
     const corners = width / 3
     displacementNodes.set(this.loadedNodes)
-    for (let e = 0, offset = 0; e < density.length; e++, offset += width) {
-      if (density[e] < 0.25) continue
-      for (let j = 0; j < corners; j++) displacementNodes[nodes ? nodes[e * corners + j] : dofs![offset + 3 * j] / 3] = 1
+    {
+      const nodes = wasm?.nodes
+      for (let e = 0, offset = 0; e < density.length; e++, offset += width) {
+        if (density[e] < 0.25) continue
+        for (let j = 0; j < corners; j++) displacementNodes[nodes ? nodes[e * corners + j] : dofs![offset + 3 * j] / 3] = 1
+      }
     }
     let compliance = 0, maxDeflection = 0
     gradient.fill(0)
@@ -228,6 +231,10 @@ export class Analysis3D {
       const wasmResult = wasm?.solve(force, u, tolerance)
       const result = wasmResult ?? pcg!.solve(force, u, tolerance)
       if (!result.converged) throw new ProblemError3D('solve3dError', result.relativeResidual)
+      // A solve can grow linear memory, invalidating every existing view.
+      const nodes = wasm?.nodes
+      const templateIndex = wasm?.templates ?? pcg!.stiffness.templateIndex
+      const modulus = wasm?.modulus ?? pcg!.modulus
       if (wasmResult) compliance += wasmResult.compliance
       for (let d = 0; d < u.length; d += 3) {
         if (!wasm) compliance += force[d] * u[d] + force[d + 1] * u[d + 1] + force[d + 2] * u[d + 2]

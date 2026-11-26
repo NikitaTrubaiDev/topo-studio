@@ -1,4 +1,4 @@
-use crate::elements::{CORNERS, Elements, Grid};
+use crate::elements::{CORNERS, Elements, Grid, nodal_product};
 use core::arch::wasm32::*;
 
 // Structured levels use geometric neighbor blocks for GS smoothing only.
@@ -124,12 +124,36 @@ impl NodalBlocks {
 
     pub fn prepare_adaptive(&mut self, elements: &Elements, modulus: &[f64], inverse: &mut [f64]) {
         self.blocks.fill([0.; 9]);
-        let mut ke = [0.; 144];
         for batch in elements.coloring.batches() {
             for &e in batch {
                 let e = e as usize;
-                elements.expand_adaptive_matrix(e, &mut ke);
-                self.assemble(e, elements.connectivity(e), &ke, modulus[e]);
+                let active: [[f64; 3]; 4] = std::array::from_fn(|i| {
+                    self.active[elements.nodes[4 * e + i] as usize]
+                });
+                let blocks = elements.adaptive_blocks(e);
+                let slots = &self.slots[16 * e..16 * (e + 1)];
+                for (i, [x, y, z]) in active.into_iter().enumerate() {
+                    let xy = f64x2_mul(f64x2(x, y), f64x2_splat(modulus[e]));
+                    let z = z * modulus[e];
+                    for (j, [a, b, c]) in active.into_iter().enumerate() {
+                        let k = 4 * i + j;
+                        let block = &mut self.blocks[slots[k]];
+                        let ke = &blocks[k];
+                        // The first six entries hold three interleaved x/y pairs.
+                        for (pair, mask) in [a, b, c].into_iter().enumerate() {
+                            let p = 2 * pair;
+                            unsafe {
+                                let dst = block.as_mut_ptr().add(p).cast();
+                                let stiffness = v128_load(ke.as_ptr().add(p).cast());
+                                let scaled = f64x2_mul(f64x2_mul(xy, stiffness), f64x2_splat(mask));
+                                v128_store(dst, f64x2_add(v128_load(dst), scaled));
+                            }
+                        }
+                        block[6] += z * ke[6] * a;
+                        block[7] += z * ke[7] * b;
+                        block[8] += z * ke[8] * c;
+                    }
+                }
             }
         }
         self.finish_diagonal(0.);
@@ -182,15 +206,9 @@ impl NodalBlocks {
         let range = self.starts[node]..self.starts[node + 1];
         for (&col, b) in self.columns[range.clone()].iter().zip(&self.blocks[range]) {
             // Column indices always identify a complete three-component node.
-            let [a, c, d] = <[f64; 3]>::try_from(&input[col..col + 3]).unwrap();
-            let lanes = unsafe {
-                let p = b.as_ptr();
-                f64x2_add(f64x2_add(f64x2_mul(v128_load(p.cast()), f64x2_splat(a)),
-                    f64x2_mul(v128_load(p.add(2).cast()), f64x2_splat(c))),
-                    f64x2_mul(v128_load(p.add(4).cast()), f64x2_splat(d)))
-            };
-            xy = f64x2_add(xy, lanes);
-            z += b[6] * a + b[7] * c + b[8] * d;
+            let (product_xy, product_z) = nodal_product(b, input[col..col + 3].try_into().unwrap());
+            xy = f64x2_add(xy, product_xy);
+            z += product_z;
         }
         [f64x2_extract_lane::<0>(xy), f64x2_extract_lane::<1>(xy), z]
     }

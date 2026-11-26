@@ -5,7 +5,75 @@ import type { WorkerCommand3D, WorkerEvent3D } from '../protocol3d'
 afterEach(() => {
   vi.useRealTimers()
   vi.unstubAllGlobals()
+  vi.restoreAllMocks()
   vi.resetModules()
+})
+
+it('posts preview while WASM is pending and ignores readiness from a superseded request', async () => {
+  const events: WorkerEvent3D[] = []
+  const scope = {
+    onmessage: undefined as ((event: { data: WorkerCommand3D }) => void) | undefined,
+    postMessage(event: WorkerEvent3D, transfer: ArrayBuffer[]) {
+      events.push(structuredClone(event, { transfer }))
+    },
+  }
+  vi.stubGlobal('self', scope)
+  const wasm = await import('../../solver3d/wasmBackend')
+  const backend = await wasm.loadWasmBackend3D()
+  expect(backend).toBeDefined()
+  let resolve!: (backend: Awaited<ReturnType<typeof wasm.loadWasmBackend3D>>) => void
+  const pending = new Promise<typeof backend>(done => { resolve = done })
+  vi.spyOn(wasm, 'loadWasmBackend3D').mockReturnValueOnce(pending)
+  await import('../simp3dWorker')
+  const problem = makePreset3D('cantilever3d', presetGrid3D([6, 4, 4]))
+  const send = (data: WorkerCommand3D) => scope.onmessage!({ data })
+
+  send({ type: 'preview', problem, requestId: 17, engine: 'wasm' })
+  expect(events).toEqual([expect.objectContaining({ type: 'preview', requestId: 17, density: expect.any(Float64Array) })])
+  send({ type: 'step' })
+  expect(events[1]).toMatchObject({ type: 'frame', snapshot: { iteration: 1 } })
+  send({ type: 'engine', engine: 'js' })
+  resolve(backend)
+  await pending
+  expect(events.filter(event => event.type === 'engine')).toEqual([{ type: 'engine', engine: 'js' }])
+  expect(events.filter(event => event.type === 'preview')).toHaveLength(1)
+})
+
+it.each(['hex8', 'tet4'] as const)('switches engines after a finished %s run without restarting it', async elementType => {
+  const events: WorkerEvent3D[] = []
+  const scope = {
+    onmessage: undefined as ((event: { data: WorkerCommand3D }) => void) | undefined,
+    postMessage(event: WorkerEvent3D, transfer: ArrayBuffer[]) {
+      events.push(structuredClone(event, { transfer }))
+    },
+  }
+  vi.stubGlobal('self', scope)
+  const wasm = await import('../../solver3d/wasmBackend')
+  const backend = await wasm.loadWasmBackend3D()
+  expect(backend).toBeDefined()
+  const tracked = new wasm.WasmBackend3D({ ...backend!.abi })
+  const drop = vi.spyOn(tracked.abi, 'solver_drop')
+  vi.spyOn(wasm, 'loadWasmBackend3D').mockResolvedValue(tracked)
+  await import('../simp3dWorker')
+  const problem = makePreset3D('cantilever3d', presetGrid3D([6, 4, 4]),
+    { ...defaultParams3D, maxIter: 1 }, undefined, elementType)
+  const send = (data: WorkerCommand3D) => scope.onmessage!({ data })
+
+  send({ type: 'preview', problem, requestId: 19, engine: 'wasm' })
+  await Promise.resolve()
+  expect(events.at(-1)).toEqual({ type: 'engine', engine: 'wasm' })
+  send({ type: 'step' })
+  expect(events.at(-1)).toMatchObject({ type: 'frame', snapshot: { iteration: 1, done: true } })
+  send({ type: 'engine', engine: 'js' })
+  expect(events.at(-1)).toEqual({ type: 'engine', engine: 'js' })
+  expect(drop).toHaveBeenCalledTimes(1)
+  send({ type: 'engine', engine: 'wasm' })
+  await Promise.resolve()
+  expect(events.at(-1)).toEqual({ type: 'engine', engine: 'wasm' })
+  send({ type: 'step' })
+  expect(events.at(-1)).toEqual({ type: 'done' })
+  expect(events.filter(event => event.type === 'frame')).toHaveLength(1)
+  send({ type: 'reset' })
 })
 
 it('transfers frames and preserves warm state across step, pause, and resume until reset', async () => {

@@ -151,7 +151,7 @@ it('falls back cleanly when the WASM module cannot instantiate', async () => {
   }
 })
 
-it('supports forced JS, preserves iteration history across switches, and falls back on a WASM trap', async () => {
+it('preserves iteration history and falls back when both WASM solve and drop trap', async () => {
   const problem = problemFor('hex8', false, [12, 6, 4])
   const js = new Simp3D(problem)
   const switched = new Simp3D(problem, undefined, undefined, await loadWasmBackend3D('js'))
@@ -162,12 +162,61 @@ it('supports forced JS, preserves iteration history across switches, and falls b
   expect(switched.engine).toBe('wasm')
   switched.setBackend()
   const failure = new WebAssembly.RuntimeError('simulated kernel trap')
+  const drop = vi.fn(() => { throw failure })
+  const separate = (await loadWasmBackend3D())!
   const failing = new WasmBackend3D({
-    ...backend.abi, solver_solve() { throw failure },
+    ...separate.abi, solver_solve() { throw failure }, solver_drop: drop,
   })
   switched.setBackend(failing)
   const frame = switched.step()
   expect(switched.engine).toBe('js')
   expect(frame.iteration).toBe(3)
   relative(frame.density, js.step().density)
+  switched.setBackend()
+  relative(switched.step().vonMises, js.step().vonMises)
+  expect(drop).toHaveBeenCalledTimes(1)
+})
+
+it('recovers stress from current memory views when each WASM solve grows memory', () => {
+  const problem = problemFor('tet4', false, [6, 4, 4])
+  const { fixed, forces, voidMask } = validateProblem3D(problem)
+  const loads = [...forces, forces[0].map(value => 0.75 * value)]
+  const expected = new Analysis3D(problem, fixed, loads, backend)
+  const growDuringSolve = vi.fn((handle: number, tolerance: number, limit: number) => {
+    backend.abi.memory.grow(1)
+    return backend.abi.solver_solve(handle, tolerance, limit)
+  })
+  const actual = new Analysis3D(problem, fixed, loads, new WasmBackend3D({ ...backend.abi, solver_solve: growDuringSolve }))
+  try {
+    const density = Float64Array.from(voidMask, mask => mask ? 0 : 0.4)
+    expect(actual.solve(density, 3, 1e-8)).toEqual(expected.solve(density, 3, 1e-8))
+    expect(growDuringSolve).toHaveBeenCalledTimes(loads.length)
+    expect(actual.engine).toBe('wasm')
+    expect(actual.vonMises).toEqual(expected.vonMises)
+    expect(actual.gradient).toEqual(expected.gradient)
+  } finally {
+    actual.setBackend()
+    expected.setBackend()
+  }
+})
+
+it('reassembles adaptive nodal blocks for new moduli while preserving sensitivities and stress', () => {
+  const problem = problemFor('adaptiveTet4', true, [12, 6, 4])
+  const { fixed, forces, voidMask } = validateProblem3D(problem)
+  const js = new Analysis3D(problem, fixed, forces)
+  const wasm = new Analysis3D(problem, fixed, forces, backend)
+  try {
+    for (const phase of [0, 1.4]) {
+      const density = Float64Array.from(voidMask, (mask, e) => mask ? 0 : 0.55 + 0.25 * Math.sin(phase + e))
+      const expected = js.solve(density, 3, 1e-8)
+      const actual = wasm.solve(density, 3, 1e-8)
+      expect(wasm.engine).toBe('wasm')
+      relative([actual.compliance, actual.maxDeflection], [expected.compliance, expected.maxDeflection])
+      relative(wasm.gradient, js.gradient)
+      relative(wasm.vonMises, js.vonMises)
+      relative(wasm.displacements[0], js.displacements[0])
+    }
+  } finally {
+    wasm.setBackend()
+  }
 })

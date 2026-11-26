@@ -256,9 +256,10 @@ export class UnstructuredConeFilter3D {
   }
 
   setBackend(backend?: WasmBackend3D) {
-    this.wasm?.dispose()
+    const previous = this.wasm
     this.wasm = undefined
     this.wasmRows = 0
+    previous?.dispose()
     if (!backend || !this.cachedRows) return
     const { starts, columns, weights, cachedRows } = this
     // Retain the JS cache for live switching and respect the AMR budget.

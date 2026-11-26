@@ -97,7 +97,7 @@ pub struct Elements {
     pub per_brick: usize,
     pub width: usize,
     matrices: Vec<f64>,
-    compact: Vec<[[f64; 4]; 21]>,
+    adaptive_blocks: Vec<[[f64; 9]; 16]>,
 }
 
 impl Elements {
@@ -127,32 +127,29 @@ impl Elements {
         }
         Self {
             nodes, templates, coloring: Coloring::bricks(grid), per_brick, width,
-            matrices: matrices.to_vec(), compact: Vec::new(),
+            matrices: matrices.to_vec(), adaptive_blocks: Vec::new(),
         }
     }
 
     pub fn adaptive(nodes: &[u32], templates: &[u32], fixed: &[u8], packed: &[f64]) -> Self {
-        // Repack the 78 unique entries into triangular SIMD blocks. Only the
-        // off-diagonal entry of each diagonal block is duplicated.
-        let compact = packed.chunks_exact(78).map(|ke| {
+        // Pack each template once in the nodal operator's SIMD layout.
+        let adaptive_blocks = packed.chunks_exact(78).map(|ke| {
             let coeff = |a: usize, b: usize| {
                 let (i, j) = (a.min(b), a.max(b));
                 ke[i * (25 - i) / 2 + j - i]
             };
-            let mut blocks = [[0.; 4]; 21];
-            let mut k = 0;
-            for i in (0..12).step_by(2) {
-                for j in (i..12).step_by(2) {
-                    blocks[k] = [coeff(i, j), coeff(i + 1, j), coeff(i, j + 1), coeff(i + 1, j + 1)];
-                    k += 1;
-                }
-            }
-            blocks
+            std::array::from_fn(|block| {
+                let i = 3 * (block / 4);
+                let j = 3 * (block % 4);
+                [coeff(i, j), coeff(i + 1, j), coeff(i, j + 1), coeff(i + 1, j + 1),
+                    coeff(i, j + 2), coeff(i + 1, j + 2),
+                    coeff(i + 2, j), coeff(i + 2, j + 1), coeff(i + 2, j + 2)]
+            })
         }).collect();
         Self {
             nodes: nodes.to_vec(), templates: templates.to_vec(),
             coloring: Coloring::tetrahedra(nodes, fixed.len() / 3),
-            per_brick: 1, width: 12, matrices: Vec::new(), compact,
+            per_brick: 1, width: 12, matrices: Vec::new(), adaptive_blocks,
         }
     }
 
@@ -162,23 +159,8 @@ impl Elements {
         &self.matrices[start..start + width]
     }
 
-    pub fn expand_adaptive_matrix(&self, e: usize, matrix: &mut [f64; 144]) {
-        let ke = &self.compact[self.templates[e] as usize];
-        let mut k = 0;
-        for i in (0..12).step_by(2) {
-            for j in (i..12).step_by(2) {
-                let [a, b, c, d] = ke[k];
-                matrix[12 * i + j] = a;
-                matrix[12 * j + i] = a;
-                matrix[12 * (i + 1) + j] = b;
-                matrix[12 * j + i + 1] = b;
-                matrix[12 * i + j + 1] = c;
-                matrix[12 * (j + 1) + i] = c;
-                matrix[12 * (i + 1) + j + 1] = d;
-                matrix[12 * (j + 1) + i + 1] = d;
-                k += 1;
-            }
-        }
+    pub fn adaptive_blocks(&self, e: usize) -> &[[f64; 9]; 16] {
+        &self.adaptive_blocks[self.templates[e] as usize]
     }
 
     pub fn connectivity(&self, e: usize) -> &[u32] {
@@ -219,20 +201,39 @@ impl Elements {
     }
 
     pub fn energy(&self, input: &[f64], energy: &mut [f64]) {
-        self.dispatch::<true>(input, energy, &[]);
-    }
-
-    fn dispatch<const ENERGY: bool>(&self, input: &[f64], output: &mut [f64], modulus: &[f64]) {
-        if ENERGY && !self.compact.is_empty() {
-            self.sweep::<12, 4, true, ENERGY>(input, output, modulus);
-        } else if self.width == 12 {
-            self.sweep::<12, 4, false, ENERGY>(input, output, modulus);
-        } else {
-            self.sweep::<24, 8, false, ENERGY>(input, output, modulus);
+        if self.adaptive_blocks.is_empty() {
+            self.dispatch::<true>(input, energy, &[]);
+            return;
+        }
+        for (e, value) in energy.iter_mut().enumerate() {
+            let nodes = self.connectivity(e);
+            let q: [[f64; 3]; 4] = std::array::from_fn(|i| {
+                let d = 3 * nodes[i] as usize;
+                input[d..d + 3].try_into().unwrap()
+            });
+            *value = 0.;
+            for (row, [x, y, z]) in self.adaptive_blocks(e).chunks_exact(4).zip(q) {
+                let mut xy = f64x2_splat(0.);
+                let mut sum_z = 0.;
+                for (block, components) in row.iter().zip(q) {
+                    let (product_xy, product_z) = nodal_product(block, components);
+                    xy = f64x2_add(xy, product_xy);
+                    sum_z += product_z;
+                }
+                *value += x * f64x2_extract_lane::<0>(xy) + y * f64x2_extract_lane::<1>(xy) + z * sum_z;
+            }
         }
     }
 
-    fn sweep<const W: usize, const N: usize, const COMPACT: bool, const ENERGY: bool>(
+    fn dispatch<const ENERGY: bool>(&self, input: &[f64], output: &mut [f64], modulus: &[f64]) {
+        if self.width == 12 {
+            self.sweep::<12, 4, ENERGY>(input, output, modulus);
+        } else {
+            self.sweep::<24, 8, ENERGY>(input, output, modulus);
+        }
+    }
+
+    fn sweep<const W: usize, const N: usize, const ENERGY: bool>(
         &self, input: &[f64], output: &mut [f64], modulus: &[f64],
     ) {
         for batch in self.coloring.batches() {
@@ -243,12 +244,8 @@ impl Elements {
                     let nodes: &[u32; N] = self.connectivity(e).try_into().unwrap();
                     let q: [f64; W] = std::array::from_fn(|i| input[3 * nodes[i / 3] as usize + i % 3]);
                     let mut product = [0.; W];
-                    if COMPACT {
-                        compact_product(&self.compact[self.templates[e] as usize], &q, &mut product);
-                    } else {
-                        for (row, out) in self.matrix(e).chunks_exact(W).zip(&mut product) {
-                            *out = row_dot::<W>(row, &q);
-                        }
+                    for (row, out) in self.matrix(e).chunks_exact(W).zip(&mut product) {
+                        *out = row_dot::<W>(row, &q);
                     }
                     if ENERGY {
                         output[e] = row_dot::<W>(&product, &q);
@@ -286,27 +283,13 @@ fn row_dot<const W: usize>(a: &[f64], b: &[f64; W]) -> f64 {
 }
 
 #[inline]
-fn compact_product(ke: &[[f64; 4]; 21], q: &[f64], out: &mut [f64]) {
-    let mut sums = [f64x2_splat(0.); 6];
-    let mut k = 0;
-    for i in 0..6 {
-        for j in i..6 {
-            let [a, b, c, d] = ke[k];
-            let direct = f64x2_add(f64x2_mul(f64x2(a, b), f64x2_splat(q[2 * j])),
-                f64x2_mul(f64x2(c, d), f64x2_splat(q[2 * j + 1])));
-            sums[i] = f64x2_add(sums[i], direct);
-            if i != j {
-                let transposed = f64x2_add(
-                    f64x2_mul(f64x2(a, c), f64x2_splat(q[2 * i])),
-                    f64x2_mul(f64x2(b, d), f64x2_splat(q[2 * i + 1])),
-                );
-                sums[j] = f64x2_add(sums[j], transposed);
-            }
-            k += 1;
-        }
-    }
-    for (pair, value) in out.chunks_exact_mut(2).zip(sums) {
-        pair[0] = f64x2_extract_lane::<0>(value);
-        pair[1] = f64x2_extract_lane::<1>(value);
-    }
+pub fn nodal_product(block: &[f64; 9], [a, b, c]: [f64; 3]) -> (v128, f64) {
+    // The x and y rows are interleaved at the start of each block.
+    let xy = unsafe {
+        let p = block.as_ptr();
+        f64x2_add(f64x2_add(f64x2_mul(v128_load(p.cast()), f64x2_splat(a)),
+            f64x2_mul(v128_load(p.add(2).cast()), f64x2_splat(b))),
+            f64x2_mul(v128_load(p.add(4).cast()), f64x2_splat(c)))
+    };
+    (xy, block[6] * a + block[7] * b + block[8] * c)
 }

@@ -30,22 +30,22 @@ function stop() {
 function reset() {
   stop()
   engineRequest++
-  solver?.setBackend()
+  const previous = solver
   backend = undefined
   solver = undefined
   problem = undefined
   finished = false
   latest = undefined
+  previous?.setBackend()
 }
 
-async function selectEngine(engine: SolverEngine3D, preview?: Preview3D) {
+async function selectEngine(engine: SolverEngine3D) {
   const request = ++engineRequest
   const next = engine === 'wasm' ? backend ?? await loadWasmBackend3D() : undefined
   if (request !== engineRequest) return
   backend = next
   solver?.setBackend(backend)
   send({ type: 'engine', engine: backend ? 'wasm' : 'js' })
-  if (preview) send(preview, [preview.density.buffer])
 }
 
 function reportEngineFallback(next: Simp3D) {
@@ -99,8 +99,8 @@ function preview(requestId: number, next: SimpProblem3D, engine?: SolverEngine3D
     })
     event = { type: 'preview', requestId, density, passive, issue: error instanceof ProblemError3D ? error.code : 'workerError' }
   }
-  if (engine) void selectEngine(engine, event)
-  else send(event, [event.density.buffer])
+  send(event, [event.density.buffer])
+  if (engine) void selectEngine(engine)
 }
 
 function ensureSolver() {

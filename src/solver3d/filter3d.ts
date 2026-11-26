@@ -116,8 +116,9 @@ export class DensityFilter3D {
   }
 
   setBackend(backend?: WasmBackend3D) {
-    this.wasm?.dispose()
+    const previous = this.wasm
     this.wasm = undefined
+    previous?.dispose()
     if (!backend) return
     const { nelx, nely, nelz } = this.grid
     const { perCell, inverseWeight } = this

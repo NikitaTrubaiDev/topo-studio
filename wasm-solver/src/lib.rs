@@ -4,7 +4,44 @@ mod multigrid;
 
 use elements::{Elements, Grid};
 use multigrid::{Multigrid, NodalBlocks};
-use std::{alloc::{alloc, dealloc, Layout}, slice};
+use std::{
+    alloc::{alloc_zeroed, dealloc, Layout},
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    mem::{align_of, size_of},
+    ptr, slice,
+};
+
+struct Allocation {
+    pointer: *mut u8,
+    bytes: usize,
+    layout: Layout,
+}
+
+type Allocations = BTreeMap<usize, Allocation>;
+
+thread_local! {
+    static ALLOCATIONS: RefCell<Allocations> = const { RefCell::new(BTreeMap::new()) };
+    static SOLVERS: RefCell<BTreeMap<u32, Box<Solver>>> = const { RefCell::new(BTreeMap::new()) };
+    static NEXT_HANDLE: Cell<u32> = const { Cell::new(1) };
+}
+
+fn checked_bytes<T>(len: usize) -> Option<usize> {
+    len.checked_mul(size_of::<T>()).filter(|&bytes| bytes <= isize::MAX as usize)
+}
+
+fn abi_pointer<T>(allocations: &Allocations, pointer: *const T, len: usize) -> Option<*mut T> {
+    let allocation = allocations.get(&(pointer as usize))?;
+    (pointer.is_aligned() && allocation.bytes == checked_bytes::<T>(len)?)
+        .then(|| allocation.pointer.cast())
+}
+
+// The caller holds the allocation-table borrow and must keep mutable views
+// disjoint from all other views. ABI types contain only integer and float data.
+unsafe fn abi_slice<T>(allocations: &Allocations, pointer: *const T, len: usize) -> Option<&[T]> {
+    let pointer = abi_pointer(allocations, pointer, len)?;
+    Some(unsafe { slice::from_raw_parts(pointer, len) })
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wasm_simd_enabled() -> u32 {
@@ -14,12 +51,25 @@ pub extern "C" fn wasm_simd_enabled() -> u32 {
 // Scratch allocations are eight-byte aligned for all ABI array types.
 #[unsafe(no_mangle)]
 pub extern "C" fn wasm_alloc(bytes: usize) -> *mut u8 {
-    unsafe { alloc(Layout::from_size_align(bytes.max(1), 8).unwrap()) }
+    let Ok(layout) = Layout::from_size_align(bytes.max(1), align_of::<f64>()) else { return ptr::null_mut() };
+    // Raw callers may leave parts of their staging allocations unwritten.
+    let pointer = unsafe { alloc_zeroed(layout) };
+    if !pointer.is_null() {
+        ALLOCATIONS.with_borrow_mut(|allocations| {
+            allocations.insert(pointer as usize, Allocation { pointer, bytes, layout });
+        });
+    }
+    pointer
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wasm_dealloc(ptr: *mut u8, bytes: usize) {
-    unsafe { dealloc(ptr, Layout::from_size_align(bytes.max(1), 8).unwrap()) }
+pub extern "C" fn wasm_dealloc(pointer: *mut u8, bytes: usize) -> i32 {
+    ALLOCATIONS.with_borrow_mut(|allocations| {
+        if abi_pointer(allocations, pointer, bytes).is_none() { return -1; }
+        let allocation = allocations.remove(&(pointer as usize)).unwrap();
+        unsafe { dealloc(allocation.pointer, allocation.layout) };
+        0
+    })
 }
 
 struct Solver {
@@ -200,80 +250,132 @@ impl Solver {
     }
 }
 
-// Input slices must refer to live, aligned WASM allocations. Constructors
-// retain their own topology, so the caller can release the staging buffers.
+fn register_solver(solver: Solver) -> Option<u32> {
+    let handle = NEXT_HANDLE.with(|next| {
+        let handle = next.get();
+        next.set(handle.checked_add(1)?);
+        Some(handle)
+    })?;
+    SOLVERS.with_borrow_mut(|solvers| solvers.insert(handle, Box::new(solver)));
+    Some(handle)
+}
+
+// Constructors copy validated staging buffers into their own storage.
 #[unsafe(no_mangle)]
-unsafe extern "C" fn solver_structured(
+extern "C" fn solver_structured(
     nx: usize, ny: usize, nz: usize, fixed: *const u8,
     ke: *const f64, corners: *const u8, coarse_ke: *const f64, levels: usize,
-) -> *mut Solver {
-    let grid = Grid([nx, ny, nz]);
-    let tet = !corners.is_null();
-    let (fixed, ke, tet_corners, coarse_ke) = unsafe {
-        (slice::from_raw_parts(fixed, grid.nodes() * 3),
-            slice::from_raw_parts(ke, if tet { 1440 } else { 576 }),
-            if tet { slice::from_raw_parts(corners, 40) } else { &[] },
-            slice::from_raw_parts(coarse_ke, levels * 576))
-    };
-    let elements = Elements::structured(grid, ke, tet_corners);
-    let mg = (levels != 0).then(|| Multigrid::new(grid, &elements, fixed, coarse_ke));
-    Box::into_raw(Box::new(Solver::new(elements, fixed, mg, None)))
+) -> u32 {
+    ALLOCATIONS.with_borrow(|allocations| {
+        let grid = Grid([nx, ny, nz]);
+        let tet = !corners.is_null();
+        if grid.0.contains(&0) { return None; }
+        let nodes = grid.0.iter().try_fold(1usize, |product, &n| product.checked_mul(n.checked_add(1)?))?;
+        let dofs = nodes.checked_mul(3)?;
+        checked_bytes::<f64>(dofs)?;
+        let elements = nx.checked_mul(ny)?.checked_mul(nz)?.checked_mul(if tet { 5 } else { 1 })?;
+        let width = if tet { 4 } else { 8 };
+        checked_bytes::<u32>(elements.checked_mul(width)?)?;
+        if levels != 0 {
+            checked_bytes::<[f64; 9]>(nodes.checked_mul(27)?)?;
+            checked_bytes::<usize>(elements.checked_mul(width * width)?)?;
+        }
+        let mut coarse = grid;
+        for _ in 0..levels { coarse = coarse.coarse()?; }
+        let (fixed, ke, tet_corners, coarse_ke) = unsafe {
+            (abi_slice(allocations, fixed, dofs)?,
+                abi_slice(allocations, ke, if tet { 1440 } else { 576 })?,
+                if tet { abi_slice(allocations, corners, 40)? } else { &[] },
+                abi_slice(allocations, coarse_ke, levels.checked_mul(576)?)?)
+        };
+        // A structured Tet4 stencil omits links across a brick's long diagonal.
+        for nodes in tet_corners.chunks_exact(4) {
+            for (i, &node) in nodes.iter().enumerate() {
+                if node >= 8 || nodes[..i].iter().any(|&other| other == node || other ^ node == 7) {
+                    return None;
+                }
+            }
+        }
+        let elements = Elements::structured(grid, ke, tet_corners);
+        let mg = (levels != 0).then(|| Multigrid::new(grid, &elements, fixed, coarse_ke));
+        register_solver(Solver::new(elements, fixed, mg, None))
+    }).unwrap_or_default()
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn solver_adaptive(
+extern "C" fn solver_adaptive(
     dofs: usize, fixed: *const u8, count: usize, nodes: *const u32, templates: *const u32,
     packed: *const f64, template_count: usize,
-) -> *mut Solver {
-    let (fixed, elements) = unsafe {
-        let fixed = slice::from_raw_parts(fixed, dofs);
-        let elements = Elements::adaptive(slice::from_raw_parts(nodes, 4 * count),
-            slice::from_raw_parts(templates, count), fixed, slice::from_raw_parts(packed, 78 * template_count));
-        (fixed, elements)
-    };
-    let operator = NodalBlocks::adaptive(&elements, fixed);
-    Box::into_raw(Box::new(Solver::new(elements, fixed, None, Some(operator))))
+) -> u32 {
+    ALLOCATIONS.with_borrow(|allocations| {
+        if dofs == 0 || dofs % 3 != 0 || count == 0 || template_count == 0 { return None; }
+        let node_count = dofs / 3;
+        checked_bytes::<f64>(dofs)?;
+        checked_bytes::<[f64; 9]>(count.checked_mul(12)?.checked_add(node_count)?)?;
+        checked_bytes::<[[f64; 9]; 16]>(template_count)?;
+        let (fixed, nodes, templates, packed) = unsafe {
+            (abi_slice(allocations, fixed, dofs)?,
+                abi_slice(allocations, nodes, count.checked_mul(4)?)?,
+                abi_slice(allocations, templates, count)?,
+                abi_slice(allocations, packed, template_count.checked_mul(78)?)?)
+        };
+        if nodes.iter().any(|&node| node as usize >= node_count)
+            || templates.iter().any(|&template| template as usize >= template_count) {
+            return None;
+        }
+        let elements = Elements::adaptive(nodes, templates, fixed, packed);
+        let operator = NodalBlocks::adaptive(&elements, fixed);
+        register_solver(Solver::new(elements, fixed, None, Some(operator)))
+    }).unwrap_or_default()
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn solver_drop(handle: *mut Solver) {
-    unsafe { drop(Box::from_raw(handle)) };
+extern "C" fn solver_drop(handle: u32) -> i32 {
+    SOLVERS.with_borrow_mut(|solvers| if solvers.remove(&handle).is_some() { 0 } else { -1 })
 }
 
 // Buffer addresses are stable for the life of a solver. JS must recreate typed
 // views if another allocation grows linear memory and detaches its old buffer.
 #[unsafe(no_mangle)]
-unsafe extern "C" fn solver_buffer(handle: *mut Solver, field: u32) -> *const u8 {
-    let s = unsafe { &mut *handle };
-    match field {
-        0 => s.modulus.as_mut_ptr().cast(),
-        1 => s.force.as_mut_ptr().cast(),
-        2 => s.u.as_mut_ptr().cast(),
-        3 => s.gradient.as_ptr().cast(),
-        4 => s.stats.as_ptr().cast(),
-        5 => s.elements.nodes.as_ptr().cast(),
-        6 => s.elements.templates.as_ptr().cast(),
-        7 => s.elements.coloring.starts.as_ptr().cast(),
-        8 => s.elements.coloring.order.as_ptr().cast(),
-        9 => s.energy.as_ptr().cast(),
-        _ => std::ptr::null(),
-    }
+extern "C" fn solver_buffer(handle: u32, field: u32) -> *const u8 {
+    SOLVERS.with_borrow_mut(|solvers| {
+        let Some(s) = solvers.get_mut(&handle) else { return ptr::null(); };
+        match field {
+            0 => s.modulus.as_mut_ptr().cast(),
+            1 => s.force.as_mut_ptr().cast(),
+            2 => s.u.as_mut_ptr().cast(),
+            3 => s.gradient.as_ptr().cast(),
+            4 => s.stats.as_ptr().cast(),
+            5 => s.elements.nodes.as_ptr().cast(),
+            6 => s.elements.templates.as_ptr().cast(),
+            7 => s.elements.coloring.starts.as_ptr().cast(),
+            8 => s.elements.coloring.order.as_ptr().cast(),
+            9 => s.energy.as_ptr().cast(),
+            _ => ptr::null(),
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn solver_colors(handle: *mut Solver) -> usize {
-    unsafe { (&*handle).elements.coloring.starts.len() - 1 }
+extern "C" fn solver_colors(handle: u32) -> usize {
+    SOLVERS.with_borrow(|solvers| solvers.get(&handle).map_or(0, |s| s.elements.coloring.starts.len() - 1))
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn solver_prepare(handle: *mut Solver, e0: f64, emin: f64, penal: f64) {
-    unsafe { (&mut *handle).prepare(e0, emin, penal) };
+extern "C" fn solver_prepare(handle: u32, e0: f64, emin: f64, penal: f64) -> i32 {
+    SOLVERS.with_borrow_mut(|solvers| {
+        let Some(solver) = solvers.get_mut(&handle) else { return -1; };
+        solver.prepare(e0, emin, penal);
+        0
+    })
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn solver_solve(handle: *mut Solver, tolerance: f64, limit: u32) -> u32 {
-    let solver = unsafe { &mut *handle };
-    let converged = solver.solve(tolerance, limit);
-    if converged { solver.sensitivities(); }
-    u32::from(converged)
+extern "C" fn solver_solve(handle: u32, tolerance: f64, limit: u32) -> u32 {
+    SOLVERS.with_borrow_mut(|solvers| {
+        let Some(solver) = solvers.get_mut(&handle) else { return 0; };
+        let converged = solver.solve(tolerance, limit);
+        if converged { solver.sensitivities(); }
+        u32::from(converged)
+    })
 }
